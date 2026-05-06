@@ -218,12 +218,12 @@ function getRelayUploadConcurrency(fileSizeBytes: number, totalParts: number): n
     return Math.min(4, totalParts);
   }
   if (fileSizeBytes <= 512 * MIB || totalParts <= 16) {
-    return Math.min(6, totalParts);
-  }
-  if (fileSizeBytes <= 2 * 1024 * MIB || totalParts <= 64) {
     return Math.min(8, totalParts);
   }
-  return Math.min(10, totalParts);
+  if (fileSizeBytes <= 2 * 1024 * MIB || totalParts <= 64) {
+    return Math.min(12, totalParts);
+  }
+  return Math.min(16, totalParts);
 }
 
 function uploadPresignedPartWithProgress(
@@ -307,12 +307,22 @@ async function uploadRelayPartsConcurrently(options: {
   const concurrency = getRelayUploadConcurrency(file.size, totalParts);
   let aggregateLoadedBytes = 0;
   let cursor = 0;
+  let lastProgressEmitAt = 0;
 
-  const setPartLoaded = (partNumber: number, loaded: number) => {
+  const emitProgress = (force: boolean = false) => {
+    const now = performance.now();
+    if (!force && now - lastProgressEmitAt < 120) {
+      return;
+    }
+    lastProgressEmitAt = now;
+    onProgress(Math.min(file.size, aggregateLoadedBytes), totalParts, concurrency);
+  };
+
+  const setPartLoaded = (partNumber: number, loaded: number, forceEmit: boolean = false) => {
     const previous = loadedByPart.get(partNumber) ?? 0;
     loadedByPart.set(partNumber, loaded);
     aggregateLoadedBytes += loaded - previous;
-    onProgress(Math.min(file.size, aggregateLoadedBytes), totalParts, concurrency);
+    emitProgress(forceEmit || aggregateLoadedBytes >= file.size);
   };
 
   const uploadNext = async (): Promise<void> => {
@@ -334,7 +344,8 @@ async function uploadRelayPartsConcurrently(options: {
     const part = await uploadPresignedPartWithProgress(partUrl, current.chunk, (loaded) => {
       setPartLoaded(current.partNumber, loaded);
     }, task);
-    setPartLoaded(current.partNumber, current.chunk.size);
+    // Force one last progress flush when a part completes so the UI does not lag behind.
+    setPartLoaded(current.partNumber, current.chunk.size, true);
     uploadedParts.push(part);
     await uploadNext();
   };
@@ -342,6 +353,7 @@ async function uploadRelayPartsConcurrently(options: {
   await Promise.all(
     Array.from({ length: concurrency }, () => uploadNext()),
   );
+  emitProgress(true);
 
   uploadedParts.sort((left, right) => left.partNumber - right.partNumber);
   return uploadedParts;
