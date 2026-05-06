@@ -1,0 +1,18 @@
+[workspace]
+members = ["backend/server"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+salvo = { version = "0.89.3", features = ["affix-state", "compression", "logging", "websocket"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "mysql", "macros", "migrate"] }
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }

@@ -1,0 +1,19 @@
+services:
+  patrick-im-server:
+    image: patrick-im-server:latest
+    build:
+      context: ..
+      dockerfile: backend/server/Dockerfile
+    container_name: patrick-im-server
+    restart: unless-stopped
+    env_file:
+      - ../backend/server/.env
+    ports:
+      - "127.0.0.1:5800:5800"
+    networks:
+      - app
+
+networks:
+  app:
+    external: true
+    name: ${PATRICK_IM_DOCKER_NETWORK:-1panel-network}

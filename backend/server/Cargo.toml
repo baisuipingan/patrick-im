@@ -1,0 +1,27 @@
+[package]
+name = "patrick-im-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+salvo.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+aws-sdk-s3 = "1"
+bytes = "1"
+base64 = "0.22"
+futures-util = "0.3"
+hmac = "0.12"
+include_dir = "0.7"
+mime_guess = "2"
+sha2 = "0.10"
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+uuid = { version = "1", features = ["v4", "serde"] }

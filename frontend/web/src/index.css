@@ -1,0 +1,83 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 210 33% 97%;
+  --foreground: 220 24% 12%;
+  --muted: 210 22% 92%;
+  --muted-foreground: 215 12% 42%;
+  --card: 0 0% 100%;
+  --card-foreground: 220 24% 12%;
+  --border: 214 20% 86%;
+  --input: 214 20% 86%;
+  --ring: 154 54% 41%;
+  --accent: 154 54% 41%;
+  --accent-foreground: 0 0% 100%;
+  --success: 150 62% 36%;
+  --warning: 37 92% 50%;
+  --danger: 3 76% 53%;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "SF Pro Display", "Avenir Next", "PingFang SC", sans-serif;
+  color: hsl(var(--foreground));
+  background: #eff6ff;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+a {
+  color: inherit;
+}
+
+::selection {
+  background: rgba(46, 166, 115, 0.18);
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.5);
+  background-clip: padding-box;
+}
+
+.message-slide-in {
+  animation: message-slide-in 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@keyframes message-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
