@@ -60,9 +60,7 @@ const WS_RECONNECT_MAX_DELAY_MS = 30_000;
 const TRANSFER_MODE_TOOLTIP_DELAY_MS = 500;
 const PEER_PATH_TOOLTIP_DELAY_MS = 500;
 const TRANSIENT_NOTICE_RESET_MS = 2600;
-// Public relay uploads to the HK server are usually RTT-bound, so 6 parallel 8 MiB
-// parts make better use of the uplink than the previous 3-part window.
-const RELAY_UPLOAD_CONCURRENCY = 6;
+const MIB = 1024 * 1024;
 const LARGE_DIRECT_FILE_NOTICE_BYTES = 256 * 1024 * 1024;
 const DEFAULT_NOTICE = '把两个浏览器打开到同一个房间后，就可以开始发文字、图片和文件了。';
 const HEADER_BADGE_CLASS = 'h-7 rounded-full px-3 text-[12px] font-medium shadow-sm';
@@ -209,6 +207,25 @@ function rememberRoom(roomId: string, current: string[]): string[] {
   return next;
 }
 
+function getRelayUploadConcurrency(fileSizeBytes: number, totalParts: number): number {
+  if (totalParts <= 1) {
+    return 1;
+  }
+  if (fileSizeBytes <= 32 * MIB || totalParts <= 2) {
+    return Math.min(2, totalParts);
+  }
+  if (fileSizeBytes <= 128 * MIB || totalParts <= 4) {
+    return Math.min(4, totalParts);
+  }
+  if (fileSizeBytes <= 512 * MIB || totalParts <= 16) {
+    return Math.min(6, totalParts);
+  }
+  if (fileSizeBytes <= 2 * 1024 * MIB || totalParts <= 64) {
+    return Math.min(8, totalParts);
+  }
+  return Math.min(10, totalParts);
+}
+
 function uploadPresignedPartWithProgress(
   part: RelayPresignedPart,
   chunk: Blob,
@@ -270,7 +287,7 @@ async function uploadRelayPartsConcurrently(options: {
   file: File;
   chunkSizeBytes: number;
   partUrls: RelayPresignedPart[];
-  onProgress: (transferredBytes: number, totalParts: number) => void;
+  onProgress: (transferredBytes: number, totalParts: number, concurrency: number) => void;
   task: RelayUploadTask;
 }): Promise<RelayUploadPartResponse[]> {
   const { file, chunkSizeBytes, partUrls, onProgress, task } = options;
@@ -287,6 +304,7 @@ async function uploadRelayPartsConcurrently(options: {
   const uploadedParts: RelayUploadPartResponse[] = [];
   const loadedByPart = new Map<number, number>();
   const totalParts = chunks.length;
+  const concurrency = getRelayUploadConcurrency(file.size, totalParts);
   let aggregateLoadedBytes = 0;
   let cursor = 0;
 
@@ -294,7 +312,7 @@ async function uploadRelayPartsConcurrently(options: {
     const previous = loadedByPart.get(partNumber) ?? 0;
     loadedByPart.set(partNumber, loaded);
     aggregateLoadedBytes += loaded - previous;
-    onProgress(Math.min(file.size, aggregateLoadedBytes), totalParts);
+    onProgress(Math.min(file.size, aggregateLoadedBytes), totalParts, concurrency);
   };
 
   const uploadNext = async (): Promise<void> => {
@@ -322,7 +340,7 @@ async function uploadRelayPartsConcurrently(options: {
   };
 
   await Promise.all(
-    Array.from({ length: Math.min(RELAY_UPLOAD_CONCURRENCY, chunks.length) }, () => uploadNext()),
+    Array.from({ length: concurrency }, () => uploadNext()),
   );
 
   uploadedParts.sort((left, right) => left.partNumber - right.partNumber);
@@ -2316,7 +2334,7 @@ export default function App() {
             chunkSizeBytes: payload.chunkSizeBytes,
             partUrls: payload.partUrls,
             task,
-            onProgress: (transferredBytes, totalParts) => {
+            onProgress: (transferredBytes, totalParts, concurrency) => {
               updateTransfer({
                 transferId: payload.fileId,
                 peerId,
@@ -2327,7 +2345,10 @@ export default function App() {
                 direction: 'upload',
                 transport: 'server-relay',
                 status: 'streaming',
-                note: totalParts > 1 ? `正在直传到中继存储（共 ${totalParts} 个分片）` : '正在直传到中继存储',
+                note:
+                  totalParts > 1
+                    ? `正在直传到中继存储（共 ${totalParts} 个分片，并发 ${concurrency}）`
+                    : '正在直传到中继存储',
               });
             },
           })
