@@ -1,5 +1,5 @@
 SHELL := /bin/bash
-.SHELLFLAGS := -eu -o pipefail -c
+.SHELLFLAGS := --noprofile --norc -eu -o pipefail -c
 .DEFAULT_GOAL := help
 
 FRONTEND_DIR := frontend/web
@@ -10,7 +10,7 @@ BIN_NAME := patrick-im-server
 SERVICE_NAME := patrick-im-server
 COMPOSE_FILE := ops/docker-compose.server.yml
 DOCKER_COMPOSE := docker compose -f $(COMPOSE_FILE)
-HOST_RUST_TARGET := $(shell bash -lc 'source $$HOME/.cargo/env >/dev/null 2>&1 || true; rustc -vV 2>/dev/null | sed -n "s/^host: //p"' || true)
+HOST_RUST_TARGET := $(shell bash --noprofile --norc -c 'source $$HOME/.cargo/env >/dev/null 2>&1 || true; rustc -vV 2>/dev/null | sed -n "s/^host: //p"' || true)
 
 .PHONY: help env-check frontend-build release release-host release-x86 docker-build docker-up deploy deploy-x86 status logs clean
 
@@ -52,7 +52,7 @@ env-check:
 	printf 'cargo=%s\n' "$$(cargo -V)"; \
 	printf 'rustc=%s\n' "$$(rustc -V)"; \
 	printf 'docker=%s\n' "$$(docker -v)"; \
-	printf 'docker compose=%s\n' "$$($(DOCKER_COMPOSE) version | head -n 1)"
+	printf 'docker compose=%s\n' "$$(docker compose version | head -n 1)"
 
 frontend-build: env-check
 	@mkdir -p $(BUILD_DIR) $(WEB_DIST_DIR)
