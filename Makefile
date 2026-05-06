@@ -17,8 +17,10 @@ HOST_RUST_TARGET := $(shell bash --noprofile --norc -c 'source $$HOME/.cargo/env
 define load_toolchains
 source $$HOME/.cargo/env >/dev/null 2>&1 || true; \
 export NVM_DIR="$$HOME/.nvm"; \
-if [[ -s "$$NVM_DIR/nvm.sh" ]]; then source "$$NVM_DIR/nvm.sh"; fi; \
-nvm use --lts >/dev/null 2>&1 || nvm use node >/dev/null 2>&1 || true
+if [[ -s "$$NVM_DIR/nvm.sh" ]]; then source "$$NVM_DIR/nvm.sh" >/dev/null 2>&1; fi; \
+if ! command -v node >/dev/null 2>&1 && compgen -G "$$NVM_DIR/versions/node/*/bin" >/dev/null; then \
+  export PATH="$$(ls -d "$$NVM_DIR"/versions/node/*/bin | sort -V | tail -n 1):$$PATH"; \
+fi
 endef
 
 define require_command
