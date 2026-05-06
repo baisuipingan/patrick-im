@@ -63,8 +63,6 @@ const TRANSIENT_NOTICE_RESET_MS = 2600;
 // Public relay uploads to the HK server are usually RTT-bound, so 8 parallel 8 MiB
 // parts make better use of the uplink than the previous smaller window.
 const RELAY_UPLOAD_CONCURRENCY = 8;
-const TRANSFER_SPEED_WARMUP_BYTES = 16 * 1024 * 1024;
-const TRANSFER_SPEED_WARMUP_SAMPLES = 4;
 const LARGE_DIRECT_FILE_NOTICE_BYTES = 256 * 1024 * 1024;
 const DEFAULT_NOTICE = '把两个浏览器打开到同一个房间后，就可以开始发文字、图片和文件了。';
 const HEADER_BADGE_CLASS = 'h-7 rounded-full px-3 text-[12px] font-medium shadow-sm';
@@ -92,7 +90,6 @@ interface TransferRow extends TransferUpdate {
   speedBytesPerSecond?: number;
   lastProgressAt?: number;
   lastProgressBytes?: number;
-  progressSamples?: number;
 }
 
 interface PendingAttachment {
@@ -1721,7 +1718,6 @@ export default function App() {
       let speedBytesPerSecond = existing?.speedBytesPerSecond;
       let lastProgressAt = existing?.lastProgressAt ?? now;
       let lastProgressBytes = existing?.lastProgressBytes ?? update.transferredBytes;
-      let progressSamples = existing?.progressSamples ?? 0;
 
       if (update.status === 'streaming') {
         const baseBytes = existing?.lastProgressBytes ?? update.transferredBytes;
@@ -1730,21 +1726,13 @@ export default function App() {
         const deltaMs = now - baseAt;
 
         if (deltaBytes > 0 && deltaMs >= 250) {
-          progressSamples += 1;
           const instantSpeed = deltaBytes / (deltaMs / 1000);
+          speedBytesPerSecond =
+            typeof existing?.speedBytesPerSecond === 'number'
+              ? existing.speedBytesPerSecond * 0.45 + instantSpeed * 0.55
+              : instantSpeed;
           lastProgressAt = now;
           lastProgressBytes = update.transferredBytes;
-          if (
-            progressSamples >= TRANSFER_SPEED_WARMUP_SAMPLES &&
-            update.transferredBytes >= Math.min(update.totalBytes, TRANSFER_SPEED_WARMUP_BYTES)
-          ) {
-            speedBytesPerSecond =
-              typeof existing?.speedBytesPerSecond === 'number'
-                ? existing.speedBytesPerSecond * 0.45 + instantSpeed * 0.55
-                : instantSpeed;
-          } else {
-            speedBytesPerSecond = undefined;
-          }
         } else if (!existing) {
           lastProgressAt = now;
           lastProgressBytes = update.transferredBytes;
@@ -1766,7 +1754,6 @@ export default function App() {
           speedBytesPerSecond,
           lastProgressAt,
           lastProgressBytes,
-          progressSamples,
         },
       };
     });
