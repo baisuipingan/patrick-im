@@ -59,7 +59,9 @@ const WS_RECONNECT_MAX_DELAY_MS = 30_000;
 const TRANSFER_MODE_TOOLTIP_DELAY_MS = 500;
 const PEER_PATH_TOOLTIP_DELAY_MS = 500;
 const TRANSIENT_NOTICE_RESET_MS = 2600;
-const RELAY_UPLOAD_CONCURRENCY = 3;
+// Public relay uploads to the HK server are usually RTT-bound, so 6 parallel 8 MiB
+// parts make better use of the uplink than the previous 3-part window.
+const RELAY_UPLOAD_CONCURRENCY = 6;
 const LARGE_DIRECT_FILE_NOTICE_BYTES = 256 * 1024 * 1024;
 const DEFAULT_NOTICE = '把两个浏览器打开到同一个房间后，就可以开始发文字、图片和文件了。';
 const HEADER_BADGE_CLASS = 'h-7 rounded-full px-3 text-[12px] font-medium shadow-sm';

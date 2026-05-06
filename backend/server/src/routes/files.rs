@@ -6,7 +6,6 @@ use crate::session::require_session;
 use crate::state::AppState;
 use crate::store::message_store::FileLookupError;
 use crate::utils::{encode_content_disposition_name, sanitize_room_id};
-use bytes::Bytes;
 use salvo::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
 use salvo::prelude::*;
 use tokio_util::io::ReaderStream;
@@ -84,12 +83,7 @@ pub async fn upload_part(
 
     let response = state
         .relay_store
-        .upload_part(
-            &session,
-            &upload_token,
-            part_number,
-            Bytes::copy_from_slice(body),
-        )
+        .upload_part(&session, &upload_token, part_number, body.to_owned())
         .await
         .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
     Ok(Json(response))
