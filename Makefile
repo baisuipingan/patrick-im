@@ -62,7 +62,7 @@ frontend-build: env-check
 	@find $(WEB_DIST_DIR) -mindepth 1 -maxdepth 1 ! -name '.gitkeep' -exec rm -rf {} +
 	@$(load_toolchains); \
 	cd $(FRONTEND_DIR); \
-	npm ci; \
+	npm ci --no-audit --no-fund; \
 	npm run build
 
 release:
