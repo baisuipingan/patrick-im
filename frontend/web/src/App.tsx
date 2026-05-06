@@ -26,6 +26,7 @@ import type {
   DirectPeerState,
   RelayAbortUploadRequest,
   RelayDiscardUploadRequest,
+  RelayPresignedPart,
   RelayUploadPartResponse,
   RelayUploadResponse,
   ServerToClientMessage,
@@ -208,9 +209,8 @@ function rememberRoom(roomId: string, current: string[]): string[] {
   return next;
 }
 
-function uploadChunkWithProgress(
-  uploadToken: string,
-  partNumber: number,
+function uploadPresignedPartWithProgress(
+  part: RelayPresignedPart,
   chunk: Blob,
   onProgress: (loaded: number) => void,
   task: RelayUploadTask,
@@ -223,9 +223,10 @@ function uploadChunkWithProgress(
 
     const xhr = new XMLHttpRequest();
     task.xhrs.add(xhr);
-    xhr.open('PUT', '/api/files/upload-part', true);
-    xhr.setRequestHeader('x-patrick-upload-token', uploadToken);
-    xhr.setRequestHeader('x-patrick-part-number', String(partNumber));
+    xhr.open('PUT', part.url, true);
+    for (const header of part.headers) {
+      xhr.setRequestHeader(header.name, header.value);
+    }
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) {
         onProgress(event.loaded);
@@ -242,7 +243,15 @@ function uploadChunkWithProgress(
     xhr.onload = () => {
       task.xhrs.delete(xhr);
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(JSON.parse(xhr.responseText) as RelayUploadPartResponse);
+        const etag = xhr.getResponseHeader('etag') ?? xhr.getResponseHeader('ETag');
+        if (!etag) {
+          reject(new Error('upload_part_missing_etag'));
+          return;
+        }
+        resolve({
+          partNumber: part.partNumber,
+          etag,
+        });
       } else {
         reject(new Error(`upload_part_failed_${xhr.status}`));
       }
@@ -259,13 +268,14 @@ function uploadChunkWithProgress(
 
 async function uploadRelayPartsConcurrently(options: {
   file: File;
-  uploadToken: string;
   chunkSizeBytes: number;
+  partUrls: RelayPresignedPart[];
   onProgress: (transferredBytes: number, totalParts: number) => void;
   task: RelayUploadTask;
 }): Promise<RelayUploadPartResponse[]> {
-  const { file, uploadToken, chunkSizeBytes, onProgress, task } = options;
+  const { file, chunkSizeBytes, partUrls, onProgress, task } = options;
   const chunks: Array<{ partNumber: number; chunk: Blob }> = [];
+  const partUrlByNumber = new Map(partUrls.map((part) => [part.partNumber, part]));
 
   for (let offset = 0, partNumber = 1; offset < file.size; offset += chunkSizeBytes, partNumber += 1) {
     chunks.push({
@@ -298,7 +308,12 @@ async function uploadRelayPartsConcurrently(options: {
       return;
     }
 
-    const part = await uploadChunkWithProgress(uploadToken, current.partNumber, current.chunk, (loaded) => {
+    const partUrl = partUrlByNumber.get(current.partNumber);
+    if (!partUrl) {
+      throw new Error(`upload_part_url_missing_${current.partNumber}`);
+    }
+
+    const part = await uploadPresignedPartWithProgress(partUrl, current.chunk, (loaded) => {
       setPartLoaded(current.partNumber, loaded);
     }, task);
     setPartLoaded(current.partNumber, current.chunk.size);
@@ -2288,7 +2303,7 @@ export default function App() {
         direction: 'upload',
         transport: 'server-relay',
         status: 'pending',
-        note: '等待上传到服务端中继',
+        note: '等待直传到中继存储',
       });
       if (pendingAttachmentId) {
         removePendingFile(pendingAttachmentId);
@@ -2298,8 +2313,8 @@ export default function App() {
         ...(
           await uploadRelayPartsConcurrently({
             file,
-            uploadToken: payload.uploadToken,
             chunkSizeBytes: payload.chunkSizeBytes,
+            partUrls: payload.partUrls,
             task,
             onProgress: (transferredBytes, totalParts) => {
               updateTransfer({
@@ -2312,7 +2327,7 @@ export default function App() {
                 direction: 'upload',
                 transport: 'server-relay',
                 status: 'streaming',
-                note: totalParts > 1 ? `正在并发上传到服务端中继（共 ${totalParts} 个分片）` : '正在上传到服务端中继',
+                note: totalParts > 1 ? `正在直传到中继存储（共 ${totalParts} 个分片）` : '正在直传到中继存储',
               });
             },
           })

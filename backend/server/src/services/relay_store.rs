@@ -1,8 +1,8 @@
 use crate::config::AppConfig;
 use crate::protocol::{
     RelayAbortUploadRequest, RelayCompleteUploadRequest, RelayCompleteUploadResponse,
-    RelayDiscardUploadRequest, RelayFileAnnouncement, RelayFileDescriptor, RelayUploadPartResponse,
-    RelayUploadRequest, RelayUploadResponse,
+    RelayDiscardUploadRequest, RelayFileAnnouncement, RelayFileDescriptor, RelayPresignedHeader,
+    RelayPresignedPart, RelayUploadRequest, RelayUploadResponse,
 };
 use crate::session::SessionPayload;
 use crate::signing::{create_signed_token, read_signed_token};
@@ -12,15 +12,17 @@ use crate::utils::{
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Builder as S3ConfigBuilder, Credentials, Region};
+use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
-use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 const RELAY_CHUNK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+const RELAY_UPLOAD_URL_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
@@ -52,6 +54,7 @@ struct CompletedUploadRecord {
 #[derive(Debug, Clone)]
 pub struct RelayStore {
     client: Client,
+    presign_client: Client,
     bucket: String,
     signing_secret: String,
     completed_uploads: Arc<RwLock<HashMap<String, CompletedUploadRecord>>>,
@@ -59,23 +62,17 @@ pub struct RelayStore {
 
 impl RelayStore {
     pub fn new(config: &AppConfig) -> Self {
-        let credentials = Credentials::new(
-            config.rustfs_access_key.clone(),
-            config.rustfs_secret_key.clone(),
-            None,
-            None,
-            "patrick-im-rustfs",
-        );
-        let s3_config = S3ConfigBuilder::new()
-            .behavior_version(BehaviorVersion::latest())
-            .region(Region::new("us-east-1"))
-            .endpoint_url(config.rustfs_endpoint.clone())
-            .force_path_style(true)
-            .credentials_provider(credentials)
-            .build();
-
         Self {
-            client: Client::from_conf(s3_config),
+            client: build_s3_client(
+                &config.rustfs_endpoint,
+                &config.rustfs_access_key,
+                &config.rustfs_secret_key,
+            ),
+            presign_client: build_s3_client(
+                &config.rustfs_public_endpoint,
+                &config.rustfs_access_key,
+                &config.rustfs_secret_key,
+            ),
             bucket: config.rustfs_bucket.clone(),
             signing_secret: config.session_secret.clone(),
             completed_uploads: Arc::new(RwLock::new(HashMap::new())),
@@ -87,6 +84,7 @@ impl RelayStore {
         session: &SessionPayload,
         request: RelayUploadRequest,
     ) -> Result<RelayUploadResponse> {
+        let part_count = request.size.div_ceil(RELAY_CHUNK_SIZE_BYTES as u64);
         let room_id = sanitize_room_id(&request.roomId);
         let file_name = sanitize_file_name(&request.fileName);
         let content_type = if request.contentType.trim().is_empty() {
@@ -134,41 +132,16 @@ impl RelayStore {
             issuedAt: now_ms(),
         };
 
+        let part_urls = self
+            .create_presigned_part_urls(&payload.objectKey, &payload.uploadId, part_count)
+            .await?;
+
         Ok(RelayUploadResponse {
             fileId: file_id,
             objectKey: object_key,
             uploadToken: create_signed_token(&self.signing_secret, &payload)?,
             chunkSizeBytes: RELAY_CHUNK_SIZE_BYTES as u64,
-        })
-    }
-
-    pub async fn upload_part(
-        &self,
-        session: &SessionPayload,
-        upload_token: &str,
-        part_number: i32,
-        bytes: Bytes,
-    ) -> Result<RelayUploadPartResponse> {
-        let payload = self.read_upload_token(upload_token)?;
-        if payload.fromId != session.clientId {
-            return Err(anyhow!("invalid upload token owner"));
-        }
-
-        let response = self
-            .client
-            .upload_part()
-            .bucket(&self.bucket)
-            .key(&payload.objectKey)
-            .upload_id(payload.uploadId)
-            .part_number(part_number)
-            .body(bytes.into())
-            .send()
-            .await
-            .context("failed to upload relay part")?;
-
-        Ok(RelayUploadPartResponse {
-            partNumber: part_number,
-            etag: response.e_tag().unwrap_or_default().to_owned(),
+            partUrls: part_urls,
         })
     }
 
@@ -346,4 +319,61 @@ impl RelayStore {
     fn read_upload_token(&self, token: &str) -> Result<RelayUploadTokenPayload> {
         read_signed_token(&self.signing_secret, token)
     }
+
+    async fn create_presigned_part_urls(
+        &self,
+        object_key: &str,
+        upload_id: &str,
+        part_count: u64,
+    ) -> Result<Vec<RelayPresignedPart>> {
+        let presigning_config =
+            PresigningConfig::expires_in(RELAY_UPLOAD_URL_TTL).context("invalid presign ttl")?;
+        let mut parts = Vec::with_capacity(part_count as usize);
+
+        for part_number in 1..=part_count {
+            let part_number = i32::try_from(part_number).context("relay part number overflow")?;
+            let presigned = self
+                .presign_client
+                .upload_part()
+                .bucket(&self.bucket)
+                .key(object_key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .presigned(presigning_config.clone())
+                .await
+                .context("failed to presign relay upload part")?;
+
+            parts.push(RelayPresignedPart {
+                partNumber: part_number,
+                url: presigned.uri().to_owned(),
+                headers: presigned
+                    .headers()
+                    .map(|(name, value)| RelayPresignedHeader {
+                        name: name.to_owned(),
+                        value: value.to_owned(),
+                    })
+                    .collect(),
+            });
+        }
+
+        Ok(parts)
+    }
+}
+
+fn build_s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client {
+    let credentials = Credentials::new(
+        access_key.to_owned(),
+        secret_key.to_owned(),
+        None,
+        None,
+        "patrick-im-rustfs",
+    );
+    let s3_config = S3ConfigBuilder::new()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new("us-east-1"))
+        .endpoint_url(endpoint)
+        .force_path_style(true)
+        .credentials_provider(credentials)
+        .build();
+    Client::from_conf(s3_config)
 }

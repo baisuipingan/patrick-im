@@ -169,11 +169,23 @@ export interface RelayUploadResponse {
   objectKey: string;
   uploadToken: string;
   chunkSizeBytes: number;
+  partUrls: RelayPresignedPart[];
 }
 
 export interface RelayUploadedPart {
   partNumber: number;
   etag: string;
+}
+
+export interface RelayPresignedHeader {
+  name: string;
+  value: string;
+}
+
+export interface RelayPresignedPart {
+  partNumber: number;
+  url: string;
+  headers: RelayPresignedHeader[];
 }
 
 export interface RelayUploadPartResponse {

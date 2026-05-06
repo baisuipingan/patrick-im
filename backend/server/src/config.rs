@@ -7,6 +7,7 @@ pub struct AppConfig {
     pub bind: String,
     pub log_filter: String,
     pub public_base_url: String,
+    pub rustfs_public_endpoint: String,
     pub stun_urls: Vec<String>,
     pub turn_urls: Vec<String>,
     pub turn_username: Option<String>,
@@ -24,7 +25,11 @@ impl AppConfig {
     pub fn from_env() -> Result<Self> {
         let bind = env_or("PATRICK_IM_BIND", "0.0.0.0:5800");
         let log_filter = env_or("PATRICK_IM_LOG", "info,salvo_core=info");
-        let public_base_url = env_required("PATRICK_IM_PUBLIC_BASE_URL")?;
+        let public_base_url = normalize_base_url(env_required("PATRICK_IM_PUBLIC_BASE_URL")?);
+        let rustfs_public_endpoint = normalize_base_url(env_or(
+            "PATRICK_IM_RUSTFS_PUBLIC_ENDPOINT",
+            &public_base_url,
+        ));
         let stun_urls = split_csv(&env_or(
             "PATRICK_IM_STUN_URLS",
             "stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302",
@@ -44,6 +49,7 @@ impl AppConfig {
             bind,
             log_filter,
             public_base_url,
+            rustfs_public_endpoint,
             stun_urls,
             turn_urls,
             turn_username,
@@ -76,6 +82,10 @@ fn env_or(key: &str, fallback: &str) -> String {
 
 fn env_optional(key: &str) -> Option<String> {
     env::var(key).ok().filter(|value| !value.trim().is_empty())
+}
+
+fn normalize_base_url(value: String) -> String {
+    value.trim().trim_end_matches('/').to_owned()
 }
 
 fn split_csv(value: &str) -> Vec<String> {

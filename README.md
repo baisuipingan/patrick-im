@@ -36,6 +36,11 @@ cargo run -p patrick-im-server
 - 前端开发页：`http://127.0.0.1:5173`
 - Rust 服务：`http://127.0.0.1:5800`
 
+和中继上传直接相关的环境变量：
+
+- `PATRICK_IM_RUSTFS_ENDPOINT`: 服务端容器访问 RustFS 的内网地址
+- `PATRICK_IM_RUSTFS_PUBLIC_ENDPOINT`: 浏览器直传/直下 RustFS 时使用的公网入口，默认回退到 `PATRICK_IM_PUBLIC_BASE_URL`
+
 ## 发版命令
 
 统一用 `Makefile`：
@@ -64,7 +69,7 @@ make help
 3. 然后执行：
 
 ```bash
-make deploy-x86
+make deploy
 ```
 
 这一个命令会顺序完成：
@@ -96,3 +101,27 @@ make docker-up
 - 前端先构建，后端再把静态资源内嵌进单二进制
 - Docker 不负责编译，只负责运行时打包
 - 远端部署不走源码同步脚本，只走 `git pull + make`
+
+## Nginx 反代要求
+
+如果你要启用浏览器直传 RustFS，公网反代必须把 bucket path-style 请求直接转给 RustFS。
+
+对当前默认 bucket `patrick-im`，至少需要一段和下面等价的配置：
+
+```nginx
+location ^~ /patrick-im/ {
+    proxy_pass http://127.0.0.1:9000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;
+    proxy_connect_timeout 60s;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_request_buffering off;
+    proxy_buffering off;
+}
+```
+
+如果你想让中继下载不被站点层限速，再确认站点配置里不要有类似 `limit_rate 10240k;` 这种限制。

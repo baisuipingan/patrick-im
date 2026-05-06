@@ -11,7 +11,6 @@ use salvo::prelude::*;
 use tokio_util::io::ReaderStream;
 
 const RELAY_FILE_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-const RELAY_PART_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 #[handler]
 pub async fn upload_request(
@@ -44,46 +43,6 @@ pub async fn upload_request(
     let response = state
         .relay_store
         .create_upload(&session, payload)
-        .await
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
-    Ok(Json(response))
-}
-
-#[handler]
-pub async fn upload_part(
-    req: &mut Request,
-    depot: &mut Depot,
-) -> Result<Json<crate::protocol::RelayUploadPartResponse>, StatusError> {
-    let state = depot
-        .obtain::<AppState>()
-        .map_err(|_| StatusError::internal_server_error())?;
-    let session = require_session(req, &state.config.session_secret)
-        .map_err(|error| {
-            StatusError::internal_server_error().brief(format!("session decode error: {error}"))
-        })?
-        .ok_or_else(|| StatusError::unauthorized().brief("missing session"))?;
-
-    let upload_token = req
-        .headers()
-        .get("x-patrick-upload-token")
-        .and_then(|value| value.to_str().ok())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| StatusError::bad_request().brief("missing upload token"))?;
-    let part_number = req
-        .headers()
-        .get("x-patrick-part-number")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<i32>().ok())
-        .filter(|part| *part > 0)
-        .ok_or_else(|| StatusError::bad_request().brief("invalid part number"))?;
-    let body = req
-        .payload_with_max_size(RELAY_PART_MAX_BYTES)
-        .await
-        .map_err(|_| StatusError::bad_request().brief("missing upload body"))?;
-
-    let response = state
-        .relay_store
-        .upload_part(&session, &upload_token, part_number, body.to_owned())
         .await
         .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
     Ok(Json(response))

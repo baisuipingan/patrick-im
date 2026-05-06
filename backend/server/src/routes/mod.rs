@@ -16,7 +16,6 @@ pub fn router() -> Router {
                 .push(
                     Router::with_path("files")
                         .push(Router::with_path("upload-request").post(files::upload_request))
-                        .push(Router::with_path("upload-part").put(files::upload_part))
                         .push(Router::with_path("complete").post(files::complete_upload))
                         .push(Router::with_path("abort").post(files::abort_upload))
                         .push(Router::with_path("discard").post(files::discard_upload))

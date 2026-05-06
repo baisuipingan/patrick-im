@@ -117,12 +117,27 @@ pub struct RelayUploadResponse {
     pub objectKey: String,
     pub uploadToken: String,
     pub chunkSizeBytes: u64,
+    pub partUrls: Vec<RelayPresignedPart>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayUploadedPart {
     pub partNumber: i32,
     pub etag: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayPresignedPart {
+    pub partNumber: i32,
+    pub url: String,
+    #[serde(default)]
+    pub headers: Vec<RelayPresignedHeader>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayPresignedHeader {
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
