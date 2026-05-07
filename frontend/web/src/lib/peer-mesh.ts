@@ -123,6 +123,8 @@ interface PeerSession {
   pendingCandidates: RTCIceCandidateInit[];
   pathInfoKey?: string;
   pathPollTimerId?: number;
+  lastLocalLanCandidate?: ParsedIceCandidate;
+  lastRemoteLanCandidate?: ParsedIceCandidate;
 }
 
 function getBinarySize(chunk: ArrayBuffer | Blob): number {
@@ -346,6 +348,7 @@ export class PeerMesh {
         if (!isLanIceCandidate(candidate)) {
           return;
         }
+        session.lastLocalLanCandidate = parseIceCandidate(candidate);
         this.callbacks.sendSignal(peer.clientId, {
           candidate,
         });
@@ -429,6 +432,7 @@ export class PeerMesh {
     }
 
     if (payload.candidate && isLanIceCandidate(payload.candidate)) {
+      session.lastRemoteLanCandidate = parseIceCandidate(payload.candidate);
       if (session.pc.remoteDescription) {
         await session.pc.addIceCandidate(payload.candidate);
       } else {
@@ -1227,11 +1231,17 @@ export class PeerMesh {
         typeof localCandidate?.candidateType === 'string' ? localCandidate.candidateType : undefined;
       const remoteCandidateType =
         typeof remoteCandidate?.candidateType === 'string' ? remoteCandidate.candidateType : undefined;
-      const localAddress = readCandidateAddress(localCandidate);
-      const remoteAddress = readCandidateAddress(remoteCandidate);
+      const localFallback = session.lastLocalLanCandidate;
+      const remoteFallback = session.lastRemoteLanCandidate;
+      const localAddress = readCandidateAddress(localCandidate) ?? localFallback?.address;
+      const remoteAddress = readCandidateAddress(remoteCandidate) ?? remoteFallback?.address;
+      const resolvedLocalCandidateType = localCandidateType ?? localFallback?.candidateType;
+      const resolvedRemoteCandidateType = remoteCandidateType ?? remoteFallback?.candidateType;
       const protocol =
         (typeof localCandidate?.protocol === 'string' ? localCandidate.protocol : undefined) ??
-        (typeof selectedPair.protocol === 'string' ? selectedPair.protocol : undefined);
+        (typeof selectedPair.protocol === 'string' ? selectedPair.protocol : undefined) ??
+        localFallback?.protocol ??
+        remoteFallback?.protocol;
       const roundTripTimeMs =
         typeof selectedPair.currentRoundTripTime === 'number'
           ? Math.round(selectedPair.currentRoundTripTime * 1000)
@@ -1239,13 +1249,13 @@ export class PeerMesh {
 
       this.publishPathInfo(session, {
         kind: classifyDirectPath(
-          localCandidateType,
-          remoteCandidateType,
+          resolvedLocalCandidateType,
+          resolvedRemoteCandidateType,
           localAddress,
           remoteAddress,
         ),
-        localCandidateType,
-        remoteCandidateType,
+        localCandidateType: resolvedLocalCandidateType,
+        remoteCandidateType: resolvedRemoteCandidateType,
         protocol,
         localAddress,
         remoteAddress,
