@@ -20,9 +20,10 @@ cp backend/server/.env.example backend/server/.env
 前端开发：
 
 ```bash
+corepack enable
 cd frontend/web
-npm install
-npm run dev
+pnpm install
+pnpm run dev
 ```
 
 后端开发：
@@ -75,7 +76,7 @@ make deploy
 这一个命令会顺序完成：
 
 1. 加载 `nvm` 和 `cargo` 环境
-2. 前端 `npm ci && npm run build`
+2. 前端 `corepack pnpm install --frozen-lockfile --prefer-offline && corepack pnpm run build`
 3. 产物输出到 `backend/server/web-dist`
 4. Rust `cargo build --release --target x86_64-unknown-linux-gnu`
 5. 二进制复制到 `backend/server/build/patrick-im-server`

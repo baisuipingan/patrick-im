@@ -11,7 +11,7 @@ SERVICE_NAME := patrick-im-server
 COMPOSE_FILE := ops/docker-compose.server.yml
 DOCKER_COMPOSE := docker compose -f $(COMPOSE_FILE)
 HOST_RUST_TARGET := $(shell bash --noprofile --norc -c 'source $$HOME/.cargo/env >/dev/null 2>&1 || true; rustc -vV 2>/dev/null | sed -n "s/^host: //p"' || true)
-NPM_CI_FLAGS := --no-audit --no-fund --prefer-offline
+PNPM_INSTALL_FLAGS := install --frozen-lockfile --prefer-offline
 
 .PHONY: help env-check frontend-build release release-host release-x86 docker-build docker-up deploy deploy-x86 status logs clean
 
@@ -33,7 +33,7 @@ endef
 
 help:
 	@printf '%s\n' \
-	  'make env-check     # 检查 node/npm/cargo/docker' \
+	  'make env-check     # 检查 node/corepack/cargo/docker' \
 	  'make frontend-build # 构建前端到 backend/server/web-dist' \
 	  'make release       # 按当前宿主机架构构建 release 二进制' \
 	  'make release-x86   # 构建 x86_64 Linux release 二进制' \
@@ -47,11 +47,12 @@ help:
 env-check:
 	@$(load_toolchains); \
 	$(call require_command,node); \
-	$(call require_command,npm); \
+	$(call require_command,corepack); \
 	$(call require_command,cargo); \
 	$(call require_command,docker); \
 	printf 'node=%s\n' "$$(node -v)"; \
-	printf 'npm=%s\n' "$$(npm -v)"; \
+	printf 'corepack=%s\n' "$$(corepack --version)"; \
+	printf 'pnpm=%s\n' "$$(corepack pnpm --version)"; \
 	printf 'cargo=%s\n' "$$(cargo -V)"; \
 	printf 'rustc=%s\n' "$$(rustc -V)"; \
 	printf 'docker=%s\n' "$$(docker -v)"; \
@@ -63,8 +64,8 @@ frontend-build: env-check
 	@find $(WEB_DIST_DIR) -mindepth 1 -maxdepth 1 ! -name '.gitkeep' -exec rm -rf {} +
 	@$(load_toolchains); \
 	cd $(FRONTEND_DIR); \
-	npm ci $(NPM_CI_FLAGS); \
-	npm run build
+	corepack pnpm $(PNPM_INSTALL_FLAGS); \
+	corepack pnpm run build
 
 release:
 	@if [[ -z "$(HOST_RUST_TARGET)" ]]; then \

@@ -7,6 +7,7 @@ pnpm-debug.log*
 
 # Dependencies and build outputs
 node_modules/
+.pnpm-store/
 target/
 backend/server/build/*
 !backend/server/build/.gitkeep
