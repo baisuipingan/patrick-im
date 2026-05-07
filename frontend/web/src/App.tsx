@@ -515,9 +515,9 @@ function directPathDescription(path?: DirectPathInfo | null): string {
     case 'lan':
       if (
         (path.localCandidateType === 'prflx' || path.remoteCandidateType === 'prflx') &&
-        (path.localAddress || path.remoteAddress)
+        (path.localAddress || path.remoteAddress || path.roundTripTimeMs)
       ) {
-        return '当前 candidate pair 里虽然出现了 prflx，但地址仍是内网地址，按局域网直连处理。';
+        return '当前 candidate pair 里虽然出现了 prflx，但地址或时延特征仍像本地网络，按局域网直连处理。';
       }
       return '当前是本地网络直连。';
     case 'stun':

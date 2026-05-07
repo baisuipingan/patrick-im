@@ -82,6 +82,7 @@ interface DirectPathInfo {
   protocol?: string;
   localAddress?: string;
   remoteAddress?: string;
+  roundTripTimeMs?: number;
 }
 
 interface OutgoingTransfer {
@@ -167,15 +168,31 @@ function classifyDirectPath(
   remoteCandidateType?: string,
   localAddress?: string,
   remoteAddress?: string,
+  roundTripTimeMs?: number,
 ): DirectPathKind {
   if (localCandidateType === 'relay' || remoteCandidateType === 'relay') {
     return 'turn';
   }
 
-  const looksLocalDirect =
-    isLocalNetworkCandidate(localCandidateType, localAddress) &&
-    isLocalNetworkCandidate(remoteCandidateType, remoteAddress);
-  if (looksLocalDirect) {
+  const localLooksPrivate = isLocalNetworkCandidate(localCandidateType, localAddress);
+  const remoteLooksPrivate = isLocalNetworkCandidate(remoteCandidateType, remoteAddress);
+  if (localLooksPrivate && remoteLooksPrivate) {
+    return 'lan';
+  }
+
+  const hasReflexiveCandidate =
+    localCandidateType === 'srflx' ||
+    remoteCandidateType === 'srflx' ||
+    localCandidateType === 'prflx' ||
+    remoteCandidateType === 'prflx';
+  const usesOnlyDirectCandidates = isDirectCandidateType(localCandidateType) && isDirectCandidateType(remoteCandidateType);
+  const hasLocalNetworkEvidence = localLooksPrivate || remoteLooksPrivate;
+  const likelyLocalNatPath =
+    usesOnlyDirectCandidates &&
+    hasLocalNetworkEvidence &&
+    hasReflexiveCandidate &&
+    isLocalNetworkRtt(roundTripTimeMs);
+  if (likelyLocalNatPath) {
     return 'lan';
   }
 
@@ -193,6 +210,14 @@ function classifyDirectPath(
   }
 
   return 'unknown';
+}
+
+function isDirectCandidateType(candidateType?: string): boolean {
+  return candidateType === 'host' || candidateType === 'srflx' || candidateType === 'prflx';
+}
+
+function isLocalNetworkRtt(roundTripTimeMs?: number): boolean {
+  return typeof roundTripTimeMs === 'number' && roundTripTimeMs > 0 && roundTripTimeMs <= 12;
 }
 
 function isLocalNetworkCandidate(candidateType?: string, address?: string): boolean {
@@ -1182,6 +1207,10 @@ export class PeerMesh {
       const protocol =
         (typeof localCandidate?.protocol === 'string' ? localCandidate.protocol : undefined) ??
         (typeof selectedPair.protocol === 'string' ? selectedPair.protocol : undefined);
+      const roundTripTimeMs =
+        typeof selectedPair.currentRoundTripTime === 'number'
+          ? Math.round(selectedPair.currentRoundTripTime * 1000)
+          : undefined;
 
       this.publishPathInfo(session, {
         kind: classifyDirectPath(
@@ -1189,12 +1218,14 @@ export class PeerMesh {
           remoteCandidateType,
           localAddress,
           remoteAddress,
+          roundTripTimeMs,
         ),
         localCandidateType,
         remoteCandidateType,
         protocol,
         localAddress,
         remoteAddress,
+        roundTripTimeMs,
       });
     } catch {
       // Ignore stats failures; path tooltip can stay in previous known state.
