@@ -513,7 +513,13 @@ function directPathLabel(path?: DirectPathInfo | null): string {
 function directPathDescription(path?: DirectPathInfo | null): string {
   switch (path?.kind) {
     case 'lan':
-      return '当前是 host-host，本地网络直连。';
+      if (
+        (path.localCandidateType === 'prflx' || path.remoteCandidateType === 'prflx') &&
+        (path.localAddress || path.remoteAddress)
+      ) {
+        return '当前 candidate pair 里虽然出现了 prflx，但地址仍是内网地址，按局域网直连处理。';
+      }
+      return '当前是本地网络直连。';
     case 'stun':
       return '当前通过 STUN 打洞建立直连，不是纯局域网。';
     case 'turn':
@@ -2289,6 +2295,7 @@ export default function App() {
         'content-type': 'application/json',
       },
       body: JSON.stringify({
+        clientRequestId: pendingAttachmentId ?? crypto.randomUUID(),
         roomId,
         fileName: file.name,
         contentType: file.type,
@@ -2903,6 +2910,11 @@ export default function App() {
           本地 {candidateTypeLabel(path?.localCandidateType)} · 远端 {candidateTypeLabel(path?.remoteCandidateType)} ·{' '}
           {(path?.protocol ?? 'udp').toUpperCase()}
         </div>
+        {path?.localAddress || path?.remoteAddress ? (
+          <div className="mt-1 whitespace-normal break-words text-[11px] text-slate-400">
+            {path?.localAddress ? `本地 ${path.localAddress}` : '本地 -'} · {path?.remoteAddress ? `远端 ${path.remoteAddress}` : '远端 -'}
+          </div>
+        ) : null}
       </div>
     );
   }

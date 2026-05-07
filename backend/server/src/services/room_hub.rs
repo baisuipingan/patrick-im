@@ -1,5 +1,5 @@
 use crate::protocol::{RoomPeer, ServerToClientMessage};
-use crate::state::ClientTx;
+use crate::state::{ClientSendError, ClientTx};
 use crate::utils::{now_ms, sanitize_nickname};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -33,6 +33,7 @@ pub struct JoinRoomResult {
     pub connection_id: String,
     pub peers: Vec<RoomPeer>,
     pub joined_peer: RoomPeer,
+    pub replaced_tx: Option<ClientTx>,
 }
 
 impl RoomHub {
@@ -54,10 +55,10 @@ impl RoomHub {
         let fallback_name = client_id.chars().take(4).collect::<String>();
         let sanitized_name = sanitize_nickname(nickname, &fallback_name);
 
-        let (peers, joined_peer) = {
+        let (peers, joined_peer, replaced_tx) = {
             let mut rooms = self.rooms.write().await;
             let room = rooms.entry(room_id.to_owned()).or_default();
-            room.peers.insert(
+            let replaced = room.peers.insert(
                 client_id.to_owned(),
                 RoomPeerSession {
                     connectionId: connection_id.clone(),
@@ -84,13 +85,14 @@ impl RoomHub {
                     joinedAt: peer.joinedAt,
                 })
                 .collect::<Vec<_>>();
-            (peers, joined_peer)
+            (peers, joined_peer, replaced.map(|session| session.tx))
         };
 
         JoinRoomResult {
             connection_id,
             peers,
             joined_peer,
+            replaced_tx,
         }
     }
 
@@ -150,7 +152,12 @@ impl RoomHub {
         if peer.connectionId != connection_id {
             return None;
         }
-        peer.nickname = sanitize_nickname(&nickname, &peer.nickname);
+        let next_nickname = sanitize_nickname(&nickname, &peer.nickname);
+        if next_nickname == peer.nickname {
+            peer.lastSeenAt = now_ms();
+            return None;
+        }
+        peer.nickname = next_nickname;
         peer.lastSeenAt = now_ms();
         Some(RoomPeer {
             clientId: peer.clientId.clone(),
@@ -226,7 +233,19 @@ impl RoomHub {
         };
 
         for target in targets {
-            let _ = target.send(encoded.clone());
+            if let Err(error) = target.try_send(encoded.clone()) {
+                match error {
+                    ClientSendError::Closed => {
+                        tracing::debug!(room_id, "dropping closed outbound client queue");
+                    }
+                    ClientSendError::Backpressure => {
+                        tracing::warn!(
+                            room_id,
+                            "closing slow outbound client due to queue backpressure"
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -236,13 +255,135 @@ impl RoomHub {
     {
         let encoded = serde_json::to_string(payload)
             .map_err(|_| salvo::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-        tx.send(encoded)
-            .map_err(|_| salvo::http::StatusCode::INTERNAL_SERVER_ERROR)
+        tx.try_send(encoded)
+            .map_err(|_| salvo::http::StatusCode::SERVICE_UNAVAILABLE)
     }
 }
 
 impl Default for RoomHub {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::ServerToClientMessage;
+    use tokio::sync::{mpsc, watch};
+
+    fn client(capacity: usize) -> (ClientTx, mpsc::Receiver<String>, watch::Receiver<bool>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        (ClientTx::new(sender, shutdown_tx), receiver, shutdown_rx)
+    }
+
+    #[tokio::test]
+    async fn join_room_returns_existing_peers_and_tracks_connection() {
+        let hub = RoomHub::new();
+        let (alice_tx, _alice_rx, _alice_shutdown) = client(4);
+        let (bob_tx, _bob_rx, _bob_shutdown) = client(4);
+
+        let alice = hub.join_room("room-1", "alice", "Alice", alice_tx).await;
+        let bob = hub.join_room("room-1", "bob", "Bob", bob_tx).await;
+
+        assert!(alice.peers.is_empty());
+        assert!(alice.replaced_tx.is_none());
+        assert_eq!(bob.peers.len(), 1);
+        assert_eq!(bob.peers[0].clientId, "alice");
+        assert!(
+            hub.is_current_connection("room-1", "bob", &bob.connection_id)
+                .await
+        );
+        assert!(!hub.is_current_connection("room-1", "bob", "wrong").await);
+    }
+
+    #[tokio::test]
+    async fn join_room_returns_previous_connection_sender_for_same_client() {
+        let hub = RoomHub::new();
+        let (first_tx, _first_rx, first_shutdown) = client(4);
+        let (second_tx, _second_rx, _second_shutdown) = client(4);
+
+        let first = hub.join_room("room-1", "alice", "Alice", first_tx).await;
+        let second = hub.join_room("room-1", "alice", "Alice 2", second_tx).await;
+
+        assert!(first.replaced_tx.is_none());
+        let replaced = second.replaced_tx.expect("expected replaced connection");
+        replaced.close();
+        assert!(*first_shutdown.borrow());
+        assert!(
+            hub.is_current_connection("room-1", "alice", &second.connection_id)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_respects_except_and_only_filters() {
+        let hub = RoomHub::new();
+        let (alice_tx, mut alice_rx, _alice_shutdown) = client(4);
+        let (bob_tx, mut bob_rx, _bob_shutdown) = client(4);
+        let (carol_tx, mut carol_rx, _carol_shutdown) = client(4);
+
+        hub.join_room("room-1", "alice", "Alice", alice_tx).await;
+        hub.join_room("room-1", "bob", "Bob", bob_tx).await;
+        hub.join_room("room-1", "carol", "Carol", carol_tx).await;
+
+        hub.broadcast(
+            "room-1",
+            Some("alice"),
+            Some(&["bob".to_owned()]),
+            &ServerToClientMessage::PeerLeft {
+                clientId: "ghost".to_owned(),
+            },
+        )
+        .await;
+
+        assert!(alice_rx.try_recv().is_err());
+        let bob_message = bob_rx.try_recv().expect("bob should receive broadcast");
+        let bob_json: serde_json::Value = serde_json::from_str(&bob_message).unwrap();
+        assert_eq!(bob_json["type"], "peer-left");
+        assert_eq!(bob_json["clientId"], "ghost");
+        assert!(carol_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn broadcast_closes_slow_client_when_queue_fills() {
+        let hub = RoomHub::new();
+        let (slow_tx, _slow_rx, slow_shutdown) = client(1);
+
+        hub.join_room("room-1", "slow", "Slow", slow_tx).await;
+        hub.broadcast(
+            "room-1",
+            None,
+            None,
+            &ServerToClientMessage::Pong { serverTime: 1 },
+        )
+        .await;
+        hub.broadcast(
+            "room-1",
+            None,
+            None,
+            &ServerToClientMessage::Pong { serverTime: 2 },
+        )
+        .await;
+
+        assert!(*slow_shutdown.borrow());
+    }
+
+    #[tokio::test]
+    async fn rename_peer_ignores_duplicate_nickname_updates() {
+        let hub = RoomHub::new();
+        let (tx, _rx, _shutdown) = client(4);
+        let joined = hub.join_room("room-1", "alice", "Alice", tx).await;
+
+        let renamed = hub
+            .rename_peer("room-1", "alice", &joined.connection_id, "Alice".to_owned())
+            .await;
+
+        assert!(renamed.is_none());
+        assert_eq!(
+            hub.display_name_for("room-1", "alice").await.as_deref(),
+            Some("Alice")
+        );
     }
 }

@@ -1,5 +1,6 @@
 #![allow(non_snake_case)]
 
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -55,16 +56,64 @@ pub struct RelayFileAnnouncement {
     pub previewable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MessageKind {
+    Text,
+    RelayFile,
+}
+
+impl MessageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::RelayFile => "relay-file",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "text" => Ok(Self::Text),
+            "relay-file" => Ok(Self::RelayFile),
+            _ => bail!("unsupported message kind: {value}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MessageTransport {
+    ServerSync,
+    ServerRelay,
+}
+
+impl MessageTransport {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ServerSync => "server-sync",
+            Self::ServerRelay => "server-relay",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "server-sync" => Ok(Self::ServerSync),
+            "server-relay" => Ok(Self::ServerRelay),
+            _ => bail!("unsupported message transport: {value}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub id: String,
     pub roomId: String,
-    pub kind: String,
+    pub kind: MessageKind,
     pub fromId: String,
     pub fromName: String,
     pub targetId: Option<String>,
     pub createdAt: u64,
-    pub transport: String,
+    pub transport: MessageTransport,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,6 +152,8 @@ pub struct ClearThreadResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayUploadRequest {
+    #[serde(default)]
+    pub clientRequestId: Option<String>,
     pub roomId: String,
     pub fileName: String,
     pub contentType: String,
@@ -228,4 +279,29 @@ pub enum ClientToServerMessage {
 
 pub fn is_previewable_image(content_type: &str) -> bool {
     content_type.starts_with("image/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_kind_serializes_as_legacy_wire_string() {
+        let encoded = serde_json::to_string(&MessageKind::RelayFile).unwrap();
+        assert_eq!(encoded, "\"relay-file\"");
+        assert_eq!(
+            serde_json::from_str::<MessageKind>(&encoded).unwrap(),
+            MessageKind::RelayFile
+        );
+    }
+
+    #[test]
+    fn message_transport_serializes_as_legacy_wire_string() {
+        let encoded = serde_json::to_string(&MessageTransport::ServerRelay).unwrap();
+        assert_eq!(encoded, "\"server-relay\"");
+        assert_eq!(
+            serde_json::from_str::<MessageTransport>(&encoded).unwrap(),
+            MessageTransport::ServerRelay
+        );
+    }
 }

@@ -157,6 +157,7 @@ export type ClientToServerMessage =
   | PingMessage;
 
 export interface RelayUploadRequest {
+  clientRequestId?: string;
   roomId: string;
   fileName: string;
   contentType: string;

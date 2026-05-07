@@ -1,24 +1,18 @@
 use crate::config::AppConfig;
 use crate::protocol::{
-    RelayAbortUploadRequest, RelayCompleteUploadRequest, RelayCompleteUploadResponse,
-    RelayDiscardUploadRequest, RelayFileAnnouncement, RelayFileDescriptor, RelayPresignedHeader,
+    RelayAbortUploadRequest, RelayCompleteUploadRequest, RelayFileDescriptor, RelayPresignedHeader,
     RelayPresignedPart, RelayUploadRequest, RelayUploadResponse,
 };
 use crate::session::SessionPayload;
 use crate::signing::{create_signed_token, read_signed_token};
-use crate::utils::{
-    build_object_key, now_ms, previewable_from_content_type, sanitize_file_name, sanitize_room_id,
-};
+use crate::utils::{build_object_key, now_ms, sanitize_file_name, sanitize_room_id};
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Builder as S3ConfigBuilder, Credentials, Region};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use uuid::Uuid;
 
 const RELAY_CHUNK_SIZE_BYTES: usize = 8 * 1024 * 1024;
@@ -26,29 +20,42 @@ const RELAY_UPLOAD_URL_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
-struct RelayUploadTokenPayload {
-    fileId: String,
-    objectKey: String,
-    uploadId: String,
-    roomId: String,
-    fileName: String,
-    contentType: String,
-    size: u64,
-    targetId: Option<String>,
-    fromId: String,
-    issuedAt: u64,
+pub struct RelayUploadTokenPayload {
+    pub fileId: String,
+    pub objectKey: String,
+    pub uploadId: String,
+    pub roomId: String,
+    pub fileName: String,
+    pub contentType: String,
+    pub size: u64,
+    pub targetId: Option<String>,
+    pub fromId: String,
+    pub issuedAt: u64,
 }
 
 #[derive(Debug, Clone)]
-struct CompletedUploadRecord {
-    file_id: String,
-    room_id: String,
-    file_name: String,
-    size: u64,
-    content_type: String,
-    object_key: String,
-    target_id: Option<String>,
-    from_id: String,
+pub struct CompletedRelayUpload {
+    pub file_id: String,
+    pub room_id: String,
+    pub file_name: String,
+    pub size: u64,
+    pub content_type: String,
+    pub object_key: String,
+    pub target_id: Option<String>,
+    pub from_id: String,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreatedRelayUpload {
+    pub token_payload: RelayUploadTokenPayload,
+    pub response: RelayUploadResponse,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelayUploadHandle {
+    pub file_id: String,
+    pub object_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +64,6 @@ pub struct RelayStore {
     presign_client: Client,
     bucket: String,
     signing_secret: String,
-    completed_uploads: Arc<RwLock<HashMap<String, CompletedUploadRecord>>>,
 }
 
 impl RelayStore {
@@ -75,7 +81,6 @@ impl RelayStore {
             ),
             bucket: config.rustfs_bucket.clone(),
             signing_secret: config.session_secret.clone(),
-            completed_uploads: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -83,15 +88,10 @@ impl RelayStore {
         &self,
         session: &SessionPayload,
         request: RelayUploadRequest,
-    ) -> Result<RelayUploadResponse> {
-        let part_count = request.size.div_ceil(RELAY_CHUNK_SIZE_BYTES as u64);
+    ) -> Result<CreatedRelayUpload> {
         let room_id = sanitize_room_id(&request.roomId);
         let file_name = sanitize_file_name(&request.fileName);
-        let content_type = if request.contentType.trim().is_empty() {
-            "application/octet-stream".to_owned()
-        } else {
-            request.contentType
-        };
+        let content_type = normalize_content_type(&request.contentType);
 
         let file_id = Uuid::new_v4().to_string();
         let object_key = build_object_key(&room_id, &file_id, &file_name);
@@ -132,24 +132,46 @@ impl RelayStore {
             issuedAt: now_ms(),
         };
 
-        let part_urls = self
-            .create_presigned_part_urls(&payload.objectKey, &payload.uploadId, part_count)
-            .await?;
+        let response = self.build_upload_response(&payload).await?;
 
-        Ok(RelayUploadResponse {
-            fileId: file_id,
-            objectKey: object_key,
-            uploadToken: create_signed_token(&self.signing_secret, &payload)?,
-            chunkSizeBytes: RELAY_CHUNK_SIZE_BYTES as u64,
-            partUrls: part_urls,
+        Ok(CreatedRelayUpload {
+            token_payload: payload,
+            response,
         })
+    }
+
+    pub async fn resume_upload(
+        &self,
+        file_id: &str,
+        object_key: &str,
+        upload_id: &str,
+        room_id: &str,
+        file_name: &str,
+        content_type: &str,
+        size: u64,
+        target_id: Option<String>,
+        from_id: &str,
+    ) -> Result<RelayUploadResponse> {
+        self.build_upload_response(&RelayUploadTokenPayload {
+            fileId: file_id.to_owned(),
+            objectKey: object_key.to_owned(),
+            uploadId: upload_id.to_owned(),
+            roomId: room_id.to_owned(),
+            fileName: file_name.to_owned(),
+            contentType: content_type.to_owned(),
+            size,
+            targetId: target_id,
+            fromId: from_id.to_owned(),
+            issuedAt: now_ms(),
+        })
+        .await
     }
 
     pub async fn complete_upload(
         &self,
         session: &SessionPayload,
         request: RelayCompleteUploadRequest,
-    ) -> Result<RelayCompleteUploadResponse> {
+    ) -> Result<CompletedRelayUpload> {
         let payload = self.read_upload_token(&request.uploadToken)?;
         if payload.fromId != session.clientId {
             return Err(anyhow!("invalid upload token owner"));
@@ -183,23 +205,16 @@ impl RelayStore {
             .await
             .context("failed to complete relay upload")?;
 
-        self.completed_uploads.write().await.insert(
-            payload.fileId.clone(),
-            CompletedUploadRecord {
-                file_id: payload.fileId.clone(),
-                room_id: payload.roomId,
-                file_name: payload.fileName,
-                size: payload.size,
-                content_type: payload.contentType,
-                object_key: payload.objectKey.clone(),
-                target_id: payload.targetId,
-                from_id: payload.fromId,
-            },
-        );
-
-        Ok(RelayCompleteUploadResponse {
-            fileId: payload.fileId,
-            objectKey: payload.objectKey,
+        Ok(CompletedRelayUpload {
+            file_id: payload.fileId,
+            room_id: payload.roomId,
+            file_name: payload.fileName,
+            size: payload.size,
+            content_type: payload.contentType,
+            object_key: payload.objectKey,
+            target_id: payload.targetId,
+            from_id: payload.fromId,
+            created_at: now_ms(),
         })
     }
 
@@ -221,78 +236,62 @@ impl RelayStore {
             .upload_id(payload.uploadId)
             .send()
             .await;
-        self.completed_uploads.write().await.remove(&payload.fileId);
         Ok(result.is_ok())
     }
 
-    pub async fn discard_upload(
+    pub async fn abort_upload_by_key(&self, object_key: &str, upload_id: &str) -> Result<()> {
+        self.client
+            .abort_multipart_upload()
+            .bucket(&self.bucket)
+            .key(object_key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .with_context(|| format!("failed to abort relay upload {object_key}"))
+            .map(|_| ())
+    }
+
+    pub fn verify_upload_token(
         &self,
         session: &SessionPayload,
-        request: RelayDiscardUploadRequest,
-    ) -> Result<()> {
-        let payload = self.read_upload_token(&request.uploadToken)?;
+        upload_token: &str,
+    ) -> Result<RelayUploadHandle> {
+        let payload = self.read_upload_token(upload_token)?;
         if payload.fromId != session.clientId {
             return Err(anyhow!("invalid upload token owner"));
         }
 
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(&payload.objectKey)
-            .send()
-            .await
-            .context("failed to discard completed relay object")?;
-        self.completed_uploads.write().await.remove(&payload.fileId);
-        Ok(())
-    }
-
-    pub async fn confirm_announced_file(
-        &self,
-        room_id: &str,
-        client_id: &str,
-        file: RelayFileAnnouncement,
-    ) -> Result<RelayFileAnnouncement> {
-        let mut uploads = self.completed_uploads.write().await;
-        let Some(record) = uploads.remove(&file.fileId) else {
-            return Err(anyhow!("relay file upload is not ready to announce"));
-        };
-
-        if record.from_id != client_id
-            || record.room_id != room_id
-            || record.object_key != file.objectKey
-            || record.file_name != file.fileName
-            || record.size != file.size
-            || record.content_type != file.contentType
-            || record.target_id != file.targetId
-        {
-            return Err(anyhow!(
-                "relay file announcement does not match completed upload"
-            ));
-        }
-
-        Ok(RelayFileAnnouncement {
-            fileId: record.file_id,
-            fileName: record.file_name,
-            size: record.size,
-            contentType: record.content_type.clone(),
-            objectKey: record.object_key,
-            targetId: record.target_id,
-            previewable: previewable_from_content_type(&file.contentType),
+        Ok(RelayUploadHandle {
+            file_id: payload.fileId,
+            object_key: payload.objectKey,
         })
     }
 
+    pub fn describe_upload_token(
+        &self,
+        session: &SessionPayload,
+        upload_token: &str,
+    ) -> Result<RelayUploadTokenPayload> {
+        let payload = self.read_upload_token(upload_token)?;
+        if payload.fromId != session.clientId {
+            return Err(anyhow!("invalid upload token owner"));
+        }
+
+        Ok(payload)
+    }
+
     pub async fn delete_object(&self, descriptor: &RelayFileDescriptor) -> Result<()> {
+        self.delete_object_by_key(&descriptor.objectKey).await
+    }
+
+    pub async fn delete_object_by_key(&self, object_key: &str) -> Result<()> {
         self.client
             .delete_object()
             .bucket(&self.bucket)
-            .key(&descriptor.objectKey)
+            .key(object_key)
             .send()
             .await
-            .with_context(|| format!("failed to delete relay object {}", descriptor.objectKey))?;
-        self.completed_uploads
-            .write()
-            .await
-            .remove(&descriptor.fileId);
+            .with_context(|| format!("failed to delete relay object {object_key}"))?;
         Ok(())
     }
 
@@ -318,6 +317,24 @@ impl RelayStore {
 
     fn read_upload_token(&self, token: &str) -> Result<RelayUploadTokenPayload> {
         read_signed_token(&self.signing_secret, token)
+    }
+
+    async fn build_upload_response(
+        &self,
+        payload: &RelayUploadTokenPayload,
+    ) -> Result<RelayUploadResponse> {
+        let part_count = payload.size.div_ceil(RELAY_CHUNK_SIZE_BYTES as u64);
+        let part_urls = self
+            .create_presigned_part_urls(&payload.objectKey, &payload.uploadId, part_count)
+            .await?;
+
+        Ok(RelayUploadResponse {
+            fileId: payload.fileId.clone(),
+            objectKey: payload.objectKey.clone(),
+            uploadToken: create_signed_token(&self.signing_secret, payload)?,
+            chunkSizeBytes: RELAY_CHUNK_SIZE_BYTES as u64,
+            partUrls: part_urls,
+        })
     }
 
     async fn create_presigned_part_urls(
@@ -376,4 +393,12 @@ fn build_s3_client(endpoint: &str, access_key: &str, secret_key: &str) -> Client
         .credentials_provider(credentials)
         .build();
     Client::from_conf(s3_config)
+}
+
+fn normalize_content_type(content_type: &str) -> String {
+    if content_type.trim().is_empty() {
+        "application/octet-stream".to_owned()
+    } else {
+        content_type.to_owned()
+    }
 }

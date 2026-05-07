@@ -80,6 +80,8 @@ interface DirectPathInfo {
   localCandidateType?: string;
   remoteCandidateType?: string;
   protocol?: string;
+  localAddress?: string;
+  remoteAddress?: string;
 }
 
 interface OutgoingTransfer {
@@ -160,9 +162,21 @@ function buildPathInfoKey(path: DirectPathInfo | null): string {
   return `${path.kind}:${path.localCandidateType ?? '-'}:${path.remoteCandidateType ?? '-'}:${path.protocol ?? '-'}`;
 }
 
-function classifyDirectPath(localCandidateType?: string, remoteCandidateType?: string): DirectPathKind {
+function classifyDirectPath(
+  localCandidateType?: string,
+  remoteCandidateType?: string,
+  localAddress?: string,
+  remoteAddress?: string,
+): DirectPathKind {
   if (localCandidateType === 'relay' || remoteCandidateType === 'relay') {
     return 'turn';
+  }
+
+  const looksLocalDirect =
+    isLocalNetworkCandidate(localCandidateType, localAddress) &&
+    isLocalNetworkCandidate(remoteCandidateType, remoteAddress);
+  if (looksLocalDirect) {
+    return 'lan';
   }
 
   if (
@@ -179,6 +193,74 @@ function classifyDirectPath(localCandidateType?: string, remoteCandidateType?: s
   }
 
   return 'unknown';
+}
+
+function isLocalNetworkCandidate(candidateType?: string, address?: string): boolean {
+  if (candidateType === 'host' && !address) {
+    return true;
+  }
+
+  if (candidateType !== 'host' && candidateType !== 'prflx') {
+    return false;
+  }
+
+  if (!address) {
+    return false;
+  }
+
+  return isMdnsHost(address) || isPrivateIpAddress(address);
+}
+
+function isMdnsHost(value: string): boolean {
+  return value.endsWith('.local');
+}
+
+function isPrivateIpAddress(value: string): boolean {
+  const normalized = value
+    .trim()
+    .replace(/^\[|\]$/g, '')
+    .split('%')[0];
+
+  const ipv4 = normalized.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const [a, b] = ipv4.slice(1).map((segment) => Number(segment));
+    if ([a, b].some((segment) => Number.isNaN(segment))) {
+      return false;
+    }
+    if (a === 10 || a === 127) {
+      return true;
+    }
+    if (a === 192 && b === 168) {
+      return true;
+    }
+    if (a === 172 && b >= 16 && b <= 31) {
+      return true;
+    }
+    if (a === 169 && b === 254) {
+      return true;
+    }
+    return false;
+  }
+
+  const lower = normalized.toLowerCase();
+  return (
+    lower === '::1' ||
+    lower.startsWith('fc') ||
+    lower.startsWith('fd') ||
+    lower.startsWith('fe8') ||
+    lower.startsWith('fe9') ||
+    lower.startsWith('fea') ||
+    lower.startsWith('feb')
+  );
+}
+
+function readCandidateAddress(candidate?: Record<string, unknown>): string | undefined {
+  const direct = typeof candidate?.address === 'string' ? candidate.address : undefined;
+  if (direct) {
+    return direct;
+  }
+
+  return typeof candidate?.ip === 'string' ? candidate.ip : undefined;
 }
 
 export class PeerMesh {
@@ -1095,15 +1177,24 @@ export class PeerMesh {
         typeof localCandidate?.candidateType === 'string' ? localCandidate.candidateType : undefined;
       const remoteCandidateType =
         typeof remoteCandidate?.candidateType === 'string' ? remoteCandidate.candidateType : undefined;
+      const localAddress = readCandidateAddress(localCandidate);
+      const remoteAddress = readCandidateAddress(remoteCandidate);
       const protocol =
         (typeof localCandidate?.protocol === 'string' ? localCandidate.protocol : undefined) ??
         (typeof selectedPair.protocol === 'string' ? selectedPair.protocol : undefined);
 
       this.publishPathInfo(session, {
-        kind: classifyDirectPath(localCandidateType, remoteCandidateType),
+        kind: classifyDirectPath(
+          localCandidateType,
+          remoteCandidateType,
+          localAddress,
+          remoteAddress,
+        ),
         localCandidateType,
         remoteCandidateType,
         protocol,
+        localAddress,
+        remoteAddress,
       });
     } catch {
       // Ignore stats failures; path tooltip can stay in previous known state.
