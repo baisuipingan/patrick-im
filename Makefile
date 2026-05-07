@@ -11,6 +11,7 @@ SERVICE_NAME := patrick-im-server
 COMPOSE_FILE := ops/docker-compose.server.yml
 DOCKER_COMPOSE := docker compose -f $(COMPOSE_FILE)
 HOST_RUST_TARGET := $(shell bash --noprofile --norc -c 'source $$HOME/.cargo/env >/dev/null 2>&1 || true; rustc -vV 2>/dev/null | sed -n "s/^host: //p"' || true)
+NPM_CI_FLAGS := --no-audit --no-fund --prefer-offline
 
 .PHONY: help env-check frontend-build release release-host release-x86 docker-build docker-up deploy deploy-x86 status logs clean
 
@@ -62,7 +63,7 @@ frontend-build: env-check
 	@find $(WEB_DIST_DIR) -mindepth 1 -maxdepth 1 ! -name '.gitkeep' -exec rm -rf {} +
 	@$(load_toolchains); \
 	cd $(FRONTEND_DIR); \
-	npm ci --no-audit --no-fund; \
+	npm ci $(NPM_CI_FLAGS); \
 	npm run build
 
 release:
