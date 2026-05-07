@@ -500,11 +500,11 @@ function directPathLabel(path?: DirectPathInfo | null): string {
     case 'lan':
       return '局域网直连';
     case 'stun':
-      return 'STUN 打洞';
+      return '局域网直连';
     case 'turn':
-      return 'TURN 中继';
+      return '中继';
     case 'unknown':
-      return '链路未知';
+      return '局域网直连';
     default:
       return '识别中';
   }
@@ -521,11 +521,11 @@ function directPathDescription(path?: DirectPathInfo | null): string {
       }
       return '当前是本地网络直连。';
     case 'stun':
-      return '当前通过 STUN 打洞建立直连，不是纯局域网。';
+      return '当前是 P2P 直连链路。';
     case 'turn':
-      return '当前实际经过 TURN 中继，这种情况通常会慢很多。';
+      return '当前实际经过中继链路，这种情况通常会慢很多。';
     case 'unknown':
-      return '已经连上，但浏览器还没明确识别出链路类型。';
+      return '当前是 P2P 直连链路。';
     default:
       return '正在读取当前 WebRTC candidate pair。';
   }
