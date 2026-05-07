@@ -534,6 +534,18 @@ function candidateTypeLabel(type?: string): string {
   }
 }
 
+function candidateAddressLabel(side: '本地' | '远端', type?: string, address?: string): string {
+  if (address) {
+    return `${side} ${address}`;
+  }
+
+  if (type === 'host') {
+    return `${side} 浏览器已隐藏`;
+  }
+
+  return `${side} -`;
+}
+
 function peerDotTone(state: DirectPeerState | undefined, presence: PeerPresenceStatus): string {
   if (state === 'connected') {
     return 'bg-emerald-500';
@@ -2892,9 +2904,10 @@ export default function App() {
           本地 {candidateTypeLabel(path?.localCandidateType)} · 远端 {candidateTypeLabel(path?.remoteCandidateType)} ·{' '}
           {(path?.protocol ?? 'udp').toUpperCase()}
         </div>
-        {path?.localAddress || path?.remoteAddress ? (
+        {path?.localAddress || path?.remoteAddress || path?.localCandidateType || path?.remoteCandidateType ? (
           <div className="mt-1 whitespace-normal break-words text-[11px] text-slate-400">
-            {path?.localAddress ? `本地 ${path.localAddress}` : '本地 -'} · {path?.remoteAddress ? `远端 ${path.remoteAddress}` : '远端 -'}
+            {candidateAddressLabel('本地', path?.localCandidateType, path?.localAddress)} ·{' '}
+            {candidateAddressLabel('远端', path?.remoteCandidateType, path?.remoteAddress)}
           </div>
         ) : null}
       </div>
