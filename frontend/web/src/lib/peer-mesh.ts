@@ -168,44 +168,12 @@ function classifyDirectPath(
   remoteCandidateType?: string,
   localAddress?: string,
   remoteAddress?: string,
-  roundTripTimeMs?: number,
 ): DirectPathKind {
   if (localCandidateType === 'relay' || remoteCandidateType === 'relay') {
     return 'turn';
   }
 
-  const localLooksPrivate = isLocalNetworkCandidate(localCandidateType, localAddress);
-  const remoteLooksPrivate = isLocalNetworkCandidate(remoteCandidateType, remoteAddress);
-  if (localLooksPrivate && remoteLooksPrivate) {
-    return 'lan';
-  }
-
-  const hasReflexiveCandidate =
-    localCandidateType === 'srflx' ||
-    remoteCandidateType === 'srflx' ||
-    localCandidateType === 'prflx' ||
-    remoteCandidateType === 'prflx';
-  const usesOnlyDirectCandidates = isDirectCandidateType(localCandidateType) && isDirectCandidateType(remoteCandidateType);
-  const hasLocalNetworkEvidence = localLooksPrivate || remoteLooksPrivate;
-  const likelyLocalNatPath =
-    usesOnlyDirectCandidates &&
-    hasLocalNetworkEvidence &&
-    hasReflexiveCandidate &&
-    isLocalNetworkRtt(roundTripTimeMs);
-  if (likelyLocalNatPath) {
-    return 'lan';
-  }
-
-  if (
-    localCandidateType === 'srflx' ||
-    remoteCandidateType === 'srflx' ||
-    localCandidateType === 'prflx' ||
-    remoteCandidateType === 'prflx'
-  ) {
-    return 'stun';
-  }
-
-  if (localCandidateType === 'host' && remoteCandidateType === 'host') {
+  if (isDirectCandidateType(localCandidateType) || isDirectCandidateType(remoteCandidateType)) {
     return 'lan';
   }
 
@@ -216,8 +184,61 @@ function isDirectCandidateType(candidateType?: string): boolean {
   return candidateType === 'host' || candidateType === 'srflx' || candidateType === 'prflx';
 }
 
-function isLocalNetworkRtt(roundTripTimeMs?: number): boolean {
-  return typeof roundTripTimeMs === 'number' && roundTripTimeMs > 0 && roundTripTimeMs <= 12;
+interface ParsedIceCandidate {
+  candidateType?: string;
+  address?: string;
+  protocol?: string;
+}
+
+function parseIceCandidate(candidate?: RTCIceCandidateInit | RTCIceCandidate | null): ParsedIceCandidate {
+  if (!candidate) {
+    return {};
+  }
+
+  const raw = candidate as Record<string, unknown>;
+  const directType = typeof raw.type === 'string' ? raw.type : undefined;
+  const directAddress =
+    typeof raw.address === 'string'
+      ? raw.address
+      : typeof raw.ip === 'string'
+        ? raw.ip
+        : undefined;
+  const directProtocol = typeof raw.protocol === 'string' ? raw.protocol : undefined;
+
+  const line = typeof candidate.candidate === 'string' ? candidate.candidate.trim() : '';
+  if (!line) {
+    return {
+      candidateType: directType,
+      address: directAddress,
+      protocol: directProtocol,
+    };
+  }
+
+  const parts = line.split(/\s+/);
+  const protocol = directProtocol ?? parts[2];
+  const address = directAddress ?? parts[4];
+  const typeIndex = parts.indexOf('typ');
+  const candidateType =
+    directType ?? (typeIndex >= 0 && typeIndex + 1 < parts.length ? parts[typeIndex + 1] : undefined);
+
+  return {
+    candidateType,
+    address,
+    protocol,
+  };
+}
+
+function isLanIceCandidate(candidate?: RTCIceCandidateInit | RTCIceCandidate | null): boolean {
+  const parsed = parseIceCandidate(candidate);
+  if (parsed.candidateType !== 'host') {
+    return false;
+  }
+
+  if (!parsed.address) {
+    return true;
+  }
+
+  return isMdnsHost(parsed.address) || isPrivateIpAddress(parsed.address);
 }
 
 function isLocalNetworkCandidate(candidateType?: string, address?: string): boolean {
@@ -309,7 +330,7 @@ export class PeerMesh {
     }
 
     const pc = new RTCPeerConnection({
-      iceServers: this.callbacks.iceServers,
+      iceServers: [],
     });
     const session: PeerSession = {
       peer,
@@ -321,8 +342,12 @@ export class PeerMesh {
 
     pc.onicecandidate = (event) => {
       if (event.candidate) {
+        const candidate = event.candidate.toJSON();
+        if (!isLanIceCandidate(candidate)) {
+          return;
+        }
         this.callbacks.sendSignal(peer.clientId, {
-          candidate: event.candidate.toJSON(),
+          candidate,
         });
       }
     };
@@ -403,7 +428,7 @@ export class PeerMesh {
       }
     }
 
-    if (payload.candidate) {
+    if (payload.candidate && isLanIceCandidate(payload.candidate)) {
       if (session.pc.remoteDescription) {
         await session.pc.addIceCandidate(payload.candidate);
       } else {
@@ -1218,7 +1243,6 @@ export class PeerMesh {
           remoteCandidateType,
           localAddress,
           remoteAddress,
-          roundTripTimeMs,
         ),
         localCandidateType,
         remoteCandidateType,

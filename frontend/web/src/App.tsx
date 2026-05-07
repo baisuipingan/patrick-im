@@ -482,16 +482,10 @@ function peerSignalLabel(status: PeerPresenceStatus): string {
 
 function peerStateLabel(state: DirectPeerState | undefined): string {
   switch (state) {
-    case 'connecting':
-      return 'P2P 建立中';
     case 'connected':
-      return 'P2P 已连接';
-    case 'failed':
-      return 'P2P 改走中继';
-    case 'offline':
-      return 'P2P 未连接';
+      return '局域网直连';
     default:
-      return 'P2P 未连接';
+      return '中继模式';
   }
 }
 
@@ -513,21 +507,15 @@ function directPathLabel(path?: DirectPathInfo | null): string {
 function directPathDescription(path?: DirectPathInfo | null): string {
   switch (path?.kind) {
     case 'lan':
-      if (
-        (path.localCandidateType === 'prflx' || path.remoteCandidateType === 'prflx') &&
-        (path.localAddress || path.remoteAddress || path.roundTripTimeMs)
-      ) {
-        return '当前 candidate pair 里虽然出现了 prflx，但地址或时延特征仍像本地网络，按局域网直连处理。';
-      }
-      return '当前是本地网络直连。';
+      return '当前是局域网 WebRTC 直连。';
     case 'stun':
-      return '当前是 P2P 直连链路。';
+      return '当前是局域网 WebRTC 直连。';
     case 'turn':
       return '当前实际经过中继链路，这种情况通常会慢很多。';
     case 'unknown':
-      return '当前是 P2P 直连链路。';
+      return '当前未建立局域网直连，发送文件时会走中继。';
     default:
-      return '正在读取当前 WebRTC candidate pair。';
+      return '当前未建立局域网直连，发送文件时会走中继。';
   }
 }
 
@@ -576,14 +564,8 @@ function peerBadgeTone(state: DirectPeerState | undefined): string {
   switch (state) {
     case 'connected':
       return 'border-emerald-200 bg-emerald-50 text-emerald-700';
-    case 'connecting':
-      return 'border-amber-200 bg-amber-50 text-amber-700';
-    case 'failed':
-      return 'border-orange-200 bg-orange-50 text-orange-700';
-    case 'offline':
-      return 'border-slate-200 bg-slate-100 text-slate-500';
     default:
-      return '';
+      return 'border-amber-200 bg-amber-50 text-amber-700';
   }
 }
 
@@ -609,11 +591,11 @@ function transferStatusLabel(status: TransferRow['status']): string {
 function transportLabel(transport: ChatMessage['transport'] | TransferRow['transport']): string {
   switch (transport) {
     case 'direct-p2p':
-      return 'P2P 直连';
+      return '局域网直连';
     case 'server-relay':
-      return '服务端中继';
+      return '中继';
     case 'server-sync':
-      return '服务端同步';
+      return '聊天同步';
     default:
       return transport;
   }
@@ -2836,9 +2818,9 @@ export default function App() {
     : socketStatusLabel(socketStatus);
   const transferModeTooltipText =
     transferModeTooltip === 'auto'
-      ? '自动：优先尝试直连，失败时再回退到中继。'
+      ? '自动：只在局域网可直连时走 WebRTC，其余情况直接走中继。'
       : transferModeTooltip === 'relay-only'
-        ? '中继：不尝试直连，文件直接走云端中继。'
+        ? '中继：不尝试局域网直连，文件直接走云端中继。'
         : '';
 
   function scheduleTransferModeTooltip(mode: TransferMode): void {
