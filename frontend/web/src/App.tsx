@@ -25,7 +25,6 @@ import type {
   ClearThreadResponse,
   DirectPeerState,
   RelayAbortUploadRequest,
-  RelayDiscardUploadRequest,
   RelayPresignedPart,
   RelayUploadPartResponse,
   RelayUploadResponse,
@@ -65,6 +64,7 @@ const LARGE_DIRECT_FILE_NOTICE_BYTES = 256 * 1024 * 1024;
 const DEFAULT_NOTICE = '把两个浏览器打开到同一个房间后，就可以开始发文字、图片和文件了。';
 const HEADER_BADGE_CLASS = 'h-7 rounded-full px-3 text-[12px] font-medium shadow-sm';
 const PENDING_RELAY_ABORTS_KEY = 'patrick-im:pending-relay-aborts';
+const PENDING_RELAY_ANNOUNCES_KEY = 'patrick-im:pending-relay-announces';
 
 function ShareRoomIcon({ className }: { className?: string }) {
   return (
@@ -113,6 +113,18 @@ interface PendingRelayAbortTicket {
   createdAt: number;
 }
 
+interface PendingRelayAnnounceTicket {
+  uploadToken: string;
+  roomId: string;
+  fileId: string;
+  fileName: string;
+  size: number;
+  contentType: string;
+  objectKey: string;
+  targetId: string | null;
+  createdAt: number;
+}
+
 type SocketStatus = 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'paused' | 'closed' | 'error';
 type PeerPresenceStatus = 'online' | 'offline' | 'recovering' | 'unknown';
 
@@ -158,6 +170,67 @@ function storePendingRelayAbortTickets(tickets: PendingRelayAbortTicket[]): void
   }
 
   window.localStorage.setItem(PENDING_RELAY_ABORTS_KEY, JSON.stringify(tickets.slice(-64)));
+}
+
+function loadPendingRelayAnnounceTickets(): PendingRelayAnnounceTicket[] {
+  if (typeof window === 'undefined') {
+    return [];
+  }
+
+  try {
+    const stored = window.localStorage.getItem(PENDING_RELAY_ANNOUNCES_KEY);
+    const parsed = stored ? (JSON.parse(stored) as PendingRelayAnnounceTicket[]) : [];
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+
+    const seen = new Set<string>();
+    return parsed.filter((item) => {
+      if (
+        !item ||
+        typeof item.uploadToken !== 'string' ||
+        !item.uploadToken ||
+        typeof item.roomId !== 'string' ||
+        !item.roomId ||
+        typeof item.fileId !== 'string' ||
+        !item.fileId ||
+        typeof item.fileName !== 'string' ||
+        !item.fileName ||
+        typeof item.size !== 'number' ||
+        !Number.isFinite(item.size) ||
+        item.size <= 0 ||
+        typeof item.contentType !== 'string' ||
+        !item.contentType ||
+        typeof item.objectKey !== 'string' ||
+        !item.objectKey ||
+        typeof item.createdAt !== 'number' ||
+        !Number.isFinite(item.createdAt)
+      ) {
+        return false;
+      }
+
+      if (item.targetId !== null && typeof item.targetId !== 'string') {
+        return false;
+      }
+
+      if (seen.has(item.fileId)) {
+        return false;
+      }
+
+      seen.add(item.fileId);
+      return true;
+    });
+  } catch {
+    return [];
+  }
+}
+
+function storePendingRelayAnnounceTickets(tickets: PendingRelayAnnounceTicket[]): void {
+  if (typeof window === 'undefined') {
+    return;
+  }
+
+  window.localStorage.setItem(PENDING_RELAY_ANNOUNCES_KEY, JSON.stringify(tickets.slice(-128)));
 }
 
 function getInitialNickname(): string {
@@ -865,9 +938,11 @@ export default function App() {
     name: '',
   });
   const messagesRef = useRef<UiMessage[]>([]);
+  const transfersRef = useRef<Record<string, TransferRow>>({});
   const activeRoomRef = useRef<string | null>(null);
   const activeThreadRef = useRef<string>(GLOBAL_THREAD);
   const relayAbortQueueRef = useRef<PendingRelayAbortTicket[]>(loadPendingRelayAbortTickets());
+  const relayAnnounceQueueRef = useRef<PendingRelayAnnounceTicket[]>(loadPendingRelayAnnounceTickets());
   const copiedMessageTimerRef = useRef<number | null>(null);
   const transferModeTooltipTimerRef = useRef<number | null>(null);
   const peerPathTooltipTimerRef = useRef<number | null>(null);
@@ -995,6 +1070,10 @@ export default function App() {
   }, [messages]);
 
   useEffect(() => {
+    transfersRef.current = transfers;
+  }, [transfers]);
+
+  useEffect(() => {
     activeRoomRef.current = activeRoom;
   }, [activeRoom]);
 
@@ -1094,6 +1173,14 @@ export default function App() {
 
     void flushPendingRelayAborts();
   }, [session]);
+
+  useEffect(() => {
+    if (!session || socketStatus !== 'connected') {
+      return;
+    }
+
+    flushPendingRelayAnnounces();
+  }, [activeRoom, session, socketStatus]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1414,6 +1501,7 @@ export default function App() {
         });
 
         setNotice(getDefaultNotice(activeRoom));
+        flushPendingRelayAnnounces({ roomId: activeRoom });
       };
 
       ws.onmessage = (messageEvent) => {
@@ -1789,6 +1877,26 @@ export default function App() {
     });
   }
 
+  function markRelayTransferSynced(fileId: string): void {
+    const existing = transfersRef.current[fileId];
+    if (!existing || existing.transport !== 'server-relay' || existing.direction !== 'upload') {
+      return;
+    }
+
+    updateTransfer({
+      transferId: existing.id,
+      peerId: existing.peerId,
+      peerName: existing.peerName,
+      fileName: existing.fileName,
+      totalBytes: existing.totalBytes,
+      transferredBytes: existing.totalBytes,
+      direction: 'upload',
+      transport: 'server-relay',
+      status: 'complete',
+      note: '已同步到聊天记录',
+    });
+  }
+
   function applyPeerState(peerId: string, nextState: DirectPeerState): void {
     setDirectStates((current) => ({
       ...current,
@@ -1973,6 +2081,10 @@ export default function App() {
           if (message.targetId) {
             peerNames[message.targetId] = peerNames[message.targetId] ?? message.targetId;
           }
+          if (message.file?.fileId) {
+            forgetRelayAnnounce(message.file.fileId);
+            markRelayTransferSynced(message.file.fileId);
+          }
         }
         peerNamesRef.current = peerNames;
         messagesRef.current = event.messages;
@@ -1985,6 +2097,7 @@ export default function App() {
             ? `已进入房间 ${activeRoom ?? event.roomId}。全局聊天发给整个房间，切到设备会话后就是和该设备的私聊。`
             : current,
         );
+        flushPendingRelayAnnounces({ roomId: event.roomId });
         break;
       }
       case 'peer-joined': {
@@ -2011,6 +2124,10 @@ export default function App() {
         break;
       }
       case 'chat-event':
+        if (event.message.file?.fileId) {
+          forgetRelayAnnounce(event.message.file.fileId);
+          markRelayTransferSynced(event.message.file.fileId);
+        }
         addMessage(event.message);
         break;
       case 'thread-cleared': {
@@ -2104,6 +2221,11 @@ export default function App() {
     storePendingRelayAbortTickets(next);
   }
 
+  function setRelayAnnounceQueue(next: PendingRelayAnnounceTicket[]): void {
+    relayAnnounceQueueRef.current = next;
+    storePendingRelayAnnounceTickets(next);
+  }
+
   function rememberRelayAbort(uploadToken: string): void {
     if (relayAbortQueueRef.current.some((ticket) => ticket.uploadToken === uploadToken)) {
       return;
@@ -2124,6 +2246,91 @@ export default function App() {
     }
 
     setRelayAbortQueue(relayAbortQueueRef.current.filter((ticket) => ticket.uploadToken !== uploadToken));
+  }
+
+  function rememberRelayAnnounce(ticket: PendingRelayAnnounceTicket): void {
+    const existingIndex = relayAnnounceQueueRef.current.findIndex((item) => item.fileId === ticket.fileId);
+    if (existingIndex === -1) {
+      setRelayAnnounceQueue([...relayAnnounceQueueRef.current, ticket]);
+      return;
+    }
+
+    const next = [...relayAnnounceQueueRef.current];
+    next[existingIndex] = ticket;
+    setRelayAnnounceQueue(next);
+  }
+
+  function forgetRelayAnnounce(fileId: string): void {
+    if (!relayAnnounceQueueRef.current.some((ticket) => ticket.fileId === fileId)) {
+      return;
+    }
+
+    setRelayAnnounceQueue(relayAnnounceQueueRef.current.filter((ticket) => ticket.fileId !== fileId));
+  }
+
+  function hasMessageForRelayFile(fileId: string): boolean {
+    return messagesRef.current.some((message) => message.file?.fileId === fileId);
+  }
+
+  function tryAnnounceRelayFile(ticket: PendingRelayAnnounceTicket): boolean {
+    if (activeRoomRef.current !== ticket.roomId) {
+      return false;
+    }
+
+    const announced = sendServerMessage({
+      type: 'relay-file-announced',
+      file: {
+        fileId: ticket.fileId,
+        fileName: ticket.fileName,
+        size: ticket.size,
+        contentType: ticket.contentType,
+        objectKey: ticket.objectKey,
+        targetId: ticket.targetId,
+      },
+    });
+
+    if (announced) {
+      updateTransfer({
+        transferId: ticket.fileId,
+        peerId: transfersRef.current[ticket.fileId]?.peerId ?? (ticket.targetId ?? GLOBAL_THREAD),
+        peerName:
+          transfersRef.current[ticket.fileId]?.peerName ??
+          (ticket.targetId ? getPeerDisplayName(ticket.targetId) : '整个房间'),
+        fileName: ticket.fileName,
+        totalBytes: ticket.size,
+        transferredBytes: ticket.size,
+        direction: 'upload',
+        transport: 'server-relay',
+        status: 'streaming',
+        note: '等待写入聊天记录',
+      });
+    }
+
+    return announced;
+  }
+
+  function flushPendingRelayAnnounces(options?: { roomId?: string }): void {
+    const roomId = options?.roomId ?? activeRoomRef.current;
+    if (!roomId) {
+      return;
+    }
+
+    const pendingForRoom = relayAnnounceQueueRef.current.filter((ticket) => ticket.roomId === roomId);
+    if (pendingForRoom.length === 0) {
+      return;
+    }
+
+    for (const ticket of pendingForRoom) {
+      if (hasMessageForRelayFile(ticket.fileId)) {
+        forgetRelayAnnounce(ticket.fileId);
+        markRelayTransferSynced(ticket.fileId);
+        continue;
+      }
+
+      if (!tryAnnounceRelayFile(ticket)) {
+        break;
+      }
+    }
   }
 
   async function postRelayAbort(uploadToken: string, keepalive = false): Promise<boolean> {
@@ -2148,22 +2355,6 @@ export default function App() {
     }
 
     return false;
-  }
-
-  async function discardCompletedRelayUpload(uploadToken: string): Promise<void> {
-    try {
-      await fetch('/api/files/discard', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          uploadToken,
-        } satisfies RelayDiscardUploadRequest),
-      });
-    } catch {
-      // Best effort cleanup. If discard fails, the object remains unreachable from chat.
-    }
   }
 
   function dispatchRelayAbort(uploadToken: string, mode: 'fetch' | 'keepalive' | 'beacon'): void {
@@ -2392,27 +2583,40 @@ export default function App() {
       }
 
       const completed = (await completeResponse.json()) as Pick<RelayUploadResponse, 'fileId' | 'objectKey'>;
+      const announceTicket: PendingRelayAnnounceTicket = {
+        uploadToken: payload.uploadToken,
+        roomId,
+        fileId: completed.fileId,
+        fileName: file.name,
+        size: file.size,
+        contentType: file.type || 'application/octet-stream',
+        objectKey: completed.objectKey,
+        targetId,
+        createdAt: Date.now(),
+      };
+
+      rememberRelayAnnounce(announceTicket);
 
       const canAnnounce =
         !task.cancelled &&
         activeRoomRef.current === roomId &&
-        sendServerMessage({
-          type: 'relay-file-announced',
-          file: {
-            fileId: completed.fileId,
-            fileName: file.name,
-            size: file.size,
-            contentType: file.type || 'application/octet-stream',
-            objectKey: completed.objectKey,
-            targetId,
-          },
-        });
+        tryAnnounceRelayFile(announceTicket);
 
       if (!canAnnounce) {
-        await discardCompletedRelayUpload(task.uploadToken);
+        updateTransfer({
+          transferId: payload.fileId,
+          peerId,
+          peerName,
+          fileName: file.name,
+          totalBytes: file.size,
+          transferredBytes: file.size,
+          direction: 'upload',
+          transport: 'server-relay',
+          status: 'streaming',
+          note: '文件已上传，等待信令恢复后同步到聊天记录',
+        });
         return;
       }
-
       updateTransfer({
         transferId: payload.fileId,
         peerId,
@@ -2422,8 +2626,8 @@ export default function App() {
         transferredBytes: file.size,
         direction: 'upload',
         transport: 'server-relay',
-        status: 'complete',
-        note: '已同步到聊天记录',
+        status: 'streaming',
+        note: '等待写入聊天记录',
       });
     } catch (error) {
       if (isRelayUploadCancelledError(error) || task.cancelled) {
