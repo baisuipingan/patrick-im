@@ -31,7 +31,7 @@ interface TransferUpdate {
   transferredBytes: number;
   direction: 'upload' | 'download';
   transport: 'direct-p2p' | 'server-relay';
-  status: 'pending' | 'streaming' | 'complete' | 'failed' | 'declined' | 'cancelled';
+  status: 'pending' | 'paused' | 'streaming' | 'complete' | 'failed' | 'declined' | 'cancelled';
   note?: string;
 }
 
