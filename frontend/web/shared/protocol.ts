@@ -170,6 +170,7 @@ export interface RelayUploadResponse {
   objectKey: string;
   uploadToken: string;
   chunkSizeBytes: number;
+  uploadedParts: RelayUploadedPart[];
   partUrls: RelayPresignedPart[];
 }
 

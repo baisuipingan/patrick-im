@@ -168,6 +168,8 @@ pub struct RelayUploadResponse {
     pub objectKey: String,
     pub uploadToken: String,
     pub chunkSizeBytes: u64,
+    #[serde(default)]
+    pub uploadedParts: Vec<RelayUploadedPart>,
     pub partUrls: Vec<RelayPresignedPart>,
 }
 

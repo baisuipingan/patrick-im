@@ -119,6 +119,7 @@ interface RelayUploadTask {
   displayedTransferredBytes: number;
   stage: 'uploading' | 'paused' | 'completing' | 'awaiting-sync' | 'failed';
   pauseReason: 'manual' | 'offline' | null;
+  pauseGeneration: number;
   resumePromise: Promise<void> | null;
   resumeResolver: (() => void) | null;
   cancelled: boolean;
@@ -478,6 +479,7 @@ async function uploadRelayPartsConcurrently(options: {
       }
 
       const chunk = getRelayPartBlob(task.file, task.chunkSizeBytes, partNumber);
+      const pauseGeneration = task.pauseGeneration;
 
       try {
         const part = await uploadPresignedPartWithProgress(partUrl, chunk, (loaded) => {
@@ -493,7 +495,7 @@ async function uploadRelayPartsConcurrently(options: {
         task.loadedByPart.delete(partNumber);
         recomputeLoadedBytes(true);
 
-        if (task.pauseReason !== null) {
+        if (task.pauseGeneration > pauseGeneration) {
           requeuePartNumber(partNumber);
           return;
         }
@@ -2554,6 +2556,7 @@ export default function App() {
 
     task.stage = 'paused';
     task.pauseReason = options.reason;
+    task.pauseGeneration += 1;
     task.xhrs.forEach((xhr) => xhr.abort());
     task.xhrs.clear();
 
@@ -2833,6 +2836,15 @@ export default function App() {
       const payload = (await uploadRequest.json()) as RelayUploadResponse;
       const totalParts = payload.partUrls.length;
       const concurrency = getRelayUploadConcurrency(file.size, totalParts);
+      const uploadedParts = new Map(payload.uploadedParts.map((part) => [part.partNumber, part]));
+      const uploadedPartNumbers = new Set(uploadedParts.keys());
+      const pendingPartNumbers = payload.partUrls
+        .map((part) => part.partNumber)
+        .filter((partNumber) => !uploadedPartNumbers.has(partNumber));
+      const loadedByPart = new Map<number, number>();
+      uploadedPartNumbers.forEach((partNumber) => {
+        loadedByPart.set(partNumber, getRelayPartBlob(file, payload.chunkSizeBytes, partNumber).size);
+      });
       task = {
         transferId: payload.fileId,
         fileName: file.name,
@@ -2846,13 +2858,14 @@ export default function App() {
         totalParts,
         concurrency,
         partUrlsByNumber: new Map(payload.partUrls.map((part) => [part.partNumber, part])),
-        pendingPartNumbers: payload.partUrls.map((part) => part.partNumber),
+        pendingPartNumbers,
         inFlightPartNumbers: new Set(),
-        uploadedParts: new Map(),
-        loadedByPart: new Map(),
+        uploadedParts,
+        loadedByPart,
         displayedTransferredBytes: 0,
         stage: 'uploading',
         pauseReason: null,
+        pauseGeneration: 0,
         resumePromise: null,
         resumeResolver: null,
         cancelled: false,
@@ -2872,11 +2885,14 @@ export default function App() {
         peerName,
         fileName: file.name,
         totalBytes: file.size,
-        transferredBytes: 0,
+        transferredBytes: getRelayTaskVisibleTransferredBytes(task),
         direction: 'upload',
         transport: 'server-relay',
         status: 'pending',
-        note: '等待直传到中继存储',
+        note:
+          uploadedParts.size > 0
+            ? buildRelayUploadNote(totalParts, concurrency, '继续直传到中继存储')
+            : '等待直传到中继存储',
       });
       if (pendingAttachmentId) {
         removePendingFile(pendingAttachmentId);

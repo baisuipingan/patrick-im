@@ -1,7 +1,7 @@
 use crate::config::AppConfig;
 use crate::protocol::{
     RelayAbortUploadRequest, RelayCompleteUploadRequest, RelayFileDescriptor, RelayPresignedHeader,
-    RelayPresignedPart, RelayUploadRequest, RelayUploadResponse,
+    RelayPresignedPart, RelayUploadRequest, RelayUploadResponse, RelayUploadedPart,
 };
 use crate::session::SessionPayload;
 use crate::signing::{create_signed_token, read_signed_token};
@@ -145,7 +145,7 @@ impl RelayStore {
             issuedAt: now_ms(),
         };
 
-        let response = self.build_upload_response(&payload).await?;
+        let response = self.build_upload_response(&payload, Vec::new()).await?;
 
         Ok(CreatedRelayUpload {
             token_payload: payload,
@@ -157,7 +157,7 @@ impl RelayStore {
         &self,
         input: ResumeRelayUploadInput,
     ) -> Result<RelayUploadResponse> {
-        self.build_upload_response(&RelayUploadTokenPayload {
+        let payload = RelayUploadTokenPayload {
             fileId: input.file_id,
             objectKey: input.object_key,
             uploadId: input.upload_id,
@@ -168,8 +168,11 @@ impl RelayStore {
             targetId: input.target_id,
             fromId: input.from_id,
             issuedAt: now_ms(),
-        })
-        .await
+        };
+        let uploaded_parts = self
+            .list_uploaded_parts(&payload.objectKey, &payload.uploadId)
+            .await?;
+        self.build_upload_response(&payload, uploaded_parts).await
     }
 
     pub async fn complete_upload(
@@ -327,6 +330,7 @@ impl RelayStore {
     async fn build_upload_response(
         &self,
         payload: &RelayUploadTokenPayload,
+        uploaded_parts: Vec<RelayUploadedPart>,
     ) -> Result<RelayUploadResponse> {
         let part_count = payload.size.div_ceil(RELAY_CHUNK_SIZE_BYTES as u64);
         let part_urls = self
@@ -338,8 +342,54 @@ impl RelayStore {
             objectKey: payload.objectKey.clone(),
             uploadToken: create_signed_token(&self.signing_secret, payload)?,
             chunkSizeBytes: RELAY_CHUNK_SIZE_BYTES as u64,
+            uploadedParts: uploaded_parts,
             partUrls: part_urls,
         })
+    }
+
+    async fn list_uploaded_parts(
+        &self,
+        object_key: &str,
+        upload_id: &str,
+    ) -> Result<Vec<RelayUploadedPart>> {
+        let mut part_number_marker = None;
+        let mut uploaded_parts = Vec::new();
+
+        loop {
+            let response = self
+                .client
+                .list_parts()
+                .bucket(&self.bucket)
+                .key(object_key)
+                .upload_id(upload_id)
+                .set_part_number_marker(part_number_marker)
+                .send()
+                .await
+                .with_context(|| format!("failed to list uploaded relay parts for {object_key}"))?;
+
+            if let Some(parts) = response.parts {
+                uploaded_parts.extend(parts.into_iter().filter_map(|part| {
+                    let part_number = part.part_number?;
+                    let etag = part.e_tag?.trim_matches('"').to_owned();
+                    if etag.is_empty() {
+                        return None;
+                    }
+                    Some(RelayUploadedPart {
+                        partNumber: part_number,
+                        etag,
+                    })
+                }));
+            }
+
+            if response.is_truncated != Some(true) {
+                break;
+            }
+
+            part_number_marker = response.next_part_number_marker;
+        }
+
+        uploaded_parts.sort_by_key(|part| part.partNumber);
+        Ok(uploaded_parts)
     }
 
     async fn create_presigned_part_urls(
