@@ -101,9 +101,11 @@ interface PendingAttachment {
 
 interface RelayUploadTask {
   transferId: string;
+  clientRequestId: string;
   fileName: string;
   uploadToken: string;
   roomId: string;
+  targetId: string | null;
   peerId: string;
   peerName: string;
   file: File;
@@ -352,6 +354,33 @@ function getRelayTaskVisibleTransferredBytes(task: RelayUploadTask): number {
 function getRelayPartBlob(file: File, chunkSizeBytes: number, partNumber: number): Blob {
   const start = (partNumber - 1) * chunkSizeBytes;
   return file.slice(start, Math.min(file.size, start + chunkSizeBytes));
+}
+
+function applyRelayUploadSnapshot(task: RelayUploadTask, payload: RelayUploadResponse): void {
+  if (payload.fileId !== task.transferId) {
+    throw new Error('relay_upload_resume_file_mismatch');
+  }
+
+  const uploadedParts = new Map(payload.uploadedParts.map((part) => [part.partNumber, part]));
+  const uploadedPartNumbers = new Set(uploadedParts.keys());
+  const loadedByPart = new Map<number, number>();
+
+  uploadedPartNumbers.forEach((partNumber) => {
+    loadedByPart.set(partNumber, getRelayPartBlob(task.file, payload.chunkSizeBytes, partNumber).size);
+  });
+
+  task.uploadToken = payload.uploadToken;
+  task.chunkSizeBytes = payload.chunkSizeBytes;
+  task.totalParts = payload.partUrls.length;
+  task.concurrency = getRelayUploadConcurrency(task.totalBytes, task.totalParts);
+  task.partUrlsByNumber = new Map(payload.partUrls.map((part) => [part.partNumber, part]));
+  task.pendingPartNumbers = payload.partUrls
+    .map((part) => part.partNumber)
+    .filter((partNumber) => !uploadedPartNumbers.has(partNumber));
+  task.inFlightPartNumbers.clear();
+  task.uploadedParts = uploadedParts;
+  task.loadedByPart = loadedByPart;
+  rememberRelayTaskDisplayedBytes(task, getRelayTaskTransferredBytes(task));
 }
 
 function uploadPresignedPartWithProgress(
@@ -2583,12 +2612,69 @@ export default function App() {
     return true;
   }
 
-  function resumeRelayTask(task: RelayUploadTask, options?: { notice?: string }): boolean {
+  async function refreshRelayTaskUploadSnapshot(task: RelayUploadTask): Promise<void> {
+    const response = await fetch('/api/files/upload-request', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        clientRequestId: task.clientRequestId,
+        roomId: task.roomId,
+        fileName: task.file.name,
+        contentType: task.file.type,
+        size: task.file.size,
+        targetId: task.targetId,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error('relay_upload_resume_request_failed');
+    }
+
+    applyRelayUploadSnapshot(task, (await response.json()) as RelayUploadResponse);
+  }
+
+  async function resumeRelayTask(task: RelayUploadTask, options?: { notice?: string }): Promise<boolean> {
     if (task.cancelled || task.stage !== 'paused') {
       return false;
     }
 
     const wasOfflinePaused = task.pauseReason === 'offline';
+    updateTransfer({
+      transferId: task.transferId,
+      peerId: task.peerId,
+      peerName: task.peerName,
+      fileName: task.fileName,
+      totalBytes: task.totalBytes,
+      transferredBytes: getRelayTaskVisibleTransferredBytes(task),
+      direction: 'upload',
+      transport: 'server-relay',
+      status: 'streaming',
+      note: '正在恢复中继上传',
+    });
+
+    try {
+      await refreshRelayTaskUploadSnapshot(task);
+    } catch {
+      task.stage = 'paused';
+      task.pauseReason = wasOfflinePaused ? 'offline' : 'manual';
+      updateTransfer({
+        transferId: task.transferId,
+        peerId: task.peerId,
+        peerName: task.peerName,
+        fileName: task.fileName,
+        totalBytes: task.totalBytes,
+        transferredBytes: getRelayTaskVisibleTransferredBytes(task),
+        direction: 'upload',
+        transport: 'server-relay',
+        status: 'paused',
+        note: buildRelayPausedNote(task.pauseReason),
+      });
+      showTransientNotice(`${task.fileName} 恢复失败，请稍后重试。`, 3200);
+      return false;
+    }
+
     task.pauseReason = null;
     task.stage = task.uploadedParts.size >= task.totalParts ? 'awaiting-sync' : 'uploading';
     wakeRelayTaskResume(task);
@@ -2718,7 +2804,7 @@ export default function App() {
     const tasks = [...relayUploadTasksRef.current.values()];
     for (const task of tasks) {
       if (task.stage === 'paused' && task.pauseReason === 'offline') {
-        resumeRelayTask(task);
+        void resumeRelayTask(task);
       }
     }
 
@@ -2768,7 +2854,7 @@ export default function App() {
       return false;
     }
 
-    return resumeRelayTask(task, {
+    return await resumeRelayTask(task, {
       notice: `${task.fileName} 已继续发送。`,
     });
   }
@@ -2812,6 +2898,7 @@ export default function App() {
 
     const peerId = targetId ?? GLOBAL_THREAD;
     const peerName = targetId ? getPeerDisplayName(targetId) : '整个房间';
+    const clientRequestId = pendingAttachmentId ?? crypto.randomUUID();
     let task: RelayUploadTask | null = null;
     try {
       const uploadRequest = await fetch('/api/files/upload-request', {
@@ -2820,7 +2907,7 @@ export default function App() {
           'content-type': 'application/json',
         },
         body: JSON.stringify({
-          clientRequestId: pendingAttachmentId ?? crypto.randomUUID(),
+          clientRequestId,
           roomId,
           fileName: file.name,
           contentType: file.type,
@@ -2836,20 +2923,13 @@ export default function App() {
       const payload = (await uploadRequest.json()) as RelayUploadResponse;
       const totalParts = payload.partUrls.length;
       const concurrency = getRelayUploadConcurrency(file.size, totalParts);
-      const uploadedParts = new Map(payload.uploadedParts.map((part) => [part.partNumber, part]));
-      const uploadedPartNumbers = new Set(uploadedParts.keys());
-      const pendingPartNumbers = payload.partUrls
-        .map((part) => part.partNumber)
-        .filter((partNumber) => !uploadedPartNumbers.has(partNumber));
-      const loadedByPart = new Map<number, number>();
-      uploadedPartNumbers.forEach((partNumber) => {
-        loadedByPart.set(partNumber, getRelayPartBlob(file, payload.chunkSizeBytes, partNumber).size);
-      });
       task = {
         transferId: payload.fileId,
+        clientRequestId,
         fileName: file.name,
         uploadToken: payload.uploadToken,
         roomId,
+        targetId,
         peerId,
         peerName,
         file,
@@ -2858,10 +2938,10 @@ export default function App() {
         totalParts,
         concurrency,
         partUrlsByNumber: new Map(payload.partUrls.map((part) => [part.partNumber, part])),
-        pendingPartNumbers,
+        pendingPartNumbers: payload.partUrls.map((part) => part.partNumber),
         inFlightPartNumbers: new Set(),
-        uploadedParts,
-        loadedByPart,
+        uploadedParts: new Map(),
+        loadedByPart: new Map(),
         displayedTransferredBytes: 0,
         stage: 'uploading',
         pauseReason: null,
@@ -2871,6 +2951,7 @@ export default function App() {
         cancelled: false,
         xhrs: new Set(),
       };
+      applyRelayUploadSnapshot(task, payload);
 
       if (activeRoomRef.current !== roomId) {
         dispatchRelayAbort(task.uploadToken, 'fetch');
@@ -2890,7 +2971,7 @@ export default function App() {
         transport: 'server-relay',
         status: 'pending',
         note:
-          uploadedParts.size > 0
+          task.uploadedParts.size > 0
             ? buildRelayUploadNote(totalParts, concurrency, '继续直传到中继存储')
             : '等待直传到中继存储',
       });
@@ -2946,7 +3027,7 @@ export default function App() {
           'content-type': 'application/json',
         },
         body: JSON.stringify({
-          uploadToken: payload.uploadToken,
+          uploadToken: task.uploadToken,
           parts: [...task.uploadedParts.values()].sort((left, right) => left.partNumber - right.partNumber),
         }),
       });
@@ -2962,7 +3043,7 @@ export default function App() {
       const completed = (await completeResponse.json()) as Pick<RelayUploadResponse, 'fileId' | 'objectKey'>;
       task.stage = 'awaiting-sync';
       const announceTicket: PendingRelayAnnounceTicket = {
-        uploadToken: payload.uploadToken,
+        uploadToken: task.uploadToken,
         roomId,
         fileId: completed.fileId,
         fileName: file.name,
