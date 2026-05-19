@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use uuid::Uuid;
 
-const RELAY_CHUNK_SIZE_BYTES: usize = 8 * 1024 * 1024;
+const RELAY_CHUNK_SIZE_BYTES: usize = 5 * 1024 * 1024;
 const RELAY_UPLOAD_URL_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

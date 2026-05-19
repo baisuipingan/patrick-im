@@ -27,6 +27,7 @@ import type {
   ClearThreadResponse,
   DirectPeerState,
   RelayAbortUploadRequest,
+  RelayDiscardUploadRequest,
   RelayPresignedPart,
   RelayUploadPartResponse,
   RelayUploadResponse,
@@ -115,6 +116,7 @@ interface RelayUploadTask {
   inFlightPartNumbers: Set<number>;
   uploadedParts: Map<number, RelayUploadPartResponse>;
   loadedByPart: Map<number, number>;
+  displayedTransferredBytes: number;
   stage: 'uploading' | 'paused' | 'completing' | 'awaiting-sync' | 'failed';
   pauseReason: 'manual' | 'offline' | null;
   resumePromise: Promise<void> | null;
@@ -334,6 +336,16 @@ function getRelayTaskTransferredBytes(task: RelayUploadTask): number {
     transferred += loaded;
   });
   return Math.min(task.totalBytes, transferred);
+}
+
+function rememberRelayTaskDisplayedBytes(task: RelayUploadTask, transferredBytes: number): number {
+  const clamped = Math.min(task.totalBytes, Math.max(0, transferredBytes));
+  task.displayedTransferredBytes = Math.max(task.displayedTransferredBytes, clamped);
+  return task.displayedTransferredBytes;
+}
+
+function getRelayTaskVisibleTransferredBytes(task: RelayUploadTask): number {
+  return rememberRelayTaskDisplayedBytes(task, getRelayTaskTransferredBytes(task));
 }
 
 function getRelayPartBlob(file: File, chunkSizeBytes: number, partNumber: number): Blob {
@@ -1023,6 +1035,7 @@ export default function App() {
   const peerPathTooltipTimerRef = useRef<number | null>(null);
   const shareFeedbackTimerRef = useRef<number | null>(null);
   const relayUploadTasksRef = useRef<Map<string, RelayUploadTask>>(new Map());
+  const closedTransferIdsRef = useRef<Set<string>>(new Set());
   const reconnectTimerRef = useRef<number | null>(null);
   const connectTimeoutTimerRef = useRef<number | null>(null);
   const heartbeatTimerRef = useRef<number | null>(null);
@@ -1371,6 +1384,7 @@ export default function App() {
     messagesRef.current = [];
     setPeers([]);
     setTransfers({});
+    closedTransferIdsRef.current.clear();
     setDirectStates({});
     setDirectPaths({});
     setUnreadCounts({});
@@ -1863,6 +1877,16 @@ export default function App() {
   }
 
   function updateTransfer(update: TransferUpdate): void {
+    if (update.status === 'pending') {
+      closedTransferIdsRef.current.delete(update.transferId);
+    } else if (
+      closedTransferIdsRef.current.has(update.transferId) &&
+      update.status !== 'complete' &&
+      update.status !== 'cancelled'
+    ) {
+      return;
+    }
+
     if (update.direction === 'upload' && update.transport === 'direct-p2p') {
       if (update.status === 'complete' && activeTransferNoticeRef.current === update.transferId) {
         activeTransferNoticeRef.current = null;
@@ -1893,6 +1917,7 @@ export default function App() {
     }
 
     if (update.status === 'complete' || update.status === 'cancelled') {
+      closedTransferIdsRef.current.add(update.transferId);
       setTransfers((current) => {
         if (!(update.transferId in current)) {
           return current;
@@ -2431,6 +2456,24 @@ export default function App() {
     return false;
   }
 
+  async function postRelayDiscard(uploadToken: string, keepalive = false): Promise<boolean> {
+    try {
+      const response = await fetch('/api/files/discard', {
+        method: 'POST',
+        keepalive,
+        headers: {
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({
+          uploadToken,
+        } satisfies RelayDiscardUploadRequest),
+      });
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
   function dispatchRelayAbort(uploadToken: string, mode: 'fetch' | 'keepalive' | 'beacon'): void {
     rememberRelayAbort(uploadToken);
 
@@ -2450,6 +2493,23 @@ export default function App() {
     }
 
     void postRelayAbort(uploadToken, mode !== 'fetch');
+  }
+
+  function dispatchRelayDiscard(uploadToken: string, mode: 'fetch' | 'keepalive' | 'beacon'): void {
+    if (mode === 'beacon' && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
+      const body = new Blob(
+        [
+          JSON.stringify({
+            uploadToken,
+          } satisfies RelayDiscardUploadRequest),
+        ],
+        { type: 'application/json' },
+      );
+      navigator.sendBeacon('/api/files/discard', body);
+      return;
+    }
+
+    void postRelayDiscard(uploadToken, mode !== 'fetch');
   }
 
   async function flushPendingRelayAborts(): Promise<void> {
@@ -2503,7 +2563,7 @@ export default function App() {
       peerName: task.peerName,
       fileName: task.fileName,
       totalBytes: task.totalBytes,
-      transferredBytes: getRelayTaskTransferredBytes(task),
+      transferredBytes: getRelayTaskVisibleTransferredBytes(task),
       direction: 'upload',
       transport: 'server-relay',
       status: 'paused',
@@ -2536,7 +2596,7 @@ export default function App() {
       peerName: task.peerName,
       fileName: task.fileName,
       totalBytes: task.totalBytes,
-      transferredBytes: getRelayTaskTransferredBytes(task),
+      transferredBytes: getRelayTaskVisibleTransferredBytes(task),
       direction: 'upload',
       transport: 'server-relay',
       status: 'streaming',
@@ -2564,6 +2624,7 @@ export default function App() {
     options: {
       reason: string;
       transport: 'fetch' | 'keepalive' | 'beacon';
+      cleanup?: 'abort' | 'discard';
       updateUi: boolean;
       notice?: string;
     },
@@ -2578,8 +2639,22 @@ export default function App() {
     task.xhrs.forEach((xhr) => xhr.abort());
     task.xhrs.clear();
     wakeRelayTaskResume(task);
-    dispatchRelayAbort(task.uploadToken, options.transport);
+    closedTransferIdsRef.current.add(task.transferId);
+    forgetRelayAnnounce(task.transferId);
+    if (options.cleanup === 'discard') {
+      dispatchRelayDiscard(task.uploadToken, options.transport);
+    } else {
+      dispatchRelayAbort(task.uploadToken, options.transport);
+    }
     relayUploadTasksRef.current.delete(task.transferId);
+    setTransfers((current) => {
+      if (!(task.transferId in current)) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[task.transferId];
+      return next;
+    });
 
     if (options.updateUi) {
       updateTransfer({
@@ -2588,7 +2663,7 @@ export default function App() {
         peerName: task.peerName,
         fileName: task.fileName,
         totalBytes: task.totalBytes,
-        transferredBytes: getRelayTaskTransferredBytes(task),
+        transferredBytes: getRelayTaskVisibleTransferredBytes(task),
         direction: 'upload',
         transport: 'server-relay',
         status: 'cancelled',
@@ -2650,12 +2725,23 @@ export default function App() {
   async function cancelRelayUpload(transferId: string): Promise<boolean> {
     const task = relayUploadTasksRef.current.get(transferId);
     if (!task) {
-      return false;
+      closedTransferIdsRef.current.add(transferId);
+      forgetRelayAnnounce(transferId);
+      setTransfers((current) => {
+        if (!(transferId in current)) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[transferId];
+        return next;
+      });
+      return true;
     }
 
     abortRelayTask(task, {
       reason: 'cancelled locally',
       transport: 'fetch',
+      cleanup: task.uploadedParts.size >= task.totalParts ? 'discard' : 'abort',
       updateUi: true,
     });
     return true;
@@ -2764,6 +2850,7 @@ export default function App() {
         inFlightPartNumbers: new Set(),
         uploadedParts: new Map(),
         loadedByPart: new Map(),
+        displayedTransferredBytes: 0,
         stage: 'uploading',
         pauseReason: null,
         resumePromise: null,
@@ -2796,7 +2883,7 @@ export default function App() {
       }
 
       while (task.uploadedParts.size < task.totalParts) {
-        if (task.cancelled) {
+        if (task.cancelled || closedTransferIdsRef.current.has(task.transferId)) {
           return;
         }
 
@@ -2808,15 +2895,18 @@ export default function App() {
         await uploadRelayPartsConcurrently({
           task,
           onProgress: (transferredBytes, nextTotalParts, nextConcurrency) => {
-            const relayStage = task?.stage ?? 'uploading';
-            const pauseReason = task?.pauseReason ?? null;
+            if (!task) {
+              return;
+            }
+            const relayStage = task.stage;
+            const pauseReason = task.pauseReason;
             updateTransfer({
               transferId: payload.fileId,
               peerId,
               peerName,
               fileName: file.name,
               totalBytes: file.size,
-              transferredBytes,
+              transferredBytes: rememberRelayTaskDisplayedBytes(task, transferredBytes),
               direction: 'upload',
               transport: 'server-relay',
               status: relayStage === 'paused' ? 'paused' : 'streaming',
@@ -2829,7 +2919,7 @@ export default function App() {
         });
       }
 
-      if (task.cancelled) {
+      if (task.cancelled || closedTransferIdsRef.current.has(task.transferId)) {
         return;
       }
 
@@ -2849,7 +2939,7 @@ export default function App() {
         throw new Error('upload_complete_failed');
       }
 
-      if (task.cancelled) {
+      if (task.cancelled || closedTransferIdsRef.current.has(task.transferId)) {
         return;
       }
 
@@ -2881,7 +2971,7 @@ export default function App() {
           peerName,
           fileName: file.name,
           totalBytes: file.size,
-          transferredBytes: file.size,
+          transferredBytes: task ? rememberRelayTaskDisplayedBytes(task, file.size) : file.size,
           direction: 'upload',
           transport: 'server-relay',
           status: 'streaming',
@@ -2895,14 +2985,14 @@ export default function App() {
         peerName,
         fileName: file.name,
         totalBytes: file.size,
-        transferredBytes: file.size,
+        transferredBytes: task ? rememberRelayTaskDisplayedBytes(task, file.size) : file.size,
         direction: 'upload',
         transport: 'server-relay',
         status: 'streaming',
-          note: '等待写入聊天记录',
+        note: '等待写入聊天记录',
         });
     } catch (error) {
-      if (isRelayUploadCancelledError(error) || task?.cancelled) {
+      if (isRelayUploadCancelledError(error) || task?.cancelled || (task && closedTransferIdsRef.current.has(task.transferId))) {
         return;
       }
 
@@ -2920,7 +3010,7 @@ export default function App() {
         peerName,
         fileName: file.name,
         totalBytes: file.size,
-        transferredBytes: task ? getRelayTaskTransferredBytes(task) : 0,
+        transferredBytes: task ? getRelayTaskVisibleTransferredBytes(task) : 0,
         direction: 'upload',
         transport: 'server-relay',
         status: 'failed',
