@@ -53,6 +53,19 @@ pub struct CreatedRelayUpload {
 }
 
 #[derive(Debug, Clone)]
+pub struct ResumeRelayUploadInput {
+    pub file_id: String,
+    pub object_key: String,
+    pub upload_id: String,
+    pub room_id: String,
+    pub file_name: String,
+    pub content_type: String,
+    pub size: u64,
+    pub target_id: Option<String>,
+    pub from_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct RelayUploadHandle {
     pub file_id: String,
     pub object_key: String,
@@ -142,26 +155,18 @@ impl RelayStore {
 
     pub async fn resume_upload(
         &self,
-        file_id: &str,
-        object_key: &str,
-        upload_id: &str,
-        room_id: &str,
-        file_name: &str,
-        content_type: &str,
-        size: u64,
-        target_id: Option<String>,
-        from_id: &str,
+        input: ResumeRelayUploadInput,
     ) -> Result<RelayUploadResponse> {
         self.build_upload_response(&RelayUploadTokenPayload {
-            fileId: file_id.to_owned(),
-            objectKey: object_key.to_owned(),
-            uploadId: upload_id.to_owned(),
-            roomId: room_id.to_owned(),
-            fileName: file_name.to_owned(),
-            contentType: content_type.to_owned(),
-            size,
-            targetId: target_id,
-            fromId: from_id.to_owned(),
+            fileId: input.file_id,
+            objectKey: input.object_key,
+            uploadId: input.upload_id,
+            roomId: input.room_id,
+            fileName: input.file_name,
+            contentType: input.content_type,
+            size: input.size,
+            targetId: input.target_id,
+            fromId: input.from_id,
             issuedAt: now_ms(),
         })
         .await

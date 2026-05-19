@@ -74,9 +74,10 @@ pub enum PersistRelayFileMessageOutcome {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum StoreRelayUploadRequestOutcome {
     Inserted,
-    Existing(RelayUploadRequestRecord),
+    Existing(Box<RelayUploadRequestRecord>),
 }
 
 #[derive(Debug, Clone)]
@@ -418,7 +419,7 @@ impl MessageStore {
                     .ok_or_else(|| {
                         anyhow!("relay upload request conflicted but could not be reloaded")
                     })?;
-                Ok(StoreRelayUploadRequestOutcome::Existing(existing))
+                Ok(StoreRelayUploadRequestOutcome::Existing(Box::new(existing)))
             }
             Err(error) => Err(error).context("failed to persist relay upload request"),
         }
@@ -820,13 +821,13 @@ fn message_row_to_chat_message(
     files_by_id: &HashMap<String, RelayFileDescriptor>,
 ) -> Result<ChatMessage> {
     let row_id = row.id.clone();
-    if let Some(file_id) = row.relay_file_id.as_ref() {
-        if !files_by_id.contains_key(file_id) {
-            return Err(anyhow!(
-                "missing relay file descriptor for message {}",
-                row_id
-            ));
-        }
+    if let Some(file_id) = row.relay_file_id.as_ref()
+        && !files_by_id.contains_key(file_id)
+    {
+        return Err(anyhow!(
+            "missing relay file descriptor for message {}",
+            row_id
+        ));
     }
 
     Ok(ChatMessage {

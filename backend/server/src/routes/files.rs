@@ -2,7 +2,7 @@ use crate::protocol::{
     RelayAbortUploadRequest, RelayCompleteUploadRequest, RelayCompleteUploadResponse,
     RelayDiscardUploadRequest, RelayUploadRequest, RelayUploadResponse,
 };
-use crate::services::relay_store::RelayUploadTokenPayload;
+use crate::services::relay_store::{RelayUploadTokenPayload, ResumeRelayUploadInput};
 use crate::session::require_session;
 use crate::state::AppState;
 use crate::store::message_store::{
@@ -66,17 +66,17 @@ pub async fn upload_request(
             .map_err(|error| StatusError::conflict().brief(error.to_string()))?;
         let response = state
             .relay_store
-            .resume_upload(
-                &existing.file_id,
-                &existing.object_key,
-                &existing.upload_id,
-                &existing.room_id,
-                &existing.file_name,
-                &existing.content_type,
-                existing.size,
-                existing.target_id.clone(),
-                &existing.from_id,
-            )
+            .resume_upload(ResumeRelayUploadInput {
+                file_id: existing.file_id.clone(),
+                object_key: existing.object_key.clone(),
+                upload_id: existing.upload_id.clone(),
+                room_id: existing.room_id.clone(),
+                file_name: existing.file_name.clone(),
+                content_type: existing.content_type.clone(),
+                size: existing.size,
+                target_id: existing.target_id.clone(),
+                from_id: existing.from_id.clone(),
+            })
             .await
             .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
         return Ok(Json(response));
@@ -125,17 +125,17 @@ pub async fn upload_request(
                 .map_err(|error| StatusError::conflict().brief(error.to_string()))?;
             let response = state
                 .relay_store
-                .resume_upload(
-                    &existing.file_id,
-                    &existing.object_key,
-                    &existing.upload_id,
-                    &existing.room_id,
-                    &existing.file_name,
-                    &existing.content_type,
-                    existing.size,
-                    existing.target_id.clone(),
-                    &existing.from_id,
-                )
+                .resume_upload(ResumeRelayUploadInput {
+                    file_id: existing.file_id.clone(),
+                    object_key: existing.object_key.clone(),
+                    upload_id: existing.upload_id.clone(),
+                    room_id: existing.room_id.clone(),
+                    file_name: existing.file_name.clone(),
+                    content_type: existing.content_type.clone(),
+                    size: existing.size,
+                    target_id: existing.target_id.clone(),
+                    from_id: existing.from_id.clone(),
+                })
                 .await
                 .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
             Ok(Json(response))

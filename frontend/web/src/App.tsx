@@ -115,7 +115,7 @@ interface RelayUploadTask {
   inFlightPartNumbers: Set<number>;
   uploadedParts: Map<number, RelayUploadPartResponse>;
   loadedByPart: Map<number, number>;
-  stage: 'uploading' | 'paused' | 'completing' | 'awaiting-sync';
+  stage: 'uploading' | 'paused' | 'completing' | 'awaiting-sync' | 'failed';
   pauseReason: 'manual' | 'offline' | null;
   resumePromise: Promise<void> | null;
   resumeResolver: (() => void) | null;
@@ -320,6 +320,12 @@ function buildRelayUploadNote(totalParts: number, concurrency: number, prefix = 
 
 function buildRelayPausedNote(reason: RelayUploadTask['pauseReason']): string {
   return reason === 'offline' ? '网络已断开，上传已暂停，恢复后可继续' : '已暂停，可继续';
+}
+
+function buildRelayAwaitingSyncNote(reason: RelayUploadTask['pauseReason']): string {
+  return reason === 'offline'
+    ? '文件已上传，网络恢复后会同步到聊天记录'
+    : '文件已上传，等待信令恢复后同步到聊天记录';
 }
 
 function getRelayTaskTransferredBytes(task: RelayUploadTask): number {
@@ -2482,7 +2488,7 @@ export default function App() {
       notice?: string;
     },
   ): boolean {
-    if (task.cancelled || task.stage !== 'uploading') {
+    if (task.cancelled || (task.stage !== 'uploading' && task.stage !== 'awaiting-sync')) {
       return false;
     }
 
@@ -2501,7 +2507,10 @@ export default function App() {
       direction: 'upload',
       transport: 'server-relay',
       status: 'paused',
-      note: buildRelayPausedNote(options.reason),
+      note:
+        task.uploadedParts.size >= task.totalParts
+          ? buildRelayAwaitingSyncNote(options.reason)
+          : buildRelayPausedNote(options.reason),
     });
 
     if (options.notice) {
@@ -2518,7 +2527,7 @@ export default function App() {
 
     const wasOfflinePaused = task.pauseReason === 'offline';
     task.pauseReason = null;
-    task.stage = 'uploading';
+    task.stage = task.uploadedParts.size >= task.totalParts ? 'awaiting-sync' : 'uploading';
     wakeRelayTaskResume(task);
 
     updateTransfer({
@@ -2531,11 +2540,16 @@ export default function App() {
       direction: 'upload',
       transport: 'server-relay',
       status: 'streaming',
-      note: buildRelayUploadNote(
-        task.totalParts,
-        task.concurrency,
-        wasOfflinePaused ? '网络已恢复，继续直传到中继存储' : '继续直传到中继存储',
-      ),
+      note:
+        task.uploadedParts.size >= task.totalParts
+          ? wasOfflinePaused
+            ? '网络已恢复，正在同步到聊天记录'
+            : '正在同步到聊天记录'
+          : buildRelayUploadNote(
+              task.totalParts,
+              task.concurrency,
+              wasOfflinePaused ? '网络已恢复，继续直传到中继存储' : '继续直传到中继存储',
+            ),
     });
 
     if (options?.notice) {
@@ -2629,6 +2643,8 @@ export default function App() {
         resumeRelayTask(task);
       }
     }
+
+    flushPendingRelayAnnounces();
   }
 
   async function cancelRelayUpload(transferId: string): Promise<boolean> {
@@ -2890,8 +2906,12 @@ export default function App() {
         return;
       }
 
-      if (task && (task.stage === 'uploading' || task.stage === 'paused' || task.stage === 'completing')) {
+      if (task && (task.stage === 'uploading' || task.stage === 'completing' || task.stage === 'failed')) {
         dispatchRelayAbort(task.uploadToken, 'keepalive');
+      }
+
+      if (task) {
+        task.stage = 'failed';
       }
 
       updateTransfer({
