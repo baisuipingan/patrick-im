@@ -1,6 +1,6 @@
 use crate::protocol::{
     RelayAbortUploadRequest, RelayCompleteUploadRequest, RelayCompleteUploadResponse,
-    RelayDiscardUploadRequest, RelayUploadRequest, RelayUploadResponse,
+    RelayDiscardUploadRequest, RelayUploadPartAckRequest, RelayUploadRequest, RelayUploadResponse,
 };
 use crate::services::relay_store::{RelayUploadTokenPayload, ResumeRelayUploadInput};
 use crate::session::require_session;
@@ -64,19 +64,27 @@ pub async fn upload_request(
     {
         validate_relay_upload_request_record(&existing, &session.clientId, &normalized)
             .map_err(|error| StatusError::conflict().brief(error.to_string()))?;
+        let uploaded_parts = state
+            .message_store
+            .list_relay_upload_parts(&existing.file_id)
+            .await
+            .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
         let response = state
             .relay_store
-            .resume_upload(ResumeRelayUploadInput {
-                file_id: existing.file_id.clone(),
-                object_key: existing.object_key.clone(),
-                upload_id: existing.upload_id.clone(),
-                room_id: existing.room_id.clone(),
-                file_name: existing.file_name.clone(),
-                content_type: existing.content_type.clone(),
-                size: existing.size,
-                target_id: existing.target_id.clone(),
-                from_id: existing.from_id.clone(),
-            })
+            .resume_upload(
+                ResumeRelayUploadInput {
+                    file_id: existing.file_id.clone(),
+                    object_key: existing.object_key.clone(),
+                    upload_id: existing.upload_id.clone(),
+                    room_id: existing.room_id.clone(),
+                    file_name: existing.file_name.clone(),
+                    content_type: existing.content_type.clone(),
+                    size: existing.size,
+                    target_id: existing.target_id.clone(),
+                    from_id: existing.from_id.clone(),
+                },
+                uploaded_parts,
+            )
             .await
             .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
         return Ok(Json(response));
@@ -123,24 +131,66 @@ pub async fn upload_request(
 
             validate_relay_upload_request_record(&existing, &session.clientId, &normalized)
                 .map_err(|error| StatusError::conflict().brief(error.to_string()))?;
+            let uploaded_parts = state
+                .message_store
+                .list_relay_upload_parts(&existing.file_id)
+                .await
+                .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
             let response = state
                 .relay_store
-                .resume_upload(ResumeRelayUploadInput {
-                    file_id: existing.file_id.clone(),
-                    object_key: existing.object_key.clone(),
-                    upload_id: existing.upload_id.clone(),
-                    room_id: existing.room_id.clone(),
-                    file_name: existing.file_name.clone(),
-                    content_type: existing.content_type.clone(),
-                    size: existing.size,
-                    target_id: existing.target_id.clone(),
-                    from_id: existing.from_id.clone(),
-                })
+                .resume_upload(
+                    ResumeRelayUploadInput {
+                        file_id: existing.file_id.clone(),
+                        object_key: existing.object_key.clone(),
+                        upload_id: existing.upload_id.clone(),
+                        room_id: existing.room_id.clone(),
+                        file_name: existing.file_name.clone(),
+                        content_type: existing.content_type.clone(),
+                        size: existing.size,
+                        target_id: existing.target_id.clone(),
+                        from_id: existing.from_id.clone(),
+                    },
+                    uploaded_parts,
+                )
                 .await
                 .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
             Ok(Json(response))
         }
     }
+}
+
+#[handler]
+pub async fn ack_upload_part(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<Json<serde_json::Value>, StatusError> {
+    let state = depot
+        .obtain::<AppState>()
+        .map_err(|_| StatusError::internal_server_error())?;
+    let session = require_session(req, &state.config.session_secret)
+        .map_err(|error| {
+            StatusError::internal_server_error().brief(format!("session decode error: {error}"))
+        })?
+        .ok_or_else(|| StatusError::unauthorized().brief("missing session"))?;
+    let payload = req
+        .parse_body::<RelayUploadPartAckRequest>()
+        .await
+        .map_err(|_| StatusError::bad_request().brief("invalid upload part ack payload"))?;
+    if payload.part.partNumber <= 0 || payload.part.etag.trim().is_empty() {
+        return Err(StatusError::bad_request().brief("invalid upload part ack"));
+    }
+
+    let upload = state
+        .relay_store
+        .verify_upload_token(&session, &payload.uploadToken)
+        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+    state
+        .message_store
+        .store_relay_upload_part(&upload.file_id, &payload.part)
+        .await
+        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 #[handler]

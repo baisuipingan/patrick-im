@@ -4,7 +4,7 @@ mod threading;
 use crate::config::AppConfig;
 use crate::protocol::{
     ChatMessage, ClearThreadResponse, MessageKind, MessageTransport, RelayFileAnnouncement,
-    RelayFileDescriptor, ThreadClearedPayload,
+    RelayFileDescriptor, RelayUploadedPart, ThreadClearedPayload,
 };
 use crate::utils::{now_ms, previewable_from_content_type};
 use anyhow::{Context, Result, anyhow};
@@ -140,6 +140,12 @@ struct RelayUploadRequestRecordRow {
     object_key: String,
     upload_id: String,
     created_at: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct RelayUploadPartRow {
+    part_number: i32,
+    etag: String,
 }
 
 impl MessageStore {
@@ -425,6 +431,61 @@ impl MessageStore {
         }
     }
 
+    pub async fn store_relay_upload_part(
+        &self,
+        file_id: &str,
+        part: &RelayUploadedPart,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO relay_upload_parts (
+                file_id,
+                part_number,
+                etag,
+                created_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+                etag = VALUES(etag),
+                created_at = VALUES(created_at)
+            "#,
+        )
+        .bind(file_id)
+        .bind(part.partNumber)
+        .bind(part.etag.trim_matches('"'))
+        .bind(to_i64(now_ms(), "relay_upload_part.created_at")?)
+        .execute(&self.pool)
+        .await
+        .context("failed to persist relay upload part")?;
+
+        Ok(())
+    }
+
+    pub async fn list_relay_upload_parts(&self, file_id: &str) -> Result<Vec<RelayUploadedPart>> {
+        let rows = sqlx::query_as::<_, RelayUploadPartRow>(
+            r#"
+            SELECT
+                part_number,
+                etag
+            FROM relay_upload_parts
+            WHERE file_id = ?
+            ORDER BY part_number ASC
+            "#,
+        )
+        .bind(file_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list relay upload parts")?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| RelayUploadedPart {
+                partNumber: row.part_number,
+                etag: row.etag,
+            })
+            .collect())
+    }
+
     pub async fn remove_pending_relay_upload(&self, file_id: &str) -> Result<bool> {
         let result = sqlx::query("DELETE FROM pending_relay_uploads WHERE file_id = ?")
             .bind(file_id)
@@ -436,6 +497,12 @@ impl MessageStore {
     }
 
     pub async fn remove_relay_upload_request_by_file_id(&self, file_id: &str) -> Result<bool> {
+        sqlx::query("DELETE FROM relay_upload_parts WHERE file_id = ?")
+            .bind(file_id)
+            .execute(&self.pool)
+            .await
+            .context("failed to delete relay upload parts")?;
+
         let result = sqlx::query("DELETE FROM relay_upload_requests WHERE file_id = ?")
             .bind(file_id)
             .execute(&self.pool)

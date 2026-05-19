@@ -200,6 +200,12 @@ pub struct RelayUploadPartResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayUploadPartAckRequest {
+    pub uploadToken: String,
+    pub part: RelayUploadedPart,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayCompleteUploadRequest {
     pub uploadToken: String,
     pub parts: Vec<RelayUploadedPart>,

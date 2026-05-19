@@ -156,6 +156,7 @@ impl RelayStore {
     pub async fn resume_upload(
         &self,
         input: ResumeRelayUploadInput,
+        uploaded_parts: Vec<RelayUploadedPart>,
     ) -> Result<RelayUploadResponse> {
         let payload = RelayUploadTokenPayload {
             fileId: input.file_id,
@@ -169,9 +170,6 @@ impl RelayStore {
             fromId: input.from_id,
             issuedAt: now_ms(),
         };
-        let uploaded_parts = self
-            .list_uploaded_parts(&payload.objectKey, &payload.uploadId)
-            .await?;
         self.build_upload_response(&payload, uploaded_parts).await
     }
 
@@ -347,6 +345,7 @@ impl RelayStore {
         })
     }
 
+    #[allow(dead_code)]
     async fn list_uploaded_parts(
         &self,
         object_key: &str,

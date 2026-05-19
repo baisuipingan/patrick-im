@@ -515,6 +515,7 @@ async function uploadRelayPartsConcurrently(options: {
           task.loadedByPart.set(partNumber, loaded);
           recomputeLoadedBytes();
         }, task);
+        await ackRelayUploadPart(task, part);
         task.inFlightPartNumbers.delete(partNumber);
         task.uploadedParts.set(partNumber, part);
         task.loadedByPart.set(partNumber, chunk.size);
@@ -542,6 +543,23 @@ async function uploadRelayPartsConcurrently(options: {
     Array.from({ length: task.concurrency }, () => uploadNext()),
   );
   recomputeLoadedBytes(true);
+}
+
+async function ackRelayUploadPart(task: RelayUploadTask, part: RelayUploadPartResponse): Promise<void> {
+  const response = await fetch('/api/files/upload-part', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      uploadToken: task.uploadToken,
+      part,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error('relay_upload_part_ack_failed');
+  }
 }
 
 function getRoomShareLink(roomId: string): string {
