@@ -28,6 +28,26 @@ pub fn router() -> Router {
                     Router::with_path("rooms/{room_id}/threads/clear").post(threads::clear_thread),
                 ),
         )
-        .push(Router::with_path("").get(web::index))
         .push(Router::with_path("{**path}").get(web::asset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use salvo::http::StatusCode;
+    use salvo::test::{ResponseExt, TestClient};
+
+    #[tokio::test]
+    async fn root_path_serves_embedded_index() {
+        let service = Service::new(router());
+
+        let mut response = TestClient::get("http://127.0.0.1:5800/")
+            .send(&service)
+            .await;
+
+        assert_eq!(response.status_code, Some(StatusCode::OK));
+        let body = response.take_string().await.unwrap();
+        assert!(body.contains("<title>Patrick-IM</title>"));
+        assert!(body.contains("<div id=\"root\"></div>"));
+    }
 }
