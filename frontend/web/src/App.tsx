@@ -22,15 +22,9 @@ import {
   X,
 } from 'lucide-react';
 import type {
-  ClientToServerMessage,
   ChatMessage,
   ClearThreadResponse,
   DirectPeerState,
-  RelayAbortUploadRequest,
-  RelayDiscardUploadRequest,
-  RelayPresignedPart,
-  RelayUploadPartResponse,
-  RelayUploadResponse,
   ServerToClientMessage,
   SessionResponse,
   TransferMode,
@@ -38,6 +32,54 @@ import type {
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { ComposerPanel, MessageList, TransferPanel } from '@/app/chat-sections';
+import { ClearThreadDialog, EditNicknameDialog, ImagePreviewDialog } from '@/app/dialogs';
+import {
+  candidateAddressLabel,
+  candidateTypeLabel,
+  directPathDescription,
+  directPathLabel,
+  formatClockTime,
+  formatTransferNote,
+  formatTransferSpeed,
+  getInitials,
+  getMessageThreadKey,
+  getPeerPresenceStatus,
+  getThreadKeyForClearedEvent,
+  peerBadgeTone,
+  peerDotTone,
+  peerSignalLabel,
+  peerStateLabel,
+  socketStatusDotTone,
+  socketStatusLabel,
+  socketStatusTone,
+  summarizeMessage,
+  transferStatusLabel,
+  transportBadgeTone,
+  transportLabel,
+} from '@/app/chat-formatters';
+import { RoomPicker } from '@/app/room-picker';
+import {
+  appendMessageState,
+  applyPeerPathUpdate,
+  applyPeerStateUpdate,
+  buildDefaultNotice,
+  clearThreadUnreadCount,
+  closeTransferRow,
+  reconcileSnapshotPeerState,
+  removePeerFromList,
+  upsertPeerList,
+} from '@/app/room-state';
+import { buildDirectFileMessage, canUseDirectTransfer, collectSendPayload } from '@/app/send-actions';
+import { handleServerEventMessage } from '@/app/server-events';
+import {
+  clearThreadMessages,
+  clearThreadTransfers,
+  formatThreadClearRemoteNotice,
+  formatThreadClearSuccessNotice,
+} from '@/app/thread-actions';
+import { reduceTransferUpdate } from '@/app/transfer-state';
+import type { PendingAttachment, PeerPresenceStatus, TransferRow, UiMessage } from '@/app/types';
 import {
   clearReceiveDirectory,
   createWritableFile,
@@ -47,27 +89,18 @@ import {
   supportsDirectoryPicker,
   type StoredDirectoryState,
 } from '@/lib/file-system';
-import { buildWsUrl, cn, formatBytes, roomToSlug } from '@/lib/utils';
-import { PeerMesh, type DirectPathInfo, type IncomingFilePayload, type TransferUpdate } from '@/lib/peer-mesh';
+import { cn, formatBytes, roomToSlug } from '@/lib/utils';
+import type { DirectPathInfo, IncomingFilePayload, TransferUpdate } from '@/lib/peer-mesh';
+import { useRelayUploads, type RelayUploadControls } from '@/app/use-relay-uploads';
+import { useRoomConnection } from '@/app/use-room-connection';
 
 const GLOBAL_THREAD = '__global__';
 const RECENT_ROOMS_KEY = 'patrick-im:recent-rooms';
-const WS_HEARTBEAT_INTERVAL_MS = 15_000;
-const WS_HEARTBEAT_STALE_AFTER_MS = 55_000;
-const WS_WATCHDOG_INTERVAL_MS = 5_000;
-const WS_RESUME_PROBE_INTERVAL_MS = 3_000;
-const WS_CONNECT_TIMEOUT_MS = 12_000;
-const WS_RECONNECT_BASE_DELAY_MS = 1_000;
-const WS_RECONNECT_MAX_DELAY_MS = 30_000;
 const TRANSFER_MODE_TOOLTIP_DELAY_MS = 500;
 const PEER_PATH_TOOLTIP_DELAY_MS = 500;
 const TRANSIENT_NOTICE_RESET_MS = 2600;
-const MIB = 1024 * 1024;
 const LARGE_DIRECT_FILE_NOTICE_BYTES = 256 * 1024 * 1024;
-const DEFAULT_NOTICE = '把两个浏览器打开到同一个房间后，就可以开始发文字、图片和文件了。';
 const HEADER_BADGE_CLASS = 'h-7 rounded-full px-3 text-[12px] font-medium shadow-sm';
-const PENDING_RELAY_ABORTS_KEY = 'patrick-im:pending-relay-aborts';
-const PENDING_RELAY_ANNOUNCES_KEY = 'patrick-im:pending-relay-announces';
 
 function ShareRoomIcon({ className }: { className?: string }) {
   return (
@@ -78,179 +111,6 @@ function ShareRoomIcon({ className }: { className?: string }) {
       />
     </svg>
   );
-}
-
-interface UiMessage extends ChatMessage {
-  localUrl?: string;
-  savedToDisk?: boolean;
-}
-
-interface TransferRow extends TransferUpdate {
-  id: string;
-  startedAt: number;
-  speedBytesPerSecond?: number;
-  lastProgressAt?: number;
-  lastProgressBytes?: number;
-}
-
-interface PendingAttachment {
-  id: string;
-  file: File;
-  previewUrl?: string;
-}
-
-interface RelayUploadTask {
-  transferId: string;
-  clientRequestId: string;
-  fileName: string;
-  uploadToken: string;
-  roomId: string;
-  targetId: string | null;
-  peerId: string;
-  peerName: string;
-  file: File;
-  chunkSizeBytes: number;
-  totalBytes: number;
-  totalParts: number;
-  concurrency: number;
-  partUrlsByNumber: Map<number, RelayPresignedPart>;
-  pendingPartNumbers: number[];
-  inFlightPartNumbers: Set<number>;
-  uploadedParts: Map<number, RelayUploadPartResponse>;
-  loadedByPart: Map<number, number>;
-  displayedTransferredBytes: number;
-  stage: 'uploading' | 'paused' | 'completing' | 'awaiting-sync' | 'failed';
-  pauseReason: 'manual' | 'offline' | null;
-  pauseGeneration: number;
-  resumePromise: Promise<void> | null;
-  resumeResolver: (() => void) | null;
-  cancelled: boolean;
-  xhrs: Set<XMLHttpRequest>;
-}
-
-interface PendingRelayAbortTicket {
-  uploadToken: string;
-  createdAt: number;
-}
-
-interface PendingRelayAnnounceTicket {
-  uploadToken: string;
-  roomId: string;
-  fileId: string;
-  fileName: string;
-  size: number;
-  contentType: string;
-  objectKey: string;
-  targetId: string | null;
-  createdAt: number;
-}
-
-type SocketStatus = 'idle' | 'connecting' | 'reconnecting' | 'connected' | 'paused' | 'closed' | 'error';
-type PeerPresenceStatus = 'online' | 'offline' | 'recovering' | 'unknown';
-
-function isRelayUploadCancelledError(error: unknown): boolean {
-  return error instanceof Error && error.message === 'relay_upload_cancelled';
-}
-
-function createRelayUploadCancelledError(): Error {
-  return new Error('relay_upload_cancelled');
-}
-
-function loadPendingRelayAbortTickets(): PendingRelayAbortTicket[] {
-  if (typeof window === 'undefined') {
-    return [];
-  }
-
-  try {
-    const stored = window.localStorage.getItem(PENDING_RELAY_ABORTS_KEY);
-    const parsed = stored ? (JSON.parse(stored) as PendingRelayAbortTicket[]) : [];
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
-    const seen = new Set<string>();
-    return parsed.filter((item) => {
-      if (!item || typeof item.uploadToken !== 'string' || !item.uploadToken) {
-        return false;
-      }
-      if (seen.has(item.uploadToken)) {
-        return false;
-      }
-      seen.add(item.uploadToken);
-      return true;
-    });
-  } catch {
-    return [];
-  }
-}
-
-function storePendingRelayAbortTickets(tickets: PendingRelayAbortTicket[]): void {
-  if (typeof window === 'undefined') {
-    return;
-  }
-
-  window.localStorage.setItem(PENDING_RELAY_ABORTS_KEY, JSON.stringify(tickets.slice(-64)));
-}
-
-function loadPendingRelayAnnounceTickets(): PendingRelayAnnounceTicket[] {
-  if (typeof window === 'undefined') {
-    return [];
-  }
-
-  try {
-    const stored = window.localStorage.getItem(PENDING_RELAY_ANNOUNCES_KEY);
-    const parsed = stored ? (JSON.parse(stored) as PendingRelayAnnounceTicket[]) : [];
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-
-    const seen = new Set<string>();
-    return parsed.filter((item) => {
-      if (
-        !item ||
-        typeof item.uploadToken !== 'string' ||
-        !item.uploadToken ||
-        typeof item.roomId !== 'string' ||
-        !item.roomId ||
-        typeof item.fileId !== 'string' ||
-        !item.fileId ||
-        typeof item.fileName !== 'string' ||
-        !item.fileName ||
-        typeof item.size !== 'number' ||
-        !Number.isFinite(item.size) ||
-        item.size <= 0 ||
-        typeof item.contentType !== 'string' ||
-        !item.contentType ||
-        typeof item.objectKey !== 'string' ||
-        !item.objectKey ||
-        typeof item.createdAt !== 'number' ||
-        !Number.isFinite(item.createdAt)
-      ) {
-        return false;
-      }
-
-      if (item.targetId !== null && typeof item.targetId !== 'string') {
-        return false;
-      }
-
-      if (seen.has(item.fileId)) {
-        return false;
-      }
-
-      seen.add(item.fileId);
-      return true;
-    });
-  } catch {
-    return [];
-  }
-}
-
-function storePendingRelayAnnounceTickets(tickets: PendingRelayAnnounceTicket[]): void {
-  if (typeof window === 'undefined') {
-    return;
-  }
-
-  window.localStorage.setItem(PENDING_RELAY_ANNOUNCES_KEY, JSON.stringify(tickets.slice(-128)));
 }
 
 function getInitialNickname(): string {
@@ -300,724 +160,9 @@ function rememberRoom(roomId: string, current: string[]): string[] {
   return next;
 }
 
-function getRelayUploadConcurrency(fileSizeBytes: number, totalParts: number): number {
-  if (totalParts <= 1) {
-    return 1;
-  }
-  if (fileSizeBytes <= 32 * MIB || totalParts <= 2) {
-    return Math.min(2, totalParts);
-  }
-  if (fileSizeBytes <= 128 * MIB || totalParts <= 4) {
-    return Math.min(4, totalParts);
-  }
-  if (fileSizeBytes <= 512 * MIB || totalParts <= 16) {
-    return Math.min(8, totalParts);
-  }
-  if (fileSizeBytes <= 2 * 1024 * MIB || totalParts <= 64) {
-    return Math.min(12, totalParts);
-  }
-  return Math.min(16, totalParts);
-}
-
-function buildRelayUploadNote(totalParts: number, concurrency: number, prefix = '正在直传到中继存储'): string {
-  return totalParts > 1 ? `${prefix}（共 ${totalParts} 个分片，并发 ${concurrency}）` : prefix;
-}
-
-function buildRelayPausedNote(reason: RelayUploadTask['pauseReason']): string {
-  return reason === 'offline' ? '网络已断开，上传已暂停，恢复后可继续' : '已暂停，可继续';
-}
-
-function buildRelayAwaitingSyncNote(reason: RelayUploadTask['pauseReason']): string {
-  return reason === 'offline'
-    ? '文件已上传，网络恢复后会同步到聊天记录'
-    : '文件已上传，等待信令恢复后同步到聊天记录';
-}
-
-function getRelayTaskTransferredBytes(task: RelayUploadTask): number {
-  let transferred = 0;
-  task.loadedByPart.forEach((loaded) => {
-    transferred += loaded;
-  });
-  return Math.min(task.totalBytes, transferred);
-}
-
-function rememberRelayTaskDisplayedBytes(task: RelayUploadTask, transferredBytes: number): number {
-  const clamped = Math.min(task.totalBytes, Math.max(0, transferredBytes));
-  task.displayedTransferredBytes = Math.max(task.displayedTransferredBytes, clamped);
-  return task.displayedTransferredBytes;
-}
-
-function getRelayTaskVisibleTransferredBytes(task: RelayUploadTask): number {
-  return rememberRelayTaskDisplayedBytes(task, getRelayTaskTransferredBytes(task));
-}
-
-function getRelayPartBlob(file: File, chunkSizeBytes: number, partNumber: number): Blob {
-  const start = (partNumber - 1) * chunkSizeBytes;
-  return file.slice(start, Math.min(file.size, start + chunkSizeBytes));
-}
-
-function applyRelayUploadSnapshot(task: RelayUploadTask, payload: RelayUploadResponse): void {
-  if (payload.fileId !== task.transferId) {
-    throw new Error('relay_upload_resume_file_mismatch');
-  }
-
-  const uploadedParts = new Map(payload.uploadedParts.map((part) => [part.partNumber, part]));
-  const uploadedPartNumbers = new Set(uploadedParts.keys());
-  const loadedByPart = new Map<number, number>();
-
-  uploadedPartNumbers.forEach((partNumber) => {
-    loadedByPart.set(partNumber, getRelayPartBlob(task.file, payload.chunkSizeBytes, partNumber).size);
-  });
-
-  task.uploadToken = payload.uploadToken;
-  task.chunkSizeBytes = payload.chunkSizeBytes;
-  task.totalParts = payload.partUrls.length;
-  task.concurrency = getRelayUploadConcurrency(task.totalBytes, task.totalParts);
-  task.partUrlsByNumber = new Map(payload.partUrls.map((part) => [part.partNumber, part]));
-  task.pendingPartNumbers = payload.partUrls
-    .map((part) => part.partNumber)
-    .filter((partNumber) => !uploadedPartNumbers.has(partNumber));
-  task.inFlightPartNumbers.clear();
-  task.uploadedParts = uploadedParts;
-  task.loadedByPart = loadedByPart;
-  rememberRelayTaskDisplayedBytes(task, getRelayTaskTransferredBytes(task));
-}
-
-function uploadPresignedPartWithProgress(
-  part: RelayPresignedPart,
-  chunk: Blob,
-  onProgress: (loaded: number) => void,
-  task: RelayUploadTask,
-): Promise<RelayUploadPartResponse> {
-  return new Promise<RelayUploadPartResponse>((resolve, reject) => {
-    if (task.cancelled) {
-      reject(createRelayUploadCancelledError());
-      return;
-    }
-
-    const xhr = new XMLHttpRequest();
-    task.xhrs.add(xhr);
-    xhr.open('PUT', part.url, true);
-    for (const header of part.headers) {
-      xhr.setRequestHeader(header.name, header.value);
-    }
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable) {
-        onProgress(event.loaded);
-      }
-    };
-    xhr.onabort = () => {
-      task.xhrs.delete(xhr);
-      reject(createRelayUploadCancelledError());
-    };
-    xhr.onerror = () => {
-      task.xhrs.delete(xhr);
-      reject(new Error('upload_part_failed'));
-    };
-    xhr.onload = () => {
-      task.xhrs.delete(xhr);
-      if (xhr.status >= 200 && xhr.status < 300) {
-        const etag = xhr.getResponseHeader('etag') ?? xhr.getResponseHeader('ETag');
-        if (!etag) {
-          reject(new Error('upload_part_missing_etag'));
-          return;
-        }
-        resolve({
-          partNumber: part.partNumber,
-          etag,
-        });
-      } else {
-        reject(new Error(`upload_part_failed_${xhr.status}`));
-      }
-    };
-
-    if (task.cancelled) {
-      xhr.abort();
-      return;
-    }
-
-    xhr.send(chunk);
-  });
-}
-
-async function uploadRelayPartsConcurrently(options: {
-  onProgress: (transferredBytes: number, totalParts: number, concurrency: number) => void;
-  task: RelayUploadTask;
-}): Promise<void> {
-  const { onProgress, task } = options;
-  let aggregateLoadedBytes = 0;
-  let lastProgressEmitAt = 0;
-
-  const emitProgress = (force: boolean = false) => {
-    const now = performance.now();
-    if (!force && now - lastProgressEmitAt < 120) {
-      return;
-    }
-    lastProgressEmitAt = now;
-    onProgress(Math.min(task.totalBytes, aggregateLoadedBytes), task.totalParts, task.concurrency);
-  };
-
-  const recomputeLoadedBytes = (forceEmit: boolean = false) => {
-    aggregateLoadedBytes = getRelayTaskTransferredBytes(task);
-    emitProgress(forceEmit || aggregateLoadedBytes >= task.totalBytes);
-  };
-
-  const claimNextPartNumber = (): number | null => {
-    while (task.pendingPartNumbers.length > 0) {
-      const partNumber = task.pendingPartNumbers.shift();
-      if (!partNumber) {
-        break;
-      }
-      if (task.uploadedParts.has(partNumber) || task.inFlightPartNumbers.has(partNumber)) {
-        continue;
-      }
-      task.inFlightPartNumbers.add(partNumber);
-      return partNumber;
-    }
-    return null;
-  };
-
-  const requeuePartNumber = (partNumber: number) => {
-    if (
-      task.uploadedParts.has(partNumber) ||
-      task.inFlightPartNumbers.has(partNumber) ||
-      task.pendingPartNumbers.includes(partNumber)
-    ) {
-      return;
-    }
-    task.pendingPartNumbers.unshift(partNumber);
-  };
-
-  recomputeLoadedBytes(true);
-
-  const uploadNext = async (): Promise<void> => {
-    while (true) {
-      if (task.cancelled || task.stage === 'paused') {
-        return;
-      }
-
-      const partNumber = claimNextPartNumber();
-      if (partNumber === null) {
-        return;
-      }
-
-      const partUrl = task.partUrlsByNumber.get(partNumber);
-      if (!partUrl) {
-        task.inFlightPartNumbers.delete(partNumber);
-        throw new Error(`upload_part_url_missing_${partNumber}`);
-      }
-
-      const chunk = getRelayPartBlob(task.file, task.chunkSizeBytes, partNumber);
-      const pauseGeneration = task.pauseGeneration;
-
-      try {
-        const part = await uploadPresignedPartWithProgress(partUrl, chunk, (loaded) => {
-          task.loadedByPart.set(partNumber, loaded);
-          recomputeLoadedBytes();
-        }, task);
-        await ackRelayUploadPart(task, part);
-        task.inFlightPartNumbers.delete(partNumber);
-        task.uploadedParts.set(partNumber, part);
-        task.loadedByPart.set(partNumber, chunk.size);
-        recomputeLoadedBytes(true);
-      } catch (error) {
-        task.inFlightPartNumbers.delete(partNumber);
-        task.loadedByPart.delete(partNumber);
-        recomputeLoadedBytes(true);
-
-        if (task.pauseGeneration > pauseGeneration) {
-          requeuePartNumber(partNumber);
-          return;
-        }
-
-        if (task.cancelled || isRelayUploadCancelledError(error)) {
-          return;
-        }
-
-        throw error;
-      }
-    }
-  };
-
-  await Promise.all(
-    Array.from({ length: task.concurrency }, () => uploadNext()),
-  );
-  recomputeLoadedBytes(true);
-}
-
-async function ackRelayUploadPart(task: RelayUploadTask, part: RelayUploadPartResponse): Promise<void> {
-  const response = await fetch('/api/files/upload-part', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      uploadToken: task.uploadToken,
-      part,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error('relay_upload_part_ack_failed');
-  }
-}
 
 function getRoomShareLink(roomId: string): string {
   return `${window.location.origin}/#${encodeURIComponent(roomId)}`;
-}
-
-function getInitials(name: string): string {
-  return name.slice(0, 2).toUpperCase() || '??';
-}
-
-function formatClockTime(timestamp: number): string {
-  return new Intl.DateTimeFormat('zh-CN', {
-    hour: '2-digit',
-    minute: '2-digit',
-  }).format(timestamp);
-}
-
-function formatAgo(timestamp: number): string {
-  const diffSeconds = Math.max(1, Math.floor((Date.now() - timestamp) / 1000));
-  if (diffSeconds < 60) {
-    return '刚刚';
-  }
-  if (diffSeconds < 3600) {
-    return `${Math.floor(diffSeconds / 60)} 分钟前`;
-  }
-  if (diffSeconds < 86400) {
-    return `${Math.floor(diffSeconds / 3600)} 小时前`;
-  }
-  return `${Math.floor(diffSeconds / 86400)} 天前`;
-}
-
-function socketStatusLabel(status: SocketStatus): string {
-  switch (status) {
-    case 'idle':
-      return '信令未连接';
-    case 'connecting':
-      return '信令连接中';
-    case 'reconnecting':
-      return '信令重连中';
-    case 'connected':
-      return '信令在线';
-    case 'paused':
-      return '信令待恢复';
-    case 'closed':
-      return '信令离线';
-    case 'error':
-      return '信令异常';
-    default:
-      return status;
-  }
-}
-
-function socketStatusTone(status: SocketStatus): string {
-  switch (status) {
-    case 'connected':
-      return 'border-emerald-200 bg-emerald-50 text-emerald-700';
-    case 'connecting':
-    case 'reconnecting':
-      return 'border-amber-200 bg-amber-50 text-amber-700';
-    case 'paused':
-      return 'border-slate-200 bg-slate-100 text-slate-600';
-    case 'error':
-      return 'border-rose-200 bg-rose-50 text-rose-700';
-    case 'closed':
-      return 'border-slate-200 bg-slate-100 text-slate-600';
-    default:
-      return 'border-slate-200 bg-slate-100 text-slate-600';
-  }
-}
-
-function socketStatusDotTone(status: SocketStatus): string {
-  switch (status) {
-    case 'connected':
-      return 'bg-emerald-500';
-    case 'connecting':
-    case 'reconnecting':
-      return 'bg-amber-500';
-    case 'paused':
-      return 'bg-slate-400';
-    case 'error':
-      return 'bg-rose-500';
-    case 'closed':
-      return 'bg-slate-400';
-    default:
-      return 'bg-slate-400';
-  }
-}
-
-function getPeerPresenceStatus(
-  socketStatus: SocketStatus,
-  isOnline: boolean,
-  directState: DirectPeerState | undefined,
-): PeerPresenceStatus {
-  if (directState === 'connected') {
-    return 'online';
-  }
-
-  if (socketStatus === 'connected') {
-    return isOnline ? 'online' : 'offline';
-  }
-
-  if (socketStatus === 'connecting' || socketStatus === 'reconnecting' || socketStatus === 'paused') {
-    return 'recovering';
-  }
-
-  return 'unknown';
-}
-
-function peerSignalLabel(status: PeerPresenceStatus): string {
-  switch (status) {
-    case 'online':
-      return '对方在线';
-    case 'offline':
-      return '对方离线';
-    case 'recovering':
-      return '在线状态恢复中';
-    case 'unknown':
-      return '在线状态未知';
-    default:
-      return status;
-  }
-}
-
-function peerStateLabel(state: DirectPeerState | undefined): string {
-  switch (state) {
-    case 'connected':
-      return '局域网直连';
-    default:
-      return '中继模式';
-  }
-}
-
-function directPathLabel(path?: DirectPathInfo | null): string {
-  switch (path?.kind) {
-    case 'lan':
-      return '局域网直连';
-    case 'stun':
-      return '局域网直连';
-    case 'turn':
-      return '中继';
-    case 'unknown':
-      return '局域网直连';
-    default:
-      return '识别中';
-  }
-}
-
-function directPathDescription(path?: DirectPathInfo | null): string {
-  switch (path?.kind) {
-    case 'lan':
-      return '当前是局域网 WebRTC 直连。';
-    case 'stun':
-      return '当前是局域网 WebRTC 直连。';
-    case 'turn':
-      return '当前实际经过中继链路，这种情况通常会慢很多。';
-    case 'unknown':
-      return '当前未建立局域网直连，发送文件时会走中继。';
-    default:
-      return '当前未建立局域网直连，发送文件时会走中继。';
-  }
-}
-
-function candidateTypeLabel(type?: string): string {
-  switch (type) {
-    case 'host':
-      return 'host';
-    case 'srflx':
-      return 'srflx';
-    case 'prflx':
-      return 'prflx';
-    case 'relay':
-      return 'relay';
-    default:
-      return type ?? '-';
-  }
-}
-
-function candidateAddressLabel(side: '本地' | '远端', type?: string, address?: string): string {
-  if (address) {
-    return `${side} ${address}`;
-  }
-
-  if (type === 'host') {
-    return `${side} 浏览器已隐藏`;
-  }
-
-  return `${side} -`;
-}
-
-function peerDotTone(state: DirectPeerState | undefined, presence: PeerPresenceStatus): string {
-  if (state === 'connected') {
-    return 'bg-emerald-500';
-  }
-
-  if (state === 'connecting') {
-    return 'bg-amber-500';
-  }
-
-  if (state === 'failed') {
-    return 'bg-orange-400';
-  }
-
-  switch (presence) {
-    case 'online':
-      return 'bg-sky-500';
-    case 'recovering':
-      return 'bg-amber-400';
-    case 'unknown':
-      return 'bg-slate-400';
-    case 'offline':
-    default:
-      return 'bg-slate-400';
-  }
-}
-
-function peerBadgeTone(state: DirectPeerState | undefined): string {
-  switch (state) {
-    case 'connected':
-      return 'border-emerald-200 bg-emerald-50 text-emerald-700';
-    default:
-      return 'border-amber-200 bg-amber-50 text-amber-700';
-  }
-}
-
-function transferStatusLabel(status: TransferRow['status']): string {
-  switch (status) {
-    case 'pending':
-      return '等待中';
-    case 'paused':
-      return '已暂停';
-    case 'streaming':
-      return '传输中';
-    case 'complete':
-      return '已完成';
-    case 'failed':
-      return '失败';
-    case 'declined':
-      return '被拒绝';
-    case 'cancelled':
-      return '已取消';
-    default:
-      return status;
-  }
-}
-
-function transportLabel(transport: ChatMessage['transport'] | TransferRow['transport']): string {
-  switch (transport) {
-    case 'direct-p2p':
-      return '局域网直连';
-    case 'server-relay':
-      return '中继';
-    case 'server-sync':
-      return '聊天同步';
-    default:
-      return transport;
-  }
-}
-
-function transportBadgeTone(transport: ChatMessage['transport'] | TransferRow['transport']): string {
-  switch (transport) {
-    case 'direct-p2p':
-      return 'border-emerald-200 bg-emerald-50 text-emerald-700';
-    case 'server-relay':
-      return 'border-amber-200 bg-amber-50 text-amber-700';
-    case 'server-sync':
-      return 'border-sky-200 bg-sky-50 text-sky-700';
-    default:
-      return 'border-slate-200 bg-slate-50 text-slate-600';
-  }
-}
-
-function formatTransferNote(note?: string): string | undefined {
-  if (!note) {
-    return undefined;
-  }
-
-  switch (note) {
-    case 'saved directly to receive directory':
-      return '已直接写入接收目录';
-    case 'receiver asked to use relay mode':
-      return '对方要求改走服务端中继';
-    case 'receiver declined':
-      return '对方已拒绝接收';
-    case 'data channel error':
-      return '数据通道异常';
-    case 'transfer interrupted':
-      return '传输中断';
-    case 'stream failed':
-      return '传输失败';
-    case 'The object is in an invalid state.':
-      return '直连通道在传输中失效了，常见于浏览器兼容或分片过大';
-    case 'direct channel closed during transfer':
-      return '直连通道在传输中被关闭了';
-    case 'waiting for receiver confirmation':
-      return '发送端已发完，等待接收端确认';
-    case 'receiver confirmation is delayed':
-      return '接收端确认较慢，继续等待中';
-    case 'receiver is finalizing file':
-      return '接收端已收齐，正在写入文件';
-    case 'receiver finalization is taking longer than expected':
-      return '接收端正在写入文件，耗时比预期更久';
-    case 'receiver confirmation timed out':
-      return '等待接收端确认超时（已等待 10 分钟）';
-    case 'receiver finalization timed out':
-      return '接收端长时间未完成写入（已等待 10 分钟）';
-    case 'transfer_interrupted':
-      return '接收端报告传输中断';
-    case 'receiver_write_failed':
-      return '接收端写入文件失败';
-    case 'receiver reported failure':
-      return '接收端报告传输失败';
-    case 'cancelled locally':
-      return '已取消';
-    case 'cancelled by remote':
-      return '对方已取消';
-    case '已暂停，可继续':
-      return '已暂停，可继续';
-    case '网络已断开，上传已暂停，恢复后可继续':
-      return '网络中断，已暂停';
-    default:
-      return note;
-  }
-}
-
-function formatTransferSpeed(speedBytesPerSecond?: number): string | undefined {
-  if (!speedBytesPerSecond || !Number.isFinite(speedBytesPerSecond) || speedBytesPerSecond <= 0) {
-    return undefined;
-  }
-
-  return `${formatBytes(speedBytesPerSecond)}/s`;
-}
-
-function getMessageThreadKey(message: ChatMessage, selfId?: string): string {
-  if (!selfId) {
-    return message.targetId ?? GLOBAL_THREAD;
-  }
-
-  if (!message.targetId) {
-    return GLOBAL_THREAD;
-  }
-
-  return message.fromId === selfId ? message.targetId : message.fromId;
-}
-
-function summarizeMessage(message: ChatMessage): string {
-  if (message.text) {
-    return message.text;
-  }
-
-  if (message.file) {
-    return message.file.previewable ? `[图片] ${message.file.fileName}` : `[文件] ${message.file.fileName}`;
-  }
-
-  return '新消息';
-}
-
-function getThreadKeyForClearedEvent(
-  targetId: string | null,
-  actorId: string,
-  selfId?: string,
-): string {
-  if (!targetId) {
-    return GLOBAL_THREAD;
-  }
-
-  if (!selfId) {
-    return targetId;
-  }
-
-  return actorId === selfId ? targetId : actorId;
-}
-
-function buildRoomWebSocketUrl(roomId: string, nickname: string): string {
-  const url = new URL(buildWsUrl(`/api/rooms/${roomId}/ws`));
-  if (nickname.trim()) {
-    url.searchParams.set('nickname', nickname.trim());
-  }
-  return url.toString();
-}
-
-function RoomPicker({
-  roomDraft,
-  recentRooms,
-  currentRoom,
-  onRoomDraftChange,
-  onJoinRoom,
-}: {
-  roomDraft: string;
-  recentRooms: string[];
-  currentRoom: string | null;
-  onRoomDraftChange: (value: string) => void;
-  onJoinRoom: (roomId?: string) => void;
-}) {
-  return (
-    <div className="flex min-h-screen items-center justify-center bg-[#eff6ff] p-4">
-      <div className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-8 shadow-sm">
-        <div className="mb-6">
-          <h1 className="text-2xl font-bold text-slate-900">加入房间</h1>
-          <p className="mt-2 text-sm text-slate-600">输入房间号，或者从最近使用过的房间里继续。</p>
-          {currentRoom ? (
-            <div className="mt-3">
-              <Badge className="border-blue-200 bg-blue-50 text-blue-700">当前房间：{currentRoom}</Badge>
-            </div>
-          ) : null}
-        </div>
-
-        <div className="space-y-3">
-          <Input
-            value={roomDraft}
-            onChange={(event) => onRoomDraftChange(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') {
-                onJoinRoom(roomDraft);
-              }
-            }}
-            placeholder="输入房间号..."
-            className="h-10 rounded-lg"
-          />
-          <Button
-            onClick={() => onJoinRoom(roomDraft)}
-            className="h-10 w-full bg-[#1e3a8a] text-white hover:bg-[#1e3a8a]/90"
-          >
-            加入房间
-          </Button>
-        </div>
-
-        {recentRooms.length > 0 ? (
-          <>
-            <div className="relative my-6">
-              <div className="absolute inset-0 flex items-center">
-                <div className="w-full border-t border-slate-200" />
-              </div>
-              <div className="relative flex justify-center text-sm">
-                <span className="bg-white px-3 text-slate-500">最近使用</span>
-              </div>
-            </div>
-
-            <div className="space-y-2">
-              {recentRooms.map((room) => (
-                <button
-                  key={room}
-                  type="button"
-                  onClick={() => onJoinRoom(room)}
-                  className="flex w-full items-center justify-between rounded-lg border border-slate-200 px-4 py-3 text-left transition-colors hover:bg-blue-50"
-                >
-                  <div className="min-w-0">
-                    <div className="truncate text-sm font-semibold text-slate-900">{room}</div>
-                    <div className="mt-1 text-xs text-slate-500">点击直接进入这个房间</div>
-                  </div>
-                  <Badge className="border-slate-200 bg-slate-50 text-slate-600">房间</Badge>
-                </button>
-              ))}
-            </div>
-          </>
-        ) : null}
-      </div>
-    </div>
-  );
 }
 
 export default function App() {
@@ -1031,7 +176,6 @@ export default function App() {
   const [activeRoom, setActiveRoom] = useState<string | null>(null);
   const [roomConnectionNonce, setRoomConnectionNonce] = useState(0);
   const [activeThread, setActiveThread] = useState<string>(GLOBAL_THREAD);
-  const [socketStatus, setSocketStatus] = useState<SocketStatus>('idle');
   const [composer, setComposer] = useState('');
   const [isComposing, setIsComposing] = useState(false);
   const [messages, setMessages] = useState<UiMessage[]>([]);
@@ -1040,7 +184,7 @@ export default function App() {
   const [directStates, setDirectStates] = useState<Record<string, DirectPeerState>>({});
   const [directPaths, setDirectPaths] = useState<Record<string, DirectPathInfo>>({});
   const [transfers, setTransfers] = useState<Record<string, TransferRow>>({});
-  const [notice, setNotice] = useState(DEFAULT_NOTICE);
+  const [notice, setNotice] = useState(() => buildDefaultNotice(null));
   const [receiveDirectory, setReceiveDirectory] = useState<StoredDirectoryState>(() => ({
     handle: null,
     status: supportsDirectoryPicker() ? 'not-configured' : 'unsupported',
@@ -1060,14 +204,11 @@ export default function App() {
   const [peerPathTooltip, setPeerPathTooltip] = useState<{ peerId: string; scope: 'sidebar' | 'header' } | null>(null);
   const [shareFeedback, setShareFeedback] = useState<string | null>(null);
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const meshRef = useRef<PeerMesh | null>(null);
   const messagesViewportRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const dragCounterRef = useRef(0);
   const objectUrlsRef = useRef<string[]>([]);
   const peerNamesRef = useRef<Record<string, string>>({});
-  const socketStatusRef = useRef<SocketStatus>('idle');
   const receiveDirectoryRef = useRef<StoredDirectoryState>({
     handle: null,
     status: supportsDirectoryPicker() ? 'not-configured' : 'unsupported',
@@ -1075,28 +216,18 @@ export default function App() {
   });
   const messagesRef = useRef<UiMessage[]>([]);
   const transfersRef = useRef<Record<string, TransferRow>>({});
+  const unreadCountsRef = useRef<Record<string, number>>({});
+  const directPathsRef = useRef<Record<string, DirectPathInfo>>({});
   const activeRoomRef = useRef<string | null>(null);
   const activeThreadRef = useRef<string>(GLOBAL_THREAD);
-  const relayAbortQueueRef = useRef<PendingRelayAbortTicket[]>(loadPendingRelayAbortTickets());
-  const relayAnnounceQueueRef = useRef<PendingRelayAnnounceTicket[]>(loadPendingRelayAnnounceTickets());
   const copiedMessageTimerRef = useRef<number | null>(null);
   const transferModeTooltipTimerRef = useRef<number | null>(null);
   const peerPathTooltipTimerRef = useRef<number | null>(null);
   const shareFeedbackTimerRef = useRef<number | null>(null);
-  const relayUploadTasksRef = useRef<Map<string, RelayUploadTask>>(new Map());
   const closedTransferIdsRef = useRef<Set<string>>(new Set());
-  const reconnectTimerRef = useRef<number | null>(null);
-  const connectTimeoutTimerRef = useRef<number | null>(null);
-  const heartbeatTimerRef = useRef<number | null>(null);
-  const watchdogTimerRef = useRef<number | null>(null);
-  const resumeProbeTimerRef = useRef<number | null>(null);
-  const lastSignalActivityRef = useRef(0);
-  const connectStartedAtRef = useRef<number | null>(null);
-  const connectionEpochRef = useRef(0);
-  const reconnectAttemptRef = useRef(0);
-  const hasConnectedOnceRef = useRef(false);
   const noticeResetTimerRef = useRef<number | null>(null);
   const activeTransferNoticeRef = useRef<string | null>(null);
+  const relayUploadsRef = useRef<RelayUploadControls | null>(null);
 
   const selfId = session?.clientId;
   const roomLink = activeRoom ? getRoomShareLink(activeRoom) : '';
@@ -1153,19 +284,6 @@ export default function App() {
     return [...ids];
   }, [directStates, peers, selfId, sortedMessages]);
 
-  const livePeerCount = useMemo(() => {
-    const ids = new Set<string>();
-    if (socketStatus === 'connected') {
-      peers.forEach((peer) => ids.add(peer.clientId));
-    }
-    Object.entries(directStates).forEach(([peerId, state]) => {
-      if (state === 'connected') {
-        ids.add(peerId);
-      }
-    });
-    return ids.size;
-  }, [directStates, peers, socketStatus]);
-
   function getPeerDisplayName(peerId: string, fallback?: string): string {
     if (peerId === selfId) {
       return nickname || session?.nickname || fallback || peerId;
@@ -1202,6 +320,72 @@ export default function App() {
     [knownPeerIds, peers, threadMessages],
   );
 
+  const { meshRef, sendServerMessage, socketStatus } = useRoomConnection({
+    activeRoom,
+    roomConnectionNonce,
+    session,
+    nickname,
+    onNetworkOffline: () => {
+      relayUploadsRef.current?.pauseAllRelayUploads({
+        reason: 'offline',
+        notice: '网络已断开，未完成的服务端中继上传已暂停。',
+      });
+    },
+    onNetworkOnline: () => {
+      void relayUploadsRef.current?.flushPendingRelayAborts();
+      relayUploadsRef.current?.resumeOfflinePausedRelayUploads();
+    },
+    onRoomDispose: (transport) => {
+      relayUploadsRef.current?.abortAllRelayUploads({
+        reason: 'cancelled locally',
+        transport,
+        updateUi: false,
+      });
+    },
+    onIncomingFile: handleIncomingFile,
+    onPeerPathChange: applyPeerPath,
+    onPeerStateChange: applyPeerState,
+    onRoomConnected: (roomId) => {
+      setNotice(getDefaultNotice(roomId));
+      relayUploadsRef.current?.flushPendingRelayAnnounces({ roomId });
+    },
+    onRoomReset: () => {
+      resetRoomLocalState();
+    },
+    onServerEvent: handleServerEvent,
+    onTransferUpdate: updateTransfer,
+    prepareIncomingFileTarget,
+    setNotice,
+  });
+
+  const relayUploads = useRelayUploads({
+    activeRoom,
+    activeRoomRef,
+    closedTransferIdsRef,
+    getPeerDisplayName,
+    messagesRef,
+    removePendingFile,
+    sendServerMessage,
+    setTransfers,
+    showTransientNotice,
+    transfersRef,
+    updateTransfer,
+  });
+  relayUploadsRef.current = relayUploads;
+
+  const livePeerCount = useMemo(() => {
+    const ids = new Set<string>();
+    if (socketStatus === 'connected') {
+      peers.forEach((peer) => ids.add(peer.clientId));
+    }
+    Object.entries(directStates).forEach(([peerId, state]) => {
+      if (state === 'connected') {
+        ids.add(peerId);
+      }
+    });
+    return ids.size;
+  }, [directStates, peers, socketStatus]);
+
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
@@ -1211,16 +395,20 @@ export default function App() {
   }, [transfers]);
 
   useEffect(() => {
+    unreadCountsRef.current = unreadCounts;
+  }, [unreadCounts]);
+
+  useEffect(() => {
+    directPathsRef.current = directPaths;
+  }, [directPaths]);
+
+  useEffect(() => {
     activeRoomRef.current = activeRoom;
   }, [activeRoom]);
 
   useEffect(() => {
     activeThreadRef.current = activeThread;
   }, [activeThread]);
-
-  useEffect(() => {
-    socketStatusRef.current = socketStatus;
-  }, [socketStatus]);
 
   useEffect(() => {
     receiveDirectoryRef.current = receiveDirectory;
@@ -1291,24 +479,11 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    return () => {
-      relayUploadTasksRef.current.forEach((task) => {
-        abortRelayTask(task, {
-          reason: 'cancelled locally',
-          transport: 'beacon',
-          updateUi: false,
-        });
-      });
-      relayUploadTasksRef.current.clear();
-    };
-  }, []);
-
-  useEffect(() => {
     if (!session) {
       return;
     }
 
-    void flushPendingRelayAborts();
+    void relayUploads.flushPendingRelayAborts();
   }, [session]);
 
   useEffect(() => {
@@ -1316,8 +491,8 @@ export default function App() {
       return;
     }
 
-    flushPendingRelayAnnounces();
-  }, [activeRoom, session, socketStatus]);
+    relayUploads.flushPendingRelayAnnounces();
+  }, [activeRoom, relayUploads, session, socketStatus]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1371,469 +546,15 @@ export default function App() {
         window.clearTimeout(shareFeedbackTimerRef.current);
         shareFeedbackTimerRef.current = null;
       }
-      if (reconnectTimerRef.current) {
-        window.clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = null;
-      }
-      if (connectTimeoutTimerRef.current) {
-        window.clearTimeout(connectTimeoutTimerRef.current);
-        connectTimeoutTimerRef.current = null;
-      }
-      if (heartbeatTimerRef.current) {
-        window.clearInterval(heartbeatTimerRef.current);
-        heartbeatTimerRef.current = null;
-      }
-      if (watchdogTimerRef.current) {
-        window.clearInterval(watchdogTimerRef.current);
-        watchdogTimerRef.current = null;
-      }
-      if (resumeProbeTimerRef.current) {
-        window.clearInterval(resumeProbeTimerRef.current);
-        resumeProbeTimerRef.current = null;
-      }
       if (noticeResetTimerRef.current) {
         window.clearTimeout(noticeResetTimerRef.current);
         noticeResetTimerRef.current = null;
       }
-      connectStartedAtRef.current = null;
-      meshRef.current?.close();
       for (const url of objectUrlsRef.current) {
         URL.revokeObjectURL(url);
       }
     };
   }, []);
-
-  useEffect(() => {
-    if (!activeRoom || !session) {
-      return;
-    }
-
-    const mesh = new PeerMesh({
-      localClientId: session.clientId,
-      iceServers: session.iceServers,
-      directFileSoftLimitBytes: session.directFileSoftLimitBytes,
-      prepareIncomingFileTarget,
-      sendSignal: (targetId, payload) => {
-        sendServerMessage({
-          type: 'signal',
-          targetId,
-          payload,
-        });
-      },
-      onPeerStateChange: applyPeerState,
-      onIncomingFile: handleIncomingFile,
-      onPeerPathChange: applyPeerPath,
-      onTransferUpdate: updateTransfer,
-    });
-
-    meshRef.current = mesh;
-    peerNamesRef.current = {};
-    setSocketStatus('connecting');
-    setMessages([]);
-    messagesRef.current = [];
-    setPeers([]);
-    setTransfers({});
-    closedTransferIdsRef.current.clear();
-    setDirectStates({});
-    setDirectPaths({});
-    setUnreadCounts({});
-    setActiveThread(GLOBAL_THREAD);
-    reconnectAttemptRef.current = 0;
-    hasConnectedOnceRef.current = false;
-    clearReconnectTimer();
-
-    let disposed = false;
-    let intentionallyClosed = false;
-
-    const setSignalStatus = (next: SocketStatus) => {
-      socketStatusRef.current = next;
-      setSocketStatus(next);
-    };
-
-    const stopHeartbeatLoop = () => {
-      if (heartbeatTimerRef.current) {
-        window.clearInterval(heartbeatTimerRef.current);
-        heartbeatTimerRef.current = null;
-      }
-      if (watchdogTimerRef.current) {
-        window.clearInterval(watchdogTimerRef.current);
-        watchdogTimerRef.current = null;
-      }
-    };
-
-    const clearConnectTimeout = () => {
-      if (connectTimeoutTimerRef.current) {
-        window.clearTimeout(connectTimeoutTimerRef.current);
-        connectTimeoutTimerRef.current = null;
-      }
-      connectStartedAtRef.current = null;
-    };
-
-    const retireSocket = (socket: WebSocket | null, closeCode = 4000, closeReason = 'replace socket') => {
-      if (!socket) {
-        return;
-      }
-
-      if (wsRef.current === socket) {
-        wsRef.current = null;
-        clearConnectTimeout();
-      }
-
-      socket.onopen = null;
-      socket.onmessage = null;
-      socket.onerror = null;
-      socket.onclose = null;
-
-      if (
-        socket.readyState === WebSocket.OPEN ||
-        socket.readyState === WebSocket.CONNECTING
-      ) {
-        socket.close(closeCode, closeReason);
-      }
-    };
-
-    const canAttemptConnection = () => {
-      if (disposed || intentionallyClosed) {
-        return false;
-      }
-
-      if (document.visibilityState !== 'visible') {
-        setSignalStatus('paused');
-        return false;
-      }
-
-      if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        setSignalStatus('paused');
-        return false;
-      }
-
-      return true;
-    };
-
-    const isSocketConnectingTooLong = (socket: WebSocket | null): boolean => {
-      if (!socket || socket.readyState !== WebSocket.CONNECTING || connectStartedAtRef.current === null) {
-        return false;
-      }
-
-      return Date.now() - connectStartedAtRef.current >= WS_CONNECT_TIMEOUT_MS;
-    };
-
-    const armConnectTimeout = (epoch: number, socket: WebSocket) => {
-      clearConnectTimeout();
-      connectStartedAtRef.current = Date.now();
-      connectTimeoutTimerRef.current = window.setTimeout(() => {
-        if (disposed || intentionallyClosed || wsRef.current !== socket || connectionEpochRef.current !== epoch) {
-          return;
-        }
-
-        retireSocket(socket, 4010, 'connect timeout');
-        scheduleReconnect();
-      }, WS_CONNECT_TIMEOUT_MS);
-    };
-
-    const startHeartbeatLoop = (epoch: number, socket: WebSocket) => {
-      stopHeartbeatLoop();
-      lastSignalActivityRef.current = Date.now();
-
-      heartbeatTimerRef.current = window.setInterval(() => {
-        if (disposed || wsRef.current !== socket || connectionEpochRef.current !== epoch) {
-          stopHeartbeatLoop();
-          return;
-        }
-
-        if (socket.readyState !== WebSocket.OPEN) {
-          return;
-        }
-
-        socket.send(JSON.stringify({ type: 'ping' } satisfies ClientToServerMessage));
-      }, WS_HEARTBEAT_INTERVAL_MS);
-
-      watchdogTimerRef.current = window.setInterval(() => {
-        if (disposed || wsRef.current !== socket || connectionEpochRef.current !== epoch) {
-          stopHeartbeatLoop();
-          return;
-        }
-
-        if (socket.readyState !== WebSocket.OPEN) {
-          return;
-        }
-
-        if (Date.now() - lastSignalActivityRef.current <= WS_HEARTBEAT_STALE_AFTER_MS) {
-          return;
-        }
-
-        retireSocket(socket, 4004, 'heartbeat timeout');
-        scheduleReconnect();
-      }, WS_WATCHDOG_INTERVAL_MS);
-    };
-
-    const scheduleReconnect = () => {
-      if (disposed || intentionallyClosed) {
-        return;
-      }
-
-      clearReconnectTimer();
-      stopHeartbeatLoop();
-
-      if (!canAttemptConnection()) {
-        return;
-      }
-
-      const attempt = reconnectAttemptRef.current + 1;
-      reconnectAttemptRef.current = attempt;
-      setSignalStatus('reconnecting');
-
-      const delay = Math.min(WS_RECONNECT_MAX_DELAY_MS, WS_RECONNECT_BASE_DELAY_MS * 2 ** (attempt - 1));
-      reconnectTimerRef.current = window.setTimeout(() => {
-        reconnectTimerRef.current = null;
-        connectWebSocket();
-      }, delay);
-    };
-
-    const connectWebSocket = (forceFresh = false) => {
-      if (!canAttemptConnection()) {
-        return;
-      }
-
-      const existing = wsRef.current;
-      if (
-        !forceFresh &&
-        existing &&
-        (existing.readyState === WebSocket.OPEN ||
-          (existing.readyState === WebSocket.CONNECTING && !isSocketConnectingTooLong(existing)))
-      ) {
-        return;
-      }
-
-      if (forceFresh && existing) {
-        retireSocket(existing, 4005, 'refresh socket');
-      }
-
-      clearReconnectTimer();
-      stopHeartbeatLoop();
-
-      const epoch = connectionEpochRef.current + 1;
-      connectionEpochRef.current = epoch;
-
-      const ws = new WebSocket(buildRoomWebSocketUrl(activeRoom, nickname || session.nickname));
-      wsRef.current = ws;
-      setSignalStatus(hasConnectedOnceRef.current || reconnectAttemptRef.current > 0 ? 'reconnecting' : 'connecting');
-      armConnectTimeout(epoch, ws);
-
-      ws.onopen = () => {
-        if (disposed || wsRef.current !== ws || connectionEpochRef.current !== epoch) {
-          retireSocket(ws, 1000, 'stale socket');
-          return;
-        }
-
-        clearConnectTimeout();
-        reconnectAttemptRef.current = 0;
-        hasConnectedOnceRef.current = true;
-        setSignalStatus('connected');
-        lastSignalActivityRef.current = Date.now();
-        startHeartbeatLoop(epoch, ws);
-
-        sendServerMessage({
-          type: 'set-profile',
-          nickname: nickname || session.nickname,
-        });
-
-        setNotice(getDefaultNotice(activeRoom));
-        flushPendingRelayAnnounces({ roomId: activeRoom });
-      };
-
-      ws.onmessage = (messageEvent) => {
-        if (wsRef.current !== ws || connectionEpochRef.current !== epoch) {
-          return;
-        }
-
-        const payload = JSON.parse(messageEvent.data as string) as ServerToClientMessage;
-        lastSignalActivityRef.current = Date.now();
-
-        if (payload.type === 'pong') {
-          return;
-        }
-
-        handleServerEvent(payload);
-      };
-
-      ws.onerror = () => {
-        if (disposed || wsRef.current !== ws || connectionEpochRef.current !== epoch) {
-          return;
-        }
-
-        if (socketStatusRef.current !== 'connected') {
-          setSignalStatus('reconnecting');
-        }
-      };
-
-      ws.onclose = (event) => {
-        if (wsRef.current === ws) {
-          wsRef.current = null;
-        }
-        clearConnectTimeout();
-        stopHeartbeatLoop();
-
-        if (disposed || intentionallyClosed) {
-          return;
-        }
-
-        if (event.code === 4401) {
-          setSignalStatus('closed');
-          setNotice('会话已失效，请刷新页面重试。');
-          return;
-        }
-
-        if (event.code === 4409) {
-          setSignalStatus('closed');
-          setNotice('当前页面的信令连接已被新的连接替换。');
-          return;
-        }
-
-        scheduleReconnect();
-      };
-    };
-
-    const suspendConnection = (reason: 'hidden' | 'offline') => {
-      clearReconnectTimer();
-      clearConnectTimeout();
-      stopHeartbeatLoop();
-      retireSocket(wsRef.current, reason === 'offline' ? 4001 : 4006, `suspend:${reason}`);
-      setSignalStatus('paused');
-    };
-
-    const handleWake = () => {
-      if (document.visibilityState !== 'visible') {
-        return;
-      }
-
-      reconnectAttemptRef.current = 0;
-      if (socketStatusRef.current === 'connected' && wsRef.current?.readyState === WebSocket.OPEN) {
-        lastSignalActivityRef.current = Date.now();
-        sendServerMessage({ type: 'ping' });
-        return;
-      }
-
-      connectWebSocket(Boolean(wsRef.current));
-    };
-
-    const handleOnline = () => {
-      void flushPendingRelayAborts();
-      resumeOfflinePausedRelayUploads();
-      if (document.visibilityState !== 'visible') {
-        return;
-      }
-
-      reconnectAttemptRef.current = 0;
-      connectWebSocket(Boolean(wsRef.current));
-    };
-
-    const handleOffline = () => {
-      pauseAllRelayUploads({
-        reason: 'offline',
-        notice: '网络已断开，未完成的服务端中继上传已暂停。',
-      });
-      suspendConnection('offline');
-    };
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        handleWake();
-        return;
-      }
-
-      clearReconnectTimer();
-      if (socketStatusRef.current !== 'connected') {
-        setSignalStatus('paused');
-      }
-    };
-
-    const closeSocket = () => {
-      intentionallyClosed = true;
-      abortAllRelayUploads({
-        reason: 'cancelled locally',
-        transport: 'beacon',
-        updateUi: false,
-      });
-      clearReconnectTimer();
-      stopHeartbeatLoop();
-      retireSocket(wsRef.current, 1000, 'page unload');
-    };
-
-    window.addEventListener('pagehide', closeSocket);
-    window.addEventListener('beforeunload', closeSocket);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-    window.addEventListener('focus', handleWake);
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    resumeProbeTimerRef.current = window.setInterval(() => {
-      if (disposed || intentionallyClosed) {
-        return;
-      }
-
-      if (document.visibilityState !== 'visible') {
-        return;
-      }
-
-      if (typeof navigator !== 'undefined' && !navigator.onLine) {
-        return;
-      }
-
-      const socket = wsRef.current;
-      if (socket?.readyState === WebSocket.OPEN || socketStatusRef.current === 'connected') {
-        return;
-      }
-
-      if (socket?.readyState === WebSocket.CONNECTING && !isSocketConnectingTooLong(socket)) {
-        return;
-      }
-
-      if (reconnectTimerRef.current) {
-        return;
-      }
-
-      connectWebSocket(Boolean(socket));
-    }, WS_RESUME_PROBE_INTERVAL_MS);
-    connectWebSocket();
-
-    return () => {
-      disposed = true;
-      intentionallyClosed = true;
-      window.removeEventListener('pagehide', closeSocket);
-      window.removeEventListener('beforeunload', closeSocket);
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-      window.removeEventListener('focus', handleWake);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-      clearReconnectTimer();
-      clearConnectTimeout();
-      stopHeartbeatLoop();
-      if (resumeProbeTimerRef.current) {
-        window.clearInterval(resumeProbeTimerRef.current);
-        resumeProbeTimerRef.current = null;
-      }
-      retireSocket(wsRef.current, 1000, 'room cleanup');
-      wsRef.current = null;
-      abortAllRelayUploads({
-        reason: 'cancelled locally',
-        transport: 'fetch',
-        updateUi: false,
-      });
-      mesh.close();
-      meshRef.current = null;
-    };
-  }, [activeRoom, roomConnectionNonce, session]);
-
-  useEffect(() => {
-    if (!session || socketStatus !== 'connected') {
-      return;
-    }
-
-    sendServerMessage({
-      type: 'set-profile',
-      nickname: nickname || session.nickname,
-    });
-  }, [nickname, session, socketStatus]);
 
   useEffect(() => {
     if (!activeRoom || socketStatus !== 'connected') {
@@ -1849,54 +570,35 @@ export default function App() {
     });
   }, [activeRoom, socketStatus]);
 
-  function sendServerMessage(payload: ClientToServerMessage): boolean {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      return false;
-    }
-    wsRef.current.send(JSON.stringify(payload));
-    return true;
-  }
-
   function addMessage(message: UiMessage, trackUnread = true): void {
-    if (messagesRef.current.some((item) => item.id === message.id)) {
+    const result = appendMessageState({
+      messages: messagesRef.current,
+      message,
+      selfId,
+      activeThread: activeThreadRef.current,
+      unreadCounts: unreadCountsRef.current,
+      trackUnread,
+    });
+
+    if (!result.inserted) {
       return;
     }
 
-    const next = [...messagesRef.current, message];
-    messagesRef.current = next;
-    setMessages(next);
-
-    if (!trackUnread || message.fromId === selfId) {
-      return;
-    }
-
-    const key = getMessageThreadKey(message, selfId);
-    if (key !== activeThreadRef.current) {
-      setUnreadCounts((current) => ({
-        ...current,
-        [key]: (current[key] ?? 0) + 1,
-      }));
+    messagesRef.current = result.messages;
+    setMessages(result.messages);
+    if (result.unreadCounts !== unreadCountsRef.current) {
+      replaceUnreadCounts(result.unreadCounts);
     }
   }
 
   function getDefaultNotice(roomId: string | null = activeRoom): string {
-    if (!roomId) {
-      return DEFAULT_NOTICE;
-    }
-    return `已进入房间 ${roomId}。全局聊天发给整个房间，切到设备会话后就是和该设备的私聊。`;
+    return buildDefaultNotice(roomId);
   }
 
   function clearNoticeResetTimer(): void {
     if (noticeResetTimerRef.current) {
       window.clearTimeout(noticeResetTimerRef.current);
       noticeResetTimerRef.current = null;
-    }
-  }
-
-  function clearReconnectTimer(): void {
-    if (reconnectTimerRef.current) {
-      window.clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
     }
   }
 
@@ -1926,161 +628,74 @@ export default function App() {
   }
 
   function updateTransfer(update: TransferUpdate): void {
-    if (update.status === 'pending') {
-      closedTransferIdsRef.current.delete(update.transferId);
-    } else if (
-      closedTransferIdsRef.current.has(update.transferId) &&
-      update.status !== 'complete' &&
-      update.status !== 'cancelled'
-    ) {
-      return;
-    }
-
-    if (update.direction === 'upload' && update.transport === 'direct-p2p') {
-      if (update.status === 'complete' && activeTransferNoticeRef.current === update.transferId) {
-        activeTransferNoticeRef.current = null;
-        showTransientNotice(`${update.fileName} 已直连发送给 ${getPeerDisplayName(update.peerId, update.peerName)}。`);
-      } else if (
-        (update.status === 'failed' || update.status === 'declined') &&
-        activeTransferNoticeRef.current === update.transferId
-      ) {
-        activeTransferNoticeRef.current = null;
-        showTransientNotice(
-          update.status === 'declined'
-            ? `${update.fileName} 对方未接受直连，请切到中继后重发。`
-            : `${update.fileName} 直连发送失败，请重试或切到中继。`,
-          3200,
-        );
-      }
-    }
-
-    if (update.status === 'cancelled') {
-      if (activeTransferNoticeRef.current === update.transferId) {
-        activeTransferNoticeRef.current = null;
-      }
-      showTransientNotice(
-        update.note === 'cancelled by remote'
-          ? `${update.fileName} 已被对方取消。`
-          : `${update.fileName} 已取消${update.direction === 'upload' ? '发送' : '接收'}。`,
-      );
-    }
-
-    if (update.status === 'complete' || update.status === 'cancelled') {
-      closedTransferIdsRef.current.add(update.transferId);
-      setTransfers((current) => {
-        if (!(update.transferId in current)) {
-          return current;
-        }
-        const next = { ...current };
-        delete next[update.transferId];
-        return next;
-      });
-      return;
-    }
-
-    setTransfers((current) => {
-      const existing = current[update.transferId];
-      const now = Date.now();
-      let speedBytesPerSecond = existing?.speedBytesPerSecond;
-      let lastProgressAt = existing?.lastProgressAt ?? now;
-      let lastProgressBytes = existing?.lastProgressBytes ?? update.transferredBytes;
-
-      if (update.status === 'streaming') {
-        const baseBytes = existing?.lastProgressBytes ?? update.transferredBytes;
-        const baseAt = existing?.lastProgressAt ?? now;
-        const deltaBytes = Math.max(0, update.transferredBytes - baseBytes);
-        const deltaMs = now - baseAt;
-
-        if (deltaBytes > 0 && deltaMs >= 250) {
-          const instantSpeed = deltaBytes / (deltaMs / 1000);
-          speedBytesPerSecond =
-            typeof existing?.speedBytesPerSecond === 'number'
-              ? existing.speedBytesPerSecond * 0.45 + instantSpeed * 0.55
-              : instantSpeed;
-          lastProgressAt = now;
-          lastProgressBytes = update.transferredBytes;
-        } else if (!existing) {
-          lastProgressAt = now;
-          lastProgressBytes = update.transferredBytes;
-        }
-
-        if (update.note === 'waiting for receiver confirmation') {
-          speedBytesPerSecond = undefined;
-        }
-      } else if (update.status !== 'pending') {
-        speedBytesPerSecond = undefined;
-      }
-
-      return {
-        ...current,
-        [update.transferId]: {
-          ...update,
-          id: update.transferId,
-          startedAt: existing?.startedAt ?? now,
-          speedBytesPerSecond,
-          lastProgressAt,
-          lastProgressBytes,
-        },
-      };
+    const result = reduceTransferUpdate({
+      activeTransferNoticeId: activeTransferNoticeRef.current,
+      closedTransferIds: closedTransferIdsRef.current,
+      currentTransfers: transfersRef.current,
+      getPeerDisplayName,
+      update,
     });
-  }
 
-  function markRelayTransferSynced(fileId: string): void {
-    const existing = transfersRef.current[fileId];
-    if (!existing || existing.transport !== 'server-relay' || existing.direction !== 'upload') {
-      return;
+    closedTransferIdsRef.current = result.closedTransferIds;
+    if (result.resetActiveTransferNotice) {
+      activeTransferNoticeRef.current = null;
     }
-
-    updateTransfer({
-      transferId: existing.id,
-      peerId: existing.peerId,
-      peerName: existing.peerName,
-      fileName: existing.fileName,
-      totalBytes: existing.totalBytes,
-      transferredBytes: existing.totalBytes,
-      direction: 'upload',
-      transport: 'server-relay',
-      status: 'complete',
-      note: '已同步到聊天记录',
-    });
+    if (result.noticeMessage) {
+      showTransientNotice(result.noticeMessage, result.noticeDurationMs);
+    }
+    if (result.nextTransfers) {
+      replaceTransfers(result.nextTransfers);
+    }
   }
 
   function applyPeerState(peerId: string, nextState: DirectPeerState): void {
-    setDirectStates((current) => ({
-      ...current,
-      [peerId]: nextState,
-    }));
-
-    if (nextState !== 'connected') {
-      setDirectPaths((current) => {
-        if (!(peerId in current)) {
-          return current;
-        }
-
-        const next = { ...current };
-        delete next[peerId];
-        return next;
+    setDirectStates((currentStates) => {
+      const result = applyPeerStateUpdate({
+        directPaths: directPathsRef.current,
+        directStates: currentStates,
+        nextState,
+        peerId,
       });
-    }
+      if (result.directPaths !== directPathsRef.current) {
+        directPathsRef.current = result.directPaths;
+        setDirectPaths(result.directPaths);
+      }
+      return result.directStates;
+    });
   }
 
   function applyPeerPath(peerId: string, path: DirectPathInfo | null): void {
     setDirectPaths((current) => {
-      if (!path) {
-        if (!(peerId in current)) {
-          return current;
-        }
-
-        const next = { ...current };
-        delete next[peerId];
-        return next;
-      }
-
-      return {
-        ...current,
-        [peerId]: path,
-      };
+      const next = applyPeerPathUpdate({ directPaths: current, path, peerId });
+      directPathsRef.current = next;
+      return next;
     });
+  }
+
+  function replaceUnreadCounts(next: Record<string, number>): void {
+    unreadCountsRef.current = next;
+    setUnreadCounts(next);
+  }
+
+  function replaceTransfers(next: Record<string, TransferRow>): void {
+    transfersRef.current = next;
+    setTransfers(next);
+  }
+
+  function resetRoomLocalState(): void {
+    peerNamesRef.current = {};
+    messagesRef.current = [];
+    transfersRef.current = {};
+    directPathsRef.current = {};
+    unreadCountsRef.current = {};
+    closedTransferIdsRef.current.clear();
+    setMessages([]);
+    setPeers([]);
+    setTransfers({});
+    setDirectStates({});
+    setDirectPaths({});
+    setUnreadCounts({});
+    setActiveThread(GLOBAL_THREAD);
   }
 
   async function prepareIncomingFileTarget(payload: {
@@ -2221,86 +836,64 @@ export default function App() {
   }
 
   function handleServerEvent(event: ServerToClientMessage): void {
-    switch (event.type) {
-      case 'room-snapshot': {
-        const peerNames = Object.fromEntries(event.peers.map((peer) => [peer.clientId, peer.nickname]));
-        for (const message of event.messages) {
-          peerNames[message.fromId] = message.fromName;
-          if (message.targetId) {
-            peerNames[message.targetId] = peerNames[message.targetId] ?? message.targetId;
-          }
-          if (message.file?.fileId) {
-            forgetRelayAnnounce(message.file.fileId);
-            markRelayTransferSynced(message.file.fileId);
-          }
-        }
+    handleServerEventMessage(event, {
+      activeRoom,
+      selfId,
+      acknowledgeRelayMessage: relayUploads.acknowledgeRelayMessage,
+      addMessage,
+      addSystemMessage,
+      applyPeerState,
+      clearThreadLocally,
+      flushRelayAnnounces: (roomId) => {
+        relayUploads.flushPendingRelayAnnounces({ roomId });
+      },
+      formatThreadClearRemoteNotice,
+      getPeerDisplayName,
+      getThreadKeyForClearedEvent,
+      handleSignal: (fromId, payload, peerName) => {
+        void meshRef.current?.handleSignal(fromId, payload, peerName);
+      },
+      replaceMessages: (nextMessages) => {
+        messagesRef.current = nextMessages;
+        setMessages(nextMessages);
+        replaceUnreadCounts({});
+      },
+      replacePeers: (nextPeers) => {
+        setPeers(nextPeers);
+        nextPeers.forEach((peer) => meshRef.current?.ensurePeer(peer));
+      },
+      replacePeerNames: (peerNames) => {
         peerNamesRef.current = peerNames;
-        messagesRef.current = event.messages;
-        setPeers(event.peers);
-        setMessages(event.messages);
-        setUnreadCounts({});
-        event.peers.forEach((peer) => meshRef.current?.ensurePeer(peer));
-        setNotice((current) =>
-          /^正在进入房间\s+.+/.test(current)
-            ? `已进入房间 ${activeRoom ?? event.roomId}。全局聊天发给整个房间，切到设备会话后就是和该设备的私聊。`
-            : current,
-        );
-        flushPendingRelayAnnounces({ roomId: event.roomId });
-        break;
-      }
-      case 'peer-joined': {
-        const existed = peerNamesRef.current[event.peer.clientId];
-        peerNamesRef.current[event.peer.clientId] = event.peer.nickname;
-        setPeers((current) => {
-          const next = current.filter((peer) => peer.clientId !== event.peer.clientId);
-          next.push(event.peer);
-          return next.sort((left, right) => left.joinedAt - right.joinedAt);
+      },
+      reconcileSnapshotPeers: (nextPeers) => {
+        setDirectStates((currentStates) => {
+          const result = reconcileSnapshotPeerState({
+            directPaths: directPathsRef.current,
+            directStates: currentStates,
+            peers: nextPeers,
+          });
+          if (result.directPaths !== directPathsRef.current) {
+            directPathsRef.current = result.directPaths;
+            setDirectPaths(result.directPaths);
+          }
+          return result.directStates;
         });
-        meshRef.current?.ensurePeer(event.peer);
-        if (!existed) {
-          addSystemMessage(`${event.peer.nickname} 进入了房间。`);
-        }
-        break;
-      }
-      case 'peer-left': {
-        const peerName = getPeerDisplayName(event.clientId, peerNamesRef.current[event.clientId]);
-        delete peerNamesRef.current[event.clientId];
-        setPeers((current) => current.filter((peer) => peer.clientId !== event.clientId));
-        meshRef.current?.removePeer(event.clientId);
-        applyPeerState(event.clientId, 'offline');
-        addSystemMessage(`${peerName} 离开了房间。`);
-        break;
-      }
-      case 'chat-event':
-        if (event.message.file?.fileId) {
-          forgetRelayAnnounce(event.message.file.fileId);
-          markRelayTransferSynced(event.message.file.fileId);
-        }
-        addMessage(event.message);
-        break;
-      case 'thread-cleared': {
-        const clearedThread = getThreadKeyForClearedEvent(event.targetId, event.actorId, selfId);
-        clearThreadLocally(clearedThread);
-        if (event.actorId === selfId) {
-          setIsClearDialogOpen(false);
-        } else {
-          setNotice(formatThreadClearRemoteNotice(event.targetId, getPeerDisplayName(event.actorId, event.actorName)));
-        }
-        break;
-      }
-      case 'signal':
-        void meshRef.current?.handleSignal(
-          event.fromId,
-          event.payload,
-          peerNamesRef.current[event.fromId],
-        );
-        break;
-      case 'error':
-        setNotice(event.message);
-        break;
-      default:
-        break;
-    }
+      },
+      setClearDialogOpen: setIsClearDialogOpen,
+      setNotice,
+      upsertPeer: (peer) => {
+        const existed = peerNamesRef.current[peer.clientId];
+        peerNamesRef.current[peer.clientId] = peer.nickname;
+        setPeers((current) => upsertPeerList(current, peer));
+        meshRef.current?.ensurePeer(peer);
+        return Boolean(existed);
+      },
+      removePeer: (peerId) => {
+        delete peerNamesRef.current[peerId];
+        setPeers((current) => removePeerFromList(current, peerId));
+        meshRef.current?.removePeer(peerId);
+      },
+    });
   }
 
   function createPendingAttachment(file: File): PendingAttachment {
@@ -2336,11 +929,8 @@ export default function App() {
   function switchToThread(threadKey: string): void {
     setActiveThread(threadKey);
     setUnreadCounts((current) => {
-      if (!(threadKey in current)) {
-        return current;
-      }
-      const next = { ...current };
-      delete next[threadKey];
+      const next = clearThreadUnreadCount(current, threadKey);
+      unreadCountsRef.current = next;
       return next;
     });
     setIsSidebarOpen(false);
@@ -2358,523 +948,10 @@ export default function App() {
     setRecentRooms((current) => rememberRoom(normalized, current));
     setShowRoomPicker(false);
     setActiveThread(GLOBAL_THREAD);
-    setUnreadCounts({});
+    replaceUnreadCounts({});
     setActiveRoom(normalized);
     setRoomConnectionNonce((current) => current + 1);
     setNotice(`正在进入房间 ${normalized}...`);
-  }
-
-  function setRelayAbortQueue(next: PendingRelayAbortTicket[]): void {
-    relayAbortQueueRef.current = next;
-    storePendingRelayAbortTickets(next);
-  }
-
-  function setRelayAnnounceQueue(next: PendingRelayAnnounceTicket[]): void {
-    relayAnnounceQueueRef.current = next;
-    storePendingRelayAnnounceTickets(next);
-  }
-
-  function rememberRelayAbort(uploadToken: string): void {
-    if (relayAbortQueueRef.current.some((ticket) => ticket.uploadToken === uploadToken)) {
-      return;
-    }
-
-    setRelayAbortQueue([
-      ...relayAbortQueueRef.current,
-      {
-        uploadToken,
-        createdAt: Date.now(),
-      },
-    ]);
-  }
-
-  function forgetRelayAbort(uploadToken: string): void {
-    if (!relayAbortQueueRef.current.some((ticket) => ticket.uploadToken === uploadToken)) {
-      return;
-    }
-
-    setRelayAbortQueue(relayAbortQueueRef.current.filter((ticket) => ticket.uploadToken !== uploadToken));
-  }
-
-  function rememberRelayAnnounce(ticket: PendingRelayAnnounceTicket): void {
-    const existingIndex = relayAnnounceQueueRef.current.findIndex((item) => item.fileId === ticket.fileId);
-    if (existingIndex === -1) {
-      setRelayAnnounceQueue([...relayAnnounceQueueRef.current, ticket]);
-      return;
-    }
-
-    const next = [...relayAnnounceQueueRef.current];
-    next[existingIndex] = ticket;
-    setRelayAnnounceQueue(next);
-  }
-
-  function forgetRelayAnnounce(fileId: string): void {
-    if (!relayAnnounceQueueRef.current.some((ticket) => ticket.fileId === fileId)) {
-      return;
-    }
-
-    setRelayAnnounceQueue(relayAnnounceQueueRef.current.filter((ticket) => ticket.fileId !== fileId));
-  }
-
-  function hasMessageForRelayFile(fileId: string): boolean {
-    return messagesRef.current.some((message) => message.file?.fileId === fileId);
-  }
-
-  function tryAnnounceRelayFile(ticket: PendingRelayAnnounceTicket): boolean {
-    if (activeRoomRef.current !== ticket.roomId) {
-      return false;
-    }
-
-    const announced = sendServerMessage({
-      type: 'relay-file-announced',
-      file: {
-        fileId: ticket.fileId,
-        fileName: ticket.fileName,
-        size: ticket.size,
-        contentType: ticket.contentType,
-        objectKey: ticket.objectKey,
-        targetId: ticket.targetId,
-      },
-    });
-
-    if (announced) {
-      updateTransfer({
-        transferId: ticket.fileId,
-        peerId: transfersRef.current[ticket.fileId]?.peerId ?? (ticket.targetId ?? GLOBAL_THREAD),
-        peerName:
-          transfersRef.current[ticket.fileId]?.peerName ??
-          (ticket.targetId ? getPeerDisplayName(ticket.targetId) : '整个房间'),
-        fileName: ticket.fileName,
-        totalBytes: ticket.size,
-        transferredBytes: ticket.size,
-        direction: 'upload',
-        transport: 'server-relay',
-        status: 'streaming',
-        note: '等待写入聊天记录',
-      });
-    }
-
-    return announced;
-  }
-
-  function flushPendingRelayAnnounces(options?: { roomId?: string }): void {
-    const roomId = options?.roomId ?? activeRoomRef.current;
-    if (!roomId) {
-      return;
-    }
-
-    const pendingForRoom = relayAnnounceQueueRef.current.filter((ticket) => ticket.roomId === roomId);
-    if (pendingForRoom.length === 0) {
-      return;
-    }
-
-    for (const ticket of pendingForRoom) {
-      if (hasMessageForRelayFile(ticket.fileId)) {
-        forgetRelayAnnounce(ticket.fileId);
-        markRelayTransferSynced(ticket.fileId);
-        continue;
-      }
-
-      if (!tryAnnounceRelayFile(ticket)) {
-        break;
-      }
-    }
-  }
-
-  async function postRelayAbort(uploadToken: string, keepalive = false): Promise<boolean> {
-    try {
-      const response = await fetch('/api/files/abort', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          uploadToken,
-        } satisfies RelayAbortUploadRequest),
-        keepalive,
-      });
-
-      if (response.ok || response.status === 409) {
-        forgetRelayAbort(uploadToken);
-        return true;
-      }
-    } catch {
-      // Leave the token in the retry queue.
-    }
-
-    return false;
-  }
-
-  async function postRelayDiscard(uploadToken: string, keepalive = false): Promise<boolean> {
-    try {
-      const response = await fetch('/api/files/discard', {
-        method: 'POST',
-        keepalive,
-        headers: {
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          uploadToken,
-        } satisfies RelayDiscardUploadRequest),
-      });
-      return response.ok;
-    } catch {
-      return false;
-    }
-  }
-
-  function dispatchRelayAbort(uploadToken: string, mode: 'fetch' | 'keepalive' | 'beacon'): void {
-    rememberRelayAbort(uploadToken);
-
-    if (mode === 'beacon' && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-      const body = new Blob(
-        [
-          JSON.stringify({
-            uploadToken,
-          } satisfies RelayAbortUploadRequest),
-        ],
-        { type: 'application/json' },
-      );
-      const accepted = navigator.sendBeacon('/api/files/abort', body);
-      if (accepted) {
-        return;
-      }
-    }
-
-    void postRelayAbort(uploadToken, mode !== 'fetch');
-  }
-
-  function dispatchRelayDiscard(uploadToken: string, mode: 'fetch' | 'keepalive' | 'beacon'): void {
-    if (mode === 'beacon' && typeof navigator !== 'undefined' && typeof navigator.sendBeacon === 'function') {
-      const body = new Blob(
-        [
-          JSON.stringify({
-            uploadToken,
-          } satisfies RelayDiscardUploadRequest),
-        ],
-        { type: 'application/json' },
-      );
-      navigator.sendBeacon('/api/files/discard', body);
-      return;
-    }
-
-    void postRelayDiscard(uploadToken, mode !== 'fetch');
-  }
-
-  async function flushPendingRelayAborts(): Promise<void> {
-    const tickets = [...relayAbortQueueRef.current];
-    for (const ticket of tickets) {
-      await postRelayAbort(ticket.uploadToken);
-    }
-  }
-
-  function wakeRelayTaskResume(task: RelayUploadTask): void {
-    const resolver = task.resumeResolver;
-    task.resumeResolver = null;
-    task.resumePromise = null;
-    resolver?.();
-  }
-
-  function waitForRelayTaskResume(task: RelayUploadTask): Promise<void> {
-    if (task.stage !== 'paused') {
-      return Promise.resolve();
-    }
-
-    if (task.resumePromise) {
-      return task.resumePromise;
-    }
-
-    task.resumePromise = new Promise<void>((resolve) => {
-      task.resumeResolver = resolve;
-    });
-    return task.resumePromise;
-  }
-
-  function pauseRelayTask(
-    task: RelayUploadTask,
-    options: {
-      reason: RelayUploadTask['pauseReason'];
-      notice?: string;
-    },
-  ): boolean {
-    if (task.cancelled || (task.stage !== 'uploading' && task.stage !== 'awaiting-sync')) {
-      return false;
-    }
-
-    task.stage = 'paused';
-    task.pauseReason = options.reason;
-    task.pauseGeneration += 1;
-    task.xhrs.forEach((xhr) => xhr.abort());
-    task.xhrs.clear();
-
-    updateTransfer({
-      transferId: task.transferId,
-      peerId: task.peerId,
-      peerName: task.peerName,
-      fileName: task.fileName,
-      totalBytes: task.totalBytes,
-      transferredBytes: getRelayTaskVisibleTransferredBytes(task),
-      direction: 'upload',
-      transport: 'server-relay',
-      status: 'paused',
-      note:
-        task.uploadedParts.size >= task.totalParts
-          ? buildRelayAwaitingSyncNote(options.reason)
-          : buildRelayPausedNote(options.reason),
-    });
-
-    if (options.notice) {
-      showTransientNotice(options.notice, 3200);
-    }
-
-    return true;
-  }
-
-  async function refreshRelayTaskUploadSnapshot(task: RelayUploadTask): Promise<void> {
-    const response = await fetch('/api/files/upload-request', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        clientRequestId: task.clientRequestId,
-        roomId: task.roomId,
-        fileName: task.file.name,
-        contentType: task.file.type,
-        size: task.file.size,
-        targetId: task.targetId,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error('relay_upload_resume_request_failed');
-    }
-
-    applyRelayUploadSnapshot(task, (await response.json()) as RelayUploadResponse);
-  }
-
-  async function resumeRelayTask(task: RelayUploadTask, options?: { notice?: string }): Promise<boolean> {
-    if (task.cancelled || task.stage !== 'paused') {
-      return false;
-    }
-
-    const wasOfflinePaused = task.pauseReason === 'offline';
-    updateTransfer({
-      transferId: task.transferId,
-      peerId: task.peerId,
-      peerName: task.peerName,
-      fileName: task.fileName,
-      totalBytes: task.totalBytes,
-      transferredBytes: getRelayTaskVisibleTransferredBytes(task),
-      direction: 'upload',
-      transport: 'server-relay',
-      status: 'streaming',
-      note: '正在恢复中继上传',
-    });
-
-    try {
-      await refreshRelayTaskUploadSnapshot(task);
-    } catch {
-      task.stage = 'paused';
-      task.pauseReason = wasOfflinePaused ? 'offline' : 'manual';
-      updateTransfer({
-        transferId: task.transferId,
-        peerId: task.peerId,
-        peerName: task.peerName,
-        fileName: task.fileName,
-        totalBytes: task.totalBytes,
-        transferredBytes: getRelayTaskVisibleTransferredBytes(task),
-        direction: 'upload',
-        transport: 'server-relay',
-        status: 'paused',
-        note: buildRelayPausedNote(task.pauseReason),
-      });
-      showTransientNotice(`${task.fileName} 恢复失败，请稍后重试。`, 3200);
-      return false;
-    }
-
-    task.pauseReason = null;
-    task.stage = task.uploadedParts.size >= task.totalParts ? 'awaiting-sync' : 'uploading';
-    wakeRelayTaskResume(task);
-
-    updateTransfer({
-      transferId: task.transferId,
-      peerId: task.peerId,
-      peerName: task.peerName,
-      fileName: task.fileName,
-      totalBytes: task.totalBytes,
-      transferredBytes: getRelayTaskVisibleTransferredBytes(task),
-      direction: 'upload',
-      transport: 'server-relay',
-      status: 'streaming',
-      note:
-        task.uploadedParts.size >= task.totalParts
-          ? wasOfflinePaused
-            ? '网络已恢复，正在同步到聊天记录'
-            : '正在同步到聊天记录'
-          : buildRelayUploadNote(
-              task.totalParts,
-              task.concurrency,
-              wasOfflinePaused ? '网络已恢复，继续直传到中继存储' : '继续直传到中继存储',
-            ),
-    });
-
-    if (options?.notice) {
-      showTransientNotice(options.notice, 3200);
-    }
-
-    return true;
-  }
-
-  function abortRelayTask(
-    task: RelayUploadTask,
-    options: {
-      reason: string;
-      transport: 'fetch' | 'keepalive' | 'beacon';
-      cleanup?: 'abort' | 'discard';
-      updateUi: boolean;
-      notice?: string;
-    },
-  ): void {
-    if (task.cancelled) {
-      return;
-    }
-
-    task.cancelled = true;
-    task.pauseReason = null;
-    task.stage = 'awaiting-sync';
-    task.xhrs.forEach((xhr) => xhr.abort());
-    task.xhrs.clear();
-    wakeRelayTaskResume(task);
-    closedTransferIdsRef.current.add(task.transferId);
-    forgetRelayAnnounce(task.transferId);
-    if (options.cleanup === 'discard') {
-      dispatchRelayDiscard(task.uploadToken, options.transport);
-    } else {
-      dispatchRelayAbort(task.uploadToken, options.transport);
-    }
-    relayUploadTasksRef.current.delete(task.transferId);
-    setTransfers((current) => {
-      if (!(task.transferId in current)) {
-        return current;
-      }
-      const next = { ...current };
-      delete next[task.transferId];
-      return next;
-    });
-
-    if (options.updateUi) {
-      updateTransfer({
-        transferId: task.transferId,
-        peerId: task.peerId,
-        peerName: task.peerName,
-        fileName: task.fileName,
-        totalBytes: task.totalBytes,
-        transferredBytes: getRelayTaskVisibleTransferredBytes(task),
-        direction: 'upload',
-        transport: 'server-relay',
-        status: 'cancelled',
-        note: options.reason,
-      });
-    }
-
-    if (options.notice) {
-      showTransientNotice(options.notice, 3200);
-    }
-  }
-
-  function abortAllRelayUploads(options: {
-    reason: string;
-    transport: 'fetch' | 'keepalive' | 'beacon';
-    updateUi: boolean;
-    notice?: string;
-  }): void {
-    const tasks = [...relayUploadTasksRef.current.values()];
-    if (tasks.length === 0) {
-      return;
-    }
-
-    for (const task of tasks) {
-      abortRelayTask(task, options);
-    }
-  }
-
-  function pauseAllRelayUploads(options: {
-    reason: RelayUploadTask['pauseReason'];
-    notice?: string;
-  }): void {
-    const tasks = [...relayUploadTasksRef.current.values()];
-    if (tasks.length === 0) {
-      return;
-    }
-
-    let pausedAny = false;
-    for (const task of tasks) {
-      pausedAny = pauseRelayTask(task, { reason: options.reason }) || pausedAny;
-    }
-
-    if (pausedAny && options.notice) {
-      showTransientNotice(options.notice, 3200);
-    }
-  }
-
-  function resumeOfflinePausedRelayUploads(): void {
-    const tasks = [...relayUploadTasksRef.current.values()];
-    for (const task of tasks) {
-      if (task.stage === 'paused' && task.pauseReason === 'offline') {
-        void resumeRelayTask(task);
-      }
-    }
-
-    flushPendingRelayAnnounces();
-  }
-
-  async function cancelRelayUpload(transferId: string): Promise<boolean> {
-    const task = relayUploadTasksRef.current.get(transferId);
-    if (!task) {
-      closedTransferIdsRef.current.add(transferId);
-      forgetRelayAnnounce(transferId);
-      setTransfers((current) => {
-        if (!(transferId in current)) {
-          return current;
-        }
-        const next = { ...current };
-        delete next[transferId];
-        return next;
-      });
-      return true;
-    }
-
-    abortRelayTask(task, {
-      reason: 'cancelled locally',
-      transport: 'fetch',
-      cleanup: task.uploadedParts.size >= task.totalParts ? 'discard' : 'abort',
-      updateUi: true,
-    });
-    return true;
-  }
-
-  async function pauseRelayUpload(transferId: string): Promise<boolean> {
-    const task = relayUploadTasksRef.current.get(transferId);
-    if (!task) {
-      return false;
-    }
-
-    return pauseRelayTask(task, {
-      reason: 'manual',
-      notice: `${task.fileName} 已暂停。`,
-    });
-  }
-
-  async function resumeRelayUpload(transferId: string): Promise<boolean> {
-    const task = relayUploadTasksRef.current.get(transferId);
-    if (!task) {
-      return false;
-    }
-
-    return await resumeRelayTask(task, {
-      notice: `${task.fileName} 已继续发送。`,
-    });
   }
 
   async function handleCancelTransfer(transfer: TransferRow): Promise<void> {
@@ -2884,7 +961,7 @@ export default function App() {
     }
 
     if (transfer.transport === 'server-relay') {
-      await cancelRelayUpload(transfer.id);
+      await relayUploads.cancelRelayUpload(transfer.id);
     }
   }
 
@@ -2893,7 +970,7 @@ export default function App() {
       return;
     }
 
-    await pauseRelayUpload(transfer.id);
+    await relayUploads.pauseRelayUpload(transfer.id);
   }
 
   async function handleResumeTransfer(transfer: TransferRow): Promise<void> {
@@ -2901,242 +978,7 @@ export default function App() {
       return;
     }
 
-    await resumeRelayUpload(transfer.id);
-  }
-
-  async function relayFile(file: File, targetId: string | null, pendingAttachmentId?: string): Promise<void> {
-    void runRelayFileUpload(file, targetId, pendingAttachmentId);
-  }
-
-  async function runRelayFileUpload(file: File, targetId: string | null, pendingAttachmentId?: string): Promise<void> {
-    const roomId = activeRoom;
-    if (!roomId) {
-      return;
-    }
-
-    const peerId = targetId ?? GLOBAL_THREAD;
-    const peerName = targetId ? getPeerDisplayName(targetId) : '整个房间';
-    const clientRequestId = pendingAttachmentId ?? crypto.randomUUID();
-    let task: RelayUploadTask | null = null;
-    try {
-      const uploadRequest = await fetch('/api/files/upload-request', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          clientRequestId,
-          roomId,
-          fileName: file.name,
-          contentType: file.type,
-          size: file.size,
-          targetId,
-        }),
-      });
-
-      if (!uploadRequest.ok) {
-        throw new Error('upload_request_failed');
-      }
-
-      const payload = (await uploadRequest.json()) as RelayUploadResponse;
-      const totalParts = payload.partUrls.length;
-      const concurrency = getRelayUploadConcurrency(file.size, totalParts);
-      task = {
-        transferId: payload.fileId,
-        clientRequestId,
-        fileName: file.name,
-        uploadToken: payload.uploadToken,
-        roomId,
-        targetId,
-        peerId,
-        peerName,
-        file,
-        chunkSizeBytes: payload.chunkSizeBytes,
-        totalBytes: file.size,
-        totalParts,
-        concurrency,
-        partUrlsByNumber: new Map(payload.partUrls.map((part) => [part.partNumber, part])),
-        pendingPartNumbers: payload.partUrls.map((part) => part.partNumber),
-        inFlightPartNumbers: new Set(),
-        uploadedParts: new Map(),
-        loadedByPart: new Map(),
-        displayedTransferredBytes: 0,
-        stage: 'uploading',
-        pauseReason: null,
-        pauseGeneration: 0,
-        resumePromise: null,
-        resumeResolver: null,
-        cancelled: false,
-        xhrs: new Set(),
-      };
-      applyRelayUploadSnapshot(task, payload);
-
-      if (activeRoomRef.current !== roomId) {
-        dispatchRelayAbort(task.uploadToken, 'fetch');
-        return;
-      }
-
-      relayUploadTasksRef.current.set(payload.fileId, task);
-
-      updateTransfer({
-        transferId: task.transferId,
-        peerId,
-        peerName,
-        fileName: file.name,
-        totalBytes: file.size,
-        transferredBytes: getRelayTaskVisibleTransferredBytes(task),
-        direction: 'upload',
-        transport: 'server-relay',
-        status: 'pending',
-        note:
-          task.uploadedParts.size > 0
-            ? buildRelayUploadNote(totalParts, concurrency, '继续直传到中继存储')
-            : '等待直传到中继存储',
-      });
-      if (pendingAttachmentId) {
-        removePendingFile(pendingAttachmentId);
-      }
-
-      while (task.uploadedParts.size < task.totalParts) {
-        if (task.cancelled || closedTransferIdsRef.current.has(task.transferId)) {
-          return;
-        }
-
-        if (task.stage === 'paused') {
-          await waitForRelayTaskResume(task);
-          continue;
-        }
-
-        await uploadRelayPartsConcurrently({
-          task,
-          onProgress: (transferredBytes, nextTotalParts, nextConcurrency) => {
-            if (!task) {
-              return;
-            }
-            const relayStage = task.stage;
-            const pauseReason = task.pauseReason;
-            updateTransfer({
-              transferId: payload.fileId,
-              peerId,
-              peerName,
-              fileName: file.name,
-              totalBytes: file.size,
-              transferredBytes: rememberRelayTaskDisplayedBytes(task, transferredBytes),
-              direction: 'upload',
-              transport: 'server-relay',
-              status: relayStage === 'paused' ? 'paused' : 'streaming',
-              note:
-                relayStage === 'paused'
-                  ? buildRelayPausedNote(pauseReason)
-                  : buildRelayUploadNote(nextTotalParts, nextConcurrency),
-            });
-          },
-        });
-      }
-
-      if (task.cancelled || closedTransferIdsRef.current.has(task.transferId)) {
-        return;
-      }
-
-      task.stage = 'completing';
-      const completeResponse = await fetch('/api/files/complete', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          uploadToken: task.uploadToken,
-          parts: [...task.uploadedParts.values()].sort((left, right) => left.partNumber - right.partNumber),
-        }),
-      });
-
-      if (!completeResponse.ok) {
-        throw new Error('upload_complete_failed');
-      }
-
-      if (task.cancelled || closedTransferIdsRef.current.has(task.transferId)) {
-        return;
-      }
-
-      const completed = (await completeResponse.json()) as Pick<RelayUploadResponse, 'fileId' | 'objectKey'>;
-      task.stage = 'awaiting-sync';
-      const announceTicket: PendingRelayAnnounceTicket = {
-        uploadToken: task.uploadToken,
-        roomId,
-        fileId: completed.fileId,
-        fileName: file.name,
-        size: file.size,
-        contentType: file.type || 'application/octet-stream',
-        objectKey: completed.objectKey,
-        targetId,
-        createdAt: Date.now(),
-      };
-
-      rememberRelayAnnounce(announceTicket);
-
-      const canAnnounce =
-        !task.cancelled &&
-        activeRoomRef.current === roomId &&
-        tryAnnounceRelayFile(announceTicket);
-
-      if (!canAnnounce) {
-        updateTransfer({
-          transferId: payload.fileId,
-          peerId,
-          peerName,
-          fileName: file.name,
-          totalBytes: file.size,
-          transferredBytes: task ? rememberRelayTaskDisplayedBytes(task, file.size) : file.size,
-          direction: 'upload',
-          transport: 'server-relay',
-          status: 'streaming',
-          note: '文件已上传，等待信令恢复后同步到聊天记录',
-        });
-        return;
-      }
-      updateTransfer({
-        transferId: payload.fileId,
-        peerId,
-        peerName,
-        fileName: file.name,
-        totalBytes: file.size,
-        transferredBytes: task ? rememberRelayTaskDisplayedBytes(task, file.size) : file.size,
-        direction: 'upload',
-        transport: 'server-relay',
-        status: 'streaming',
-        note: '等待写入聊天记录',
-        });
-    } catch (error) {
-      if (isRelayUploadCancelledError(error) || task?.cancelled || (task && closedTransferIdsRef.current.has(task.transferId))) {
-        return;
-      }
-
-      if (task && (task.stage === 'uploading' || task.stage === 'completing' || task.stage === 'failed')) {
-        dispatchRelayAbort(task.uploadToken, 'keepalive');
-      }
-
-      if (task) {
-        task.stage = 'failed';
-      }
-
-      updateTransfer({
-        transferId: task?.transferId ?? `relay-failed:${crypto.randomUUID()}`,
-        peerId,
-        peerName,
-        fileName: file.name,
-        totalBytes: file.size,
-        transferredBytes: task ? getRelayTaskVisibleTransferredBytes(task) : 0,
-        direction: 'upload',
-        transport: 'server-relay',
-        status: 'failed',
-        note: '服务端中继上传失败，请重试',
-      });
-      showTransientNotice(`${file.name} 中继上传失败，请重试。`, 3200);
-    } finally {
-      if (task) {
-        relayUploadTasksRef.current.delete(task.transferId);
-      }
-    }
+    await relayUploads.resumeRelayUpload(transfer.id);
   }
 
   async function handleSingleFile(file: File, targetId: string | null, pendingAttachmentId?: string): Promise<void> {
@@ -3144,11 +986,13 @@ export default function App() {
       return;
     }
 
-    const canDirect =
-      targetId !== null &&
-      directStates[targetId] === 'connected' &&
-      file.size <= session.directFileSoftLimitBytes &&
-      effectiveTransferMode !== 'relay-only';
+    const canDirect = canUseDirectTransfer({
+      targetId,
+      directState: targetId ? directStates[targetId] : undefined,
+      fileSize: file.size,
+      session,
+      effectiveTransferMode,
+    });
 
     if (canDirect && targetId) {
       const transferId = await meshRef.current?.sendDirectFile(targetId, file);
@@ -3164,29 +1008,17 @@ export default function App() {
       objectUrlsRef.current.push(localUrl);
 
       addMessage(
-        {
-          id: transferId,
-          roomId: activeRoom ?? 'room',
-          kind: 'direct-file',
+        buildDirectFileMessage({
+          activeRoom,
+          contentType: file.type || 'application/octet-stream',
+          fileName: file.name,
+          fileSize: file.size,
           fromId: session.clientId,
           fromName: nickname || session.nickname,
-          targetId,
-          createdAt: Date.now(),
-          transport: 'direct-p2p',
-          file: {
-            fileId: transferId,
-            fileName: file.name,
-            size: file.size,
-            contentType: file.type || 'application/octet-stream',
-            objectKey: '',
-            fromId: session.clientId,
-            fromName: nickname || session.nickname,
-            createdAt: Date.now(),
-            targetId,
-            previewable: file.type.startsWith('image/'),
-          },
           localUrl,
-        },
+          targetId,
+          transferId,
+        }),
         false,
       );
       clearNoticeResetTimer();
@@ -3195,7 +1027,7 @@ export default function App() {
       return;
     }
 
-    await relayFile(file, targetId, pendingAttachmentId);
+    await relayUploads.relayFile(file, targetId, pendingAttachmentId);
     if (targetId) {
       setNotice(`${file.name} 已加入服务端中继发送队列，正在发给 ${getPeerDisplayName(targetId)}。`);
     } else {
@@ -3208,8 +1040,7 @@ export default function App() {
       return;
     }
 
-    const text = composer.trim();
-    const files = [...pendingFiles];
+    const { text, files } = collectSendPayload(composer, pendingFiles);
     if (!text && files.length === 0) {
       return;
     }
@@ -3400,49 +1231,24 @@ export default function App() {
   }
 
   function clearThreadLocally(threadId: string): void {
-    const removed = messagesRef.current.filter((message) => getMessageThreadKey(message, selfId) === threadId);
-    for (const message of removed) {
-      releaseObjectUrl(message.localUrl);
-    }
-
-    const next = messagesRef.current.filter((message) => getMessageThreadKey(message, selfId) !== threadId);
+    const next = clearThreadMessages({
+      messages: messagesRef.current,
+      selfId,
+      threadId,
+      releaseObjectUrl,
+    });
     messagesRef.current = next;
     setMessages(next);
     setUnreadCounts((current) => {
-      if (!(threadId in current)) {
-        return current;
-      }
-      const copy = { ...current };
-      delete copy[threadId];
-      return copy;
+      const nextUnreadCounts = clearThreadUnreadCount(current, threadId);
+      unreadCountsRef.current = nextUnreadCounts;
+      return nextUnreadCounts;
     });
-    setTransfers((current) =>
-      Object.fromEntries(Object.entries(current).filter(([, transfer]) => transfer.peerId !== threadId)),
-    );
-  }
-
-  function formatThreadClearSuccessNotice(
-    targetId: string | null,
-    removedMessages: number,
-    removedRelayFiles: number,
-  ): string {
-    const base = targetId
-      ? `已清空与 ${getPeerDisplayName(targetId)} 的私聊记录`
-      : '已清空当前房间的全局聊天记录';
-    const relayInfo =
-      removedRelayFiles > 0 ? `，并回收 ${removedRelayFiles} 个失去引用的中继文件` : '';
-
-    if (removedMessages > 0) {
-      return `${base}${relayInfo}。`;
-    }
-
-    return `${base}。当前没有可删除的云端消息，已一并清掉本地直传记录和进度面板。`;
-  }
-
-  function formatThreadClearRemoteNotice(targetId: string | null, actorName: string): string {
-    return targetId
-      ? `${actorName} 清空了这条私聊记录。`
-      : `${actorName} 清空了当前房间的全局聊天记录。`;
+    setTransfers((current) => {
+      const nextTransfers = clearThreadTransfers(threadId, current);
+      transfersRef.current = nextTransfers;
+      return nextTransfers;
+    });
   }
 
   function openClearCurrentThreadDialog(): void {
@@ -3476,7 +1282,14 @@ export default function App() {
       const payload = (await response.json()) as ClearThreadResponse;
       clearThreadLocally(threadId);
       setIsClearDialogOpen(false);
-      setNotice(formatThreadClearSuccessNotice(payload.targetId, payload.removedMessages, payload.removedRelayFiles));
+      setNotice(
+        formatThreadClearSuccessNotice({
+          targetId: payload.targetId,
+          removedMessages: payload.removedMessages,
+          removedRelayFiles: payload.removedRelayFiles,
+          getPeerDisplayName: (peerId) => getPeerDisplayName(peerId),
+        }),
+      );
     } catch {
       setNotice('清空失败，请稍后重试。');
     } finally {
@@ -3909,563 +1722,89 @@ export default function App() {
             </div>
           </header>
 
-          <div ref={messagesViewportRef} className="flex-1 overflow-y-auto bg-[#eff6ff] px-3 py-3 sm:px-4 sm:py-4">
-            {filteredMessages.length === 0 ? (
-              <div className="rounded-2xl border border-dashed border-slate-300 bg-white px-6 py-8 shadow-sm">
-                <div className="text-lg font-semibold text-slate-900">
-                  {activeThread === GLOBAL_THREAD ? '这个房间还没有消息' : '这个设备会话还没有记录'}
-                </div>
-                <div className="mt-2 text-sm leading-7 text-slate-500">
-                  {activeThread === GLOBAL_THREAD
-                    ? '发一条文字试试，或者把文件拖进页面底部的发送区域。'
-                    : '给这个设备发一条私聊消息，或者直接发送文件，相关记录都会显示在这里。'}
-                </div>
-              </div>
-            ) : (
-              <div className="flex flex-col gap-3 sm:gap-4">
-                {filteredMessages.map((message) => {
-                  if (message.kind === 'system') {
-                    return (
-                      <div key={message.id} className="flex flex-col items-center gap-1 py-1 text-center">
-                        <div className="rounded-full bg-white/80 px-3 py-1 text-xs text-slate-500 shadow-sm">
-                          {message.text}
-                        </div>
-                        <span className="text-[11px] text-slate-400">{formatClockTime(message.createdAt)}</span>
-                      </div>
-                    );
-                  }
+          <MessageList
+            activeRoom={activeRoom}
+            activeThread={activeThread}
+            globalThread={GLOBAL_THREAD}
+            filteredMessages={filteredMessages}
+            selfId={selfId}
+            copiedMessageId={copiedMessageId}
+            onPreviewImage={setPreviewImage}
+            onCopyMessage={handleCopyMessage}
+            getPeerDisplayName={getPeerDisplayName}
+            getInitials={getInitials}
+            formatClockTime={formatClockTime}
+            summarizeMessageTransport={transportLabel}
+            transportBadgeTone={transportBadgeTone}
+            messagesViewportRef={messagesViewportRef}
+          />
 
-                  const isMine = message.fromId === selfId;
-                  const senderName = isMine ? 'Me' : getPeerDisplayName(message.fromId, message.fromName);
-                  const isImage = Boolean(message.file?.previewable);
-                  const imageSrc = isImage
-                    ? message.localUrl ??
-                      (activeRoom && message.file ? `/api/files/${activeRoom}/${message.file.fileId}/access` : undefined)
-                    : undefined;
-                  const downloadUrl = message.savedToDisk
-                    ? undefined
-                    : message.localUrl
-                      ? message.localUrl
-                      : message.kind === 'relay-file' && activeRoom && message.file
-                        ? `/api/files/${activeRoom}/${message.file.fileId}/access`
-                        : undefined;
-                  const canCopyMessage = Boolean(message.text) || (isImage && Boolean(imageSrc));
+          <TransferPanel
+            transferRows={transferRows}
+            getRelayTaskState={relayUploads.getRelayTaskState}
+            onPauseTransfer={handlePauseTransfer}
+            onResumeTransfer={handleResumeTransfer}
+            onCancelTransfer={handleCancelTransfer}
+            transportBadgeTone={transportBadgeTone}
+            transportLabel={transportLabel}
+            formatTransferSpeed={formatTransferSpeed}
+            formatTransferNote={formatTransferNote}
+            transferStatusLabel={transferStatusLabel}
+          />
 
-                  return (
-                    <div
-                      key={message.id}
-                      className={cn(
-                        'group flex message-slide-in',
-                        isMine ? 'self-end max-w-[85%] sm:max-w-[75%]' : 'self-start max-w-[85%] gap-2 sm:max-w-[75%]',
-                      )}
-                    >
-                      {!isMine ? (
-                        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-slate-200 text-xs font-semibold text-slate-700">
-                          {getInitials(senderName)}
-                        </div>
-                      ) : null}
-
-                      <div className={cn('flex flex-col gap-1', isMine ? 'items-end' : 'items-start')}>
-                        {!isMine ? <span className="px-3 text-xs font-medium text-slate-600">{senderName}</span> : null}
-
-                        <div className="max-w-full">
-                          <div
-                            className={cn(
-                              'max-w-full overflow-hidden whitespace-pre-wrap break-words rounded-2xl px-4 py-2.5 text-[15px] leading-relaxed shadow-sm',
-                              isMine
-                                ? 'rounded-br-md bg-blue-600 text-white'
-                                : 'rounded-bl-md border border-slate-200 bg-white text-slate-900',
-                            )}
-                            style={{ wordBreak: 'break-word', overflowWrap: 'anywhere' }}
-                          >
-                            {message.text ? <span>{message.text}</span> : null}
-
-                            {message.file ? (
-                              <div className="space-y-3">
-                                <div
-                                  className={cn(
-                                    'flex items-start gap-3 rounded-lg p-3',
-                                    isMine ? 'bg-white/10' : 'bg-slate-50',
-                                  )}
-                                >
-                                  <div
-                                    className={cn(
-                                      'flex h-10 w-10 shrink-0 items-center justify-center rounded-lg',
-                                      isMine ? 'bg-white/10 text-white' : 'bg-slate-200 text-slate-600',
-                                    )}
-                                  >
-                                    {isImage ? <ImageIcon className="h-5 w-5" /> : <FileText className="h-5 w-5" />}
-                                  </div>
-                                  <div className="min-w-0 flex-1">
-                                    <div className="truncate font-medium">{message.file.fileName}</div>
-                                    <div className={cn('mt-1 text-xs', isMine ? 'text-white/70' : 'text-slate-500')}>
-                                      {formatBytes(message.file.size)} · 传输方式：{transportLabel(message.transport)}
-                                    </div>
-                                    <div className="mt-2">
-                                      <Badge
-                                        className={cn(
-                                          'h-5 px-2 text-[10px]',
-                                          isMine ? 'border-white/20 bg-white/10 text-white' : transportBadgeTone(message.transport),
-                                        )}
-                                      >
-                                        {transportLabel(message.transport)}
-                                      </Badge>
-                                    </div>
-                                    {message.savedToDisk ? (
-                                      <div className={cn('mt-2 text-xs', isMine ? 'text-emerald-100' : 'text-emerald-700')}>
-                                        文件已直接写入接收目录
-                                      </div>
-                                    ) : null}
-                                  </div>
-                                </div>
-
-                                {imageSrc ? (
-                                  <img
-                                    src={imageSrc}
-                                    alt={message.file.fileName}
-                                    className="max-h-80 w-auto max-w-full cursor-zoom-in rounded-lg object-contain"
-                                    onClick={() => setPreviewImage(imageSrc)}
-                                  />
-                                ) : null}
-
-                                {downloadUrl ? (
-                                  <a
-                                    href={downloadUrl}
-                                    download={message.file.fileName}
-                                    className={cn(
-                                      'inline-flex h-9 items-center gap-1.5 rounded-full border px-3.5 text-xs font-semibold transition-all',
-                                      isMine
-                                        ? 'border-white/15 bg-white/10 text-white hover:bg-white/20'
-                                        : 'border-slate-200 bg-white text-slate-700 shadow-sm hover:border-slate-300 hover:bg-slate-50',
-                                    )}
-                                  >
-                                    <Download className="h-3.5 w-3.5" />
-                                    下载文件
-                                  </a>
-                                ) : null}
-                              </div>
-                            ) : null}
-                          </div>
-                        </div>
-
-                        <div className="flex items-center gap-2 px-1">
-                          <span className="px-2 text-[11px] text-slate-500">{formatClockTime(message.createdAt)}</span>
-                          {canCopyMessage ? (
-                            <button
-                              type="button"
-                              onClick={() => void handleCopyMessage(message, imageSrc)}
-                              className="inline-flex h-7 items-center gap-1.5 rounded-full border border-slate-200 bg-white/85 px-2.5 text-[11px] font-semibold text-slate-600 shadow-sm backdrop-blur transition-all hover:border-slate-300 hover:bg-white hover:text-slate-900"
-                              title="复制消息"
-                            >
-                              {copiedMessageId === message.id ? (
-                                <>
-                                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
-                                  <span>已复制</span>
-                                </>
-                              ) : (
-                                <>
-                                  <Copy className="h-3.5 w-3.5" />
-                                  <span>复制</span>
-                                </>
-                              )}
-                            </button>
-                          ) : null}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
-          {transferRows.length > 0 ? (
-            <div className="border-t border-slate-200 bg-white px-4 py-3">
-              {transferRows.map((transfer) => {
-                const relayTask = relayUploadTasksRef.current.get(transfer.id);
-                const percent =
-                  transfer.totalBytes > 0
-                    ? Math.min(100, Math.round((transfer.transferredBytes / transfer.totalBytes) * 100))
-                    : 0;
-                const isDone = transfer.status === 'complete';
-                const isFailed = transfer.status === 'failed' || transfer.status === 'declined';
-                const isPaused = transfer.status === 'paused';
-                const canPause =
-                  transfer.transport === 'server-relay' &&
-                  transfer.direction === 'upload' &&
-                  transfer.status === 'streaming' &&
-                  relayTask?.stage === 'uploading';
-                const canResume =
-                  transfer.transport === 'server-relay' &&
-                  transfer.direction === 'upload' &&
-                  transfer.status === 'paused' &&
-                  relayTask?.stage === 'paused';
-                const canCancel =
-                  transfer.status === 'pending' || transfer.status === 'streaming' || transfer.status === 'paused';
-
-                return (
-                  <div key={transfer.id} className="mb-2 rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
-                    <div className="mb-2 flex items-center justify-between gap-3">
-                      <div className="flex min-w-0 flex-1 items-center gap-2.5">
-                        <div
-                          className={cn(
-                            'flex h-9 w-9 items-center justify-center rounded-lg text-white',
-                            transfer.direction === 'upload' ? 'bg-slate-900' : 'bg-emerald-600',
-                          )}
-                        >
-                          {transfer.direction === 'upload' ? (
-                            <Upload className="h-4 w-4" />
-                          ) : (
-                            <FolderOpen className="h-4 w-4" />
-                          )}
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
-                            <span className="truncate text-sm font-medium">{transfer.fileName}</span>
-                            <Badge className="h-4 border-slate-200 bg-slate-50 px-1.5 text-[10px] text-slate-600">
-                              {transfer.direction === 'upload' ? '→' : '←'} {transfer.peerName}
-                            </Badge>
-                          </div>
-                          <div className="text-[11px] text-slate-500">
-                            {formatBytes(transfer.transferredBytes)} / {formatBytes(transfer.totalBytes)}
-                            {transfer.status === 'streaming' && formatTransferSpeed(transfer.speedBytesPerSecond)
-                              ? ` · ${formatTransferSpeed(transfer.speedBytesPerSecond)}`
-                              : ''}
-                            {' · '}
-                            {formatTransferNote(transfer.note) ?? transferStatusLabel(transfer.status)}
-                          </div>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        {canPause ? (
-                          <button
-                            type="button"
-                            onClick={() => void handlePauseTransfer(transfer)}
-                            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-200 bg-slate-50 text-slate-500 shadow-sm transition-all hover:border-slate-300 hover:bg-white hover:text-slate-900"
-                            title="暂停传输"
-                          >
-                            <Pause className="h-4 w-4" />
-                          </button>
-                        ) : null}
-                        {canResume ? (
-                          <button
-                            type="button"
-                            onClick={() => void handleResumeTransfer(transfer)}
-                            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-200 bg-slate-50 text-slate-500 shadow-sm transition-all hover:border-slate-300 hover:bg-white hover:text-slate-900"
-                            title="继续传输"
-                          >
-                            <Play className="h-4 w-4" />
-                          </button>
-                        ) : null}
-                        {canCancel ? (
-                          <button
-                            type="button"
-                            onClick={() => void handleCancelTransfer(transfer)}
-                            className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-slate-200 bg-slate-50 text-slate-500 shadow-sm transition-all hover:border-slate-300 hover:bg-white hover:text-slate-900"
-                            title="取消传输"
-                          >
-                            <X className="h-4 w-4" />
-                          </button>
-                        ) : null}
-                        <Badge className={cn('h-5 px-2 text-[10px]', transportBadgeTone(transfer.transport))}>
-                          {transportLabel(transfer.transport)}
-                        </Badge>
-                        {isDone ? (
-                          <CheckCircle2 className="h-5 w-5 text-emerald-600" />
-                        ) : isFailed ? (
-                          <Badge className="border-rose-200 bg-rose-50 text-rose-700">
-                            {transferStatusLabel(transfer.status)}
-                          </Badge>
-                        ) : isPaused ? (
-                          <Pause className="h-5 w-5 text-slate-500" />
-                        ) : (
-                          <LoaderCircle className="h-5 w-5 animate-spin text-slate-700" />
-                        )}
-                        <span className="ml-1 text-xs font-semibold text-slate-900">
-                          {transfer.status === 'pending' ? '等待' : transfer.status === 'paused' ? '暂停' : `${percent}%`}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="h-1.5 overflow-hidden rounded-full bg-slate-100">
-                      <div
-                        className={cn('h-full transition-all duration-300', isFailed ? 'bg-rose-500' : 'bg-slate-900')}
-                        style={{ width: `${percent}%` }}
-                      />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          ) : null}
-
-          <div className="border-t border-slate-200 bg-white">
-            {pendingFiles.length > 0 ? (
-              <div className="flex flex-wrap gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3">
-                {pendingFiles.map((item) => (
-                  <div
-                    key={item.id}
-                    className="relative inline-flex max-w-[240px] items-center gap-3 rounded-2xl border border-slate-200 bg-white px-3 py-2.5 pr-12 shadow-sm"
-                  >
-                    {item.previewUrl ? (
-                      <div className="relative">
-                        <img src={item.previewUrl} alt={item.file.name} className="h-10 w-10 rounded-xl object-cover" />
-                        <ImageIcon className="absolute bottom-0 right-0 h-3.5 w-3.5 rounded bg-black/55 p-0.5 text-white" />
-                      </div>
-                    ) : (
-                      <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-slate-100 text-slate-500">
-                        <FileText className="h-6 w-6" />
-                      </div>
-                    )}
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-[13px] font-medium text-slate-900">{item.file.name}</div>
-                      <div className="mt-0.5 text-xs text-slate-500">{formatBytes(item.file.size)}</div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => removePendingFile(item.id)}
-                      className="absolute right-3 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full border border-slate-200 bg-slate-50 text-slate-500 shadow-sm transition-all hover:border-slate-300 hover:bg-white hover:text-slate-900"
-                      title="移除"
-                    >
-                      <X className="h-4 w-4" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-
-            <div className="flex items-end gap-2 px-3 py-3 sm:px-4">
-              <label className="group inline-flex h-11 w-11 shrink-0 cursor-pointer items-center justify-center rounded-[16px] border border-slate-200 bg-white text-slate-700 shadow-[0_8px_18px_rgba(15,23,42,0.07)] transition-all hover:border-slate-300 hover:bg-slate-50 hover:shadow-[0_12px_24px_rgba(15,23,42,0.12)]">
-                <input
-                  type="file"
-                  multiple
-                  className="sr-only"
-                  onChange={(event) => {
-                    const files = event.target.files ? Array.from(event.target.files) : [];
-                    appendPendingFiles(files);
-                    event.target.value = '';
-                  }}
-                  title="发送文件"
-                />
-                <div className="pointer-events-none inline-flex h-full w-full items-center justify-center rounded-[16px]">
-                  <Paperclip className="h-[22px] w-[22px]" />
-                </div>
-              </label>
-
-              <div className="relative">
-                <div
-                  className={cn(
-                    'relative inline-grid h-10 w-[134px] grid-cols-2 items-center rounded-full border border-slate-200 bg-slate-100 p-1 shadow-[inset_0_1px_0_rgba(255,255,255,0.9),0_8px_18px_rgba(15,23,42,0.05)] transition-colors',
-                    !canToggleTransferMode && 'opacity-95',
-                  )}
-                >
-                  <span
-                    aria-hidden="true"
-                    className={cn(
-                      'pointer-events-none absolute inset-y-1 w-[calc(50%-4px)] rounded-full border border-slate-900 bg-slate-900 shadow-[0_1px_2px_rgba(15,23,42,0.14),0_8px_18px_rgba(15,23,42,0.18)] transition-[left] duration-200 ease-out',
-                      !canToggleTransferMode && 'shadow-[0_1px_2px_rgba(15,23,42,0.1),0_6px_14px_rgba(15,23,42,0.14)]',
-                    )}
-                    style={{
-                      left: effectiveTransferMode === 'relay-only' ? 'calc(50% + 2px)' : '4px',
-                    }}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      clearTransferModeTooltip();
-                      if (canToggleTransferMode) {
-                        setTransferMode('auto');
-                      }
-                    }}
-                    onMouseEnter={() => scheduleTransferModeTooltip('auto')}
-                    onMouseLeave={clearTransferModeTooltip}
-                    onFocus={() => scheduleTransferModeTooltip('auto')}
-                    onBlur={clearTransferModeTooltip}
-                    disabled={!canToggleTransferMode}
-                    className={cn(
-                      'relative z-10 inline-flex h-8 items-center justify-center rounded-full border border-transparent px-0 text-[14px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 focus-visible:ring-offset-2 focus-visible:ring-offset-white disabled:cursor-not-allowed',
-                      effectiveTransferMode === 'auto'
-                        ? 'text-white'
-                        : canToggleTransferMode
-                          ? 'text-slate-600 hover:text-slate-900'
-                          : 'text-slate-500',
-                    )}
-                  >
-                    自动
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      clearTransferModeTooltip();
-                      if (canToggleTransferMode) {
-                        setTransferMode('relay-only');
-                      }
-                    }}
-                    onMouseEnter={() => scheduleTransferModeTooltip('relay-only')}
-                    onMouseLeave={clearTransferModeTooltip}
-                    onFocus={() => scheduleTransferModeTooltip('relay-only')}
-                    onBlur={clearTransferModeTooltip}
-                    disabled={!canToggleTransferMode}
-                    className={cn(
-                      'relative z-10 inline-flex h-8 items-center justify-center rounded-full border border-transparent px-0 text-[14px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-300 focus-visible:ring-offset-2 focus-visible:ring-offset-white disabled:cursor-not-allowed',
-                      effectiveTransferMode === 'relay-only'
-                        ? 'text-white'
-                        : canToggleTransferMode
-                          ? 'text-slate-600 hover:text-slate-900'
-                          : 'text-slate-500',
-                    )}
-                  >
-                    中继
-                  </button>
-                </div>
-                {transferModeTooltip ? (
-                  <div
-                    className={cn(
-                      'pointer-events-none absolute bottom-[calc(100%+14px)] z-20 max-w-[240px] rounded-2xl border border-slate-200 bg-white/95 px-3.5 py-2.5 text-[13px] leading-5 text-slate-600 shadow-[0_18px_40px_rgba(15,23,42,0.12)] backdrop-blur-md',
-                      transferModeTooltip === 'relay-only' ? 'right-0' : 'left-0',
-                    )}
-                  >
-                    <span
-                      aria-hidden="true"
-                      className={cn(
-                        'absolute top-full h-3 w-3 -translate-y-1/2 rotate-45 border-b border-r border-slate-200 bg-white/95',
-                        transferModeTooltip === 'relay-only' ? 'right-8' : 'left-8',
-                      )}
-                    />
-                    {transferModeTooltipText}
-                  </div>
-                ) : null}
-              </div>
-
-              <textarea
-                ref={composerRef}
-                value={composer}
-                onChange={(event) => setComposer(event.target.value)}
-                onPaste={handlePaste}
-                onKeyDown={handleComposerKeyDown}
-                onCompositionStart={() => setIsComposing(true)}
-                onCompositionEnd={() => setIsComposing(false)}
-                rows={1}
-                placeholder={
-                  activePeerId
-                    ? `给 ${getPeerDisplayName(activePeerId)} 发私聊消息，或直接发送文件`
-                    : '输入房间消息...'
-                }
-                className="min-h-[44px] flex-1 resize-none border-0 bg-transparent px-2 py-[11px] text-[15px] leading-6 outline-none placeholder:text-slate-400"
-              />
-
-              <Button
-                onClick={() => void handleSend()}
-                variant="secondary"
-                className="h-11 min-w-[52px] shrink-0 rounded-2xl border-0 bg-slate-900 px-3 text-white shadow-[0_16px_30px_rgba(15,23,42,0.18)] ring-0 transition-all hover:bg-slate-800 hover:shadow-[0_18px_34px_rgba(15,23,42,0.24)] disabled:bg-slate-200 disabled:text-slate-400 disabled:shadow-none sm:min-w-[92px] sm:px-4"
-                disabled={isSending || (!composer.trim() && pendingFiles.length === 0) || socketStatus !== 'connected'}
-              >
-                <span className="flex items-center gap-2">
-                  <Send className="h-4 w-4" />
-                  <span className="hidden text-sm font-semibold sm:inline">发送</span>
-                </span>
-              </Button>
-            </div>
-
-            <div className="border-t border-slate-200 bg-white px-4 py-2 text-xs text-slate-500">{notice}</div>
-          </div>
+          <ComposerPanel
+            pendingFiles={pendingFiles}
+            composer={composer}
+            isComposing={isComposing}
+            activePeerId={activePeerId}
+            canToggleTransferMode={canToggleTransferMode}
+            effectiveTransferMode={effectiveTransferMode}
+            isSending={isSending}
+            notice={notice}
+            socketStatus={socketStatus}
+            transferModeTooltip={transferModeTooltip}
+            transferModeTooltipText={transferModeTooltipText}
+            composerRef={composerRef}
+            onRemovePendingFile={removePendingFile}
+            onAppendPendingFiles={appendPendingFiles}
+            onSetTransferMode={setTransferMode}
+            onScheduleTransferModeTooltip={scheduleTransferModeTooltip}
+            onClearTransferModeTooltip={clearTransferModeTooltip}
+            onComposerChange={setComposer}
+            onPaste={handlePaste}
+            onKeyDown={handleComposerKeyDown}
+            onCompositionStart={() => setIsComposing(true)}
+            onCompositionEnd={() => setIsComposing(false)}
+            onSend={() => {
+              void handleSend();
+            }}
+            getPeerDisplayName={getPeerDisplayName}
+          />
         </section>
       </div>
 
-      {previewImage ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4"
-          onClick={() => setPreviewImage(null)}
-        >
-          <img src={previewImage} alt="Preview" className="max-h-full max-w-full object-contain" />
-        </div>
-      ) : null}
+      <ImagePreviewDialog previewImage={previewImage} onClose={() => setPreviewImage(null)} />
 
-      {isClearDialogOpen ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
-          onClick={() => {
-            if (!isClearingThread) {
-              setIsClearDialogOpen(false);
-            }
-          }}
-        >
-          <div
-            className="w-full max-w-md rounded-2xl bg-white p-6 shadow-xl"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <div className="flex items-start gap-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-rose-50 text-rose-600">
-                <Trash2 className="h-5 w-5" />
-              </div>
-              <div className="min-w-0">
-                <h3 className="text-lg font-semibold text-slate-900">
-                  {activePeerId ? `清空与 ${getPeerDisplayName(activePeerId)} 的私聊？` : '清空当前房间的全局聊天？'}
-                </h3>
-                <p className="mt-2 text-sm leading-6 text-slate-600">
-                  {activePeerId
-                    ? `这会删除你与 ${getPeerDisplayName(activePeerId)} 的私聊文字、定向文件和本地直传记录，对当前在线双方立即生效；失去引用的服务端中继文件会一起清理。`
-                    : '这会删除当前房间的全局文字记录和房间共享文件，对房间内所有在线成员立即生效；失去引用的服务端中继文件也会一起清理。'}
-                </p>
-                <p className="mt-2 text-xs text-slate-500">这个操作不可恢复。</p>
-              </div>
-            </div>
+      <ClearThreadDialog
+        open={isClearDialogOpen}
+        isClearingThread={isClearingThread}
+        activePeerId={activePeerId}
+        activePeerName={activePeerId ? getPeerDisplayName(activePeerId) : ''}
+        onClose={() => setIsClearDialogOpen(false)}
+        onConfirm={() => {
+          void handleConfirmClearCurrentThread();
+        }}
+      />
 
-            <div className="mt-6 flex justify-end gap-2">
-              <Button
-                onClick={() => setIsClearDialogOpen(false)}
-                variant="secondary"
-                size="sm"
-                disabled={isClearingThread}
-              >
-                取消
-              </Button>
-              <Button
-                onClick={() => void handleConfirmClearCurrentThread()}
-                size="sm"
-                className="bg-rose-600 text-white hover:bg-rose-600/90"
-                disabled={isClearingThread}
-              >
-                {isClearingThread ? '清空中...' : '确认清空'}
-              </Button>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
-      {isEditingNickname ? (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
-          onClick={() => setIsEditingNickname(false)}
-        >
-          <div
-            className="w-full max-w-sm rounded-lg bg-white p-6 shadow-xl"
-            onClick={(event) => event.stopPropagation()}
-          >
-            <h3 className="mb-4 text-lg font-semibold">设置昵称</h3>
-            <Input
-              type="text"
-              value={nicknameDraft}
-              onChange={(event) => setNicknameDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') {
-                  void handleSaveNickname();
-                }
-              }}
-              placeholder="输入昵称..."
-              autoFocus
-              className="mb-4"
-            />
-            <div className="flex justify-end gap-2">
-              <Button onClick={() => setIsEditingNickname(false)} variant="secondary" size="sm">
-                取消
-              </Button>
-              <Button onClick={() => void handleSaveNickname()} size="sm" className="bg-[#1e3a8a] text-white hover:bg-[#1e3a8a]/90">
-                保存
-              </Button>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      <EditNicknameDialog
+        open={isEditingNickname}
+        nicknameDraft={nicknameDraft}
+        onNicknameDraftChange={setNicknameDraft}
+        onClose={() => setIsEditingNickname(false)}
+        onSave={() => {
+          void handleSaveNickname();
+        }}
+      />
     </div>
   );
 }
