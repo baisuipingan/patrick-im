@@ -4,16 +4,21 @@ SHELL := /bin/bash
 
 FRONTEND_DIR := frontend/web
 BACKEND_DIR := backend/server
+BACKEND_ENV_FILE := $(BACKEND_DIR)/.env
+BACKEND_LOCAL_ENV_FILE := $(BACKEND_DIR)/.env.local
 BUILD_DIR := $(BACKEND_DIR)/build
 WEB_DIST_DIR := $(BACKEND_DIR)/web-dist
+PACKAGE_NAME := patrick-im-server
 BIN_NAME := patrick-im-server
 SERVICE_NAME := patrick-im-server
+RUSTFS_DEV_CONTAINER := patrick-im-rustfs
+RUSTFS_DEV_VOLUME := patrick-im-rustfs-data
 COMPOSE_FILE := ops/docker-compose.server.yml
 DOCKER_COMPOSE := docker compose -f $(COMPOSE_FILE)
 HOST_RUST_TARGET := $(shell bash --noprofile --norc -c 'source $$HOME/.cargo/env >/dev/null 2>&1 || true; rustc -vV 2>/dev/null | sed -n "s/^host: //p"' || true)
 PNPM_INSTALL_FLAGS := install --frozen-lockfile --prefer-offline
 
-.PHONY: help env-check frontend-build release release-host release-x86 docker-build docker-up deploy deploy-x86 status logs clean
+.PHONY: help env-check frontend-dev backend-dev frontend-build release release-host release-x86 docker-build docker-up deploy deploy-x86 status logs clean rustfs-dev
 
 define load_toolchains
 source $$HOME/.cargo/env >/dev/null 2>&1 || true; \
@@ -34,6 +39,9 @@ endef
 help:
 	@printf '%s\n' \
 	  'make env-check     # 检查 node/corepack/cargo/docker' \
+	  'make frontend-dev  # 启动前端 Vite 开发服务' \
+	  'make backend-dev   # 启动 Rust 后端开发服务' \
+	  'make rustfs-dev    # 启动本地测试用 RustFS 容器' \
 	  'make frontend-build # 构建前端到 backend/server/web-dist' \
 	  'make release       # 按当前宿主机架构构建 release 二进制' \
 	  'make release-x86   # 构建 x86_64 Linux release 二进制' \
@@ -57,6 +65,47 @@ env-check:
 	printf 'rustc=%s\n' "$$(rustc -V)"; \
 	printf 'docker=%s\n' "$$(docker -v)"; \
 	printf 'docker compose=%s\n' "$$(docker compose version | head -n 1)"
+
+frontend-dev:
+	@$(load_toolchains); \
+	$(call require_command,pnpm); \
+	cd $(FRONTEND_DIR); \
+	pnpm run dev
+
+backend-dev:
+	@$(load_toolchains); \
+	$(call require_command,cargo); \
+	ENV_FILE="$(BACKEND_LOCAL_ENV_FILE)"; \
+	if [[ ! -f "$$ENV_FILE" ]]; then \
+	  ENV_FILE="$(BACKEND_ENV_FILE)"; \
+	fi; \
+	if [[ ! -f "$$ENV_FILE" ]]; then \
+	  echo "missing env file: $(BACKEND_LOCAL_ENV_FILE) or $(BACKEND_ENV_FILE)" >&2; \
+	  echo "create $(BACKEND_LOCAL_ENV_FILE) from $(BACKEND_DIR)/.env.local.example for local development" >&2; \
+	  exit 1; \
+	fi; \
+	set -a; \
+	source "$$ENV_FILE"; \
+	set +a; \
+	cargo run -p $(PACKAGE_NAME) --bin $(BIN_NAME)
+
+rustfs-dev:
+	@$(call require_command,docker); \
+	docker pull rustfs/rustfs:latest; \
+	docker volume create $(RUSTFS_DEV_VOLUME) >/dev/null; \
+	if docker ps -a --format '{{.Names}}' | grep -qx '$(RUSTFS_DEV_CONTAINER)'; then \
+	  docker rm -f $(RUSTFS_DEV_CONTAINER) >/dev/null; \
+	fi; \
+	docker run -d \
+	  --name $(RUSTFS_DEV_CONTAINER) \
+	  -p 9000:9000 \
+	  -p 9001:9001 \
+	  -e RUSTFS_ACCESS_KEY=rustfsadmin \
+	  -e RUSTFS_SECRET_KEY=rustfsadmin \
+	  -e RUSTFS_CONSOLE_ENABLE=true \
+	  -v $(RUSTFS_DEV_VOLUME):/data \
+	  rustfs/rustfs:latest \
+	  /data
 
 frontend-build: env-check
 	@mkdir -p $(BUILD_DIR) $(WEB_DIST_DIR)
