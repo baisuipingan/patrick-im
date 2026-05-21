@@ -1231,6 +1231,7 @@ export default function App() {
   }
 
   function clearThreadLocally(threadId: string): void {
+    relayUploadsRef.current?.abortRelayUploadsForThread(threadId);
     const next = clearThreadMessages({
       messages: messagesRef.current,
       selfId,

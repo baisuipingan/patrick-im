@@ -51,6 +51,7 @@ export interface RelayUploadControls {
     updateUi: boolean;
     notice?: string;
   }) => void;
+  abortRelayUploadsForThread: (threadId: string, options?: { transport?: 'fetch' | 'keepalive' | 'beacon' }) => void;
   acknowledgeRelayMessage: (fileId: string) => void;
   cancelRelayUpload: (transferId: string) => Promise<boolean>;
   flushPendingRelayAborts: () => Promise<void>;
@@ -569,6 +570,26 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
     }
   }
 
+  function abortRelayUploadsForThread(
+    threadId: string,
+    options?: { transport?: 'fetch' | 'keepalive' | 'beacon' },
+  ): void {
+    const transport = options?.transport ?? 'fetch';
+    const tasks = [...relayUploadTasksRef.current.values()].filter((task) => task.peerId === threadId);
+    if (tasks.length === 0) {
+      return;
+    }
+
+    for (const task of tasks) {
+      abortRelayTask(task, {
+        reason: 'thread cleared',
+        transport,
+        cleanup: task.uploadedParts.size >= task.totalParts ? 'discard' : 'abort',
+        updateUi: false,
+      });
+    }
+  }
+
   function pauseAllRelayUploads(pauseOptions: {
     reason: RelayUploadTask['pauseReason'];
     notice?: string;
@@ -894,6 +915,7 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
 
   return {
     abortAllRelayUploads,
+    abortRelayUploadsForThread,
     acknowledgeRelayMessage,
     cancelRelayUpload,
     flushPendingRelayAborts,
