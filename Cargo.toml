@@ -16,4 +16,4 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "mysql", "macros",
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "signal", "sync"] }
 tower-http = { version = "0.6.11", features = ["compression-br", "compression-gzip", "trace"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
