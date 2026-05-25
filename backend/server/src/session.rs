@@ -1,7 +1,7 @@
 use crate::signing::{create_signed_token, read_signed_token};
 use anyhow::{Context, Result};
-use salvo::http::header::{COOKIE, HeaderValue, SET_COOKIE};
-use salvo::prelude::*;
+use axum::http::HeaderMap;
+use axum::http::header::{COOKIE, SET_COOKIE};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -19,12 +19,13 @@ pub struct SessionPayload {
 }
 
 pub fn get_or_create_session(
-    req: &Request,
-    res: &mut Response,
+    headers: &HeaderMap,
+    response_headers: &mut HeaderMap,
+    secure: bool,
     secret: &str,
 ) -> Result<SessionPayload> {
     let now = now_ms();
-    let existing = read_session(req, secret).ok().flatten();
+    let existing = read_session(headers, secret).ok().flatten();
     let session = existing.unwrap_or_else(|| SessionPayload {
         clientId: Uuid::new_v4().to_string(),
         nickname: create_guest_name(),
@@ -37,26 +38,21 @@ pub fn get_or_create_session(
         ..session
     };
 
-    let cookie =
-        serialize_session_cookie(&refreshed, req.uri().scheme_str() == Some("https"), secret)?;
-    res.headers_mut().append(
+    let cookie = serialize_session_cookie(&refreshed, secure, secret)?;
+    response_headers.append(
         SET_COOKIE,
-        HeaderValue::from_str(&cookie).context("invalid set-cookie header")?,
+        cookie.parse().context("invalid set-cookie header")?,
     );
 
     Ok(refreshed)
 }
 
-pub fn require_session(req: &Request, secret: &str) -> Result<Option<SessionPayload>> {
-    read_session(req, secret)
+pub fn require_session(headers: &HeaderMap, secret: &str) -> Result<Option<SessionPayload>> {
+    read_session(headers, secret)
 }
 
-fn read_session(req: &Request, secret: &str) -> Result<Option<SessionPayload>> {
-    let cookies = parse_cookies(
-        req.headers()
-            .get(COOKIE)
-            .and_then(|value| value.to_str().ok()),
-    );
+fn read_session(headers: &HeaderMap, secret: &str) -> Result<Option<SessionPayload>> {
+    let cookies = parse_cookies(headers.get(COOKIE).and_then(|value| value.to_str().ok()));
     let Some(cookie) = cookies.get(SESSION_COOKIE_NAME) else {
         return Ok(None);
     };

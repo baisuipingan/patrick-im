@@ -1,11 +1,11 @@
 use anyhow::Context;
+use axum::Router;
 use patrick_im_server::config::AppConfig;
 use patrick_im_server::routes;
 use patrick_im_server::state::AppState;
-use salvo::affix_state;
-use salvo::compression::{Compression, CompressionLevel};
-use salvo::logging::Logger;
-use salvo::prelude::*;
+use tokio::net::TcpListener;
+use tower_http::compression::CompressionLayer;
+use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -14,28 +14,25 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(&config)?;
 
     let state = AppState::new(config.clone()).await?;
-    let compression = Compression::new()
-        .enable_gzip(CompressionLevel::Default)
-        .enable_brotli(CompressionLevel::Default)
-        .min_length(1024);
-    let router = Router::new()
-        .hoop(Logger::new())
-        .hoop(compression)
-        .hoop(affix_state::inject(state))
-        .push(routes::router());
+    let app = Router::new()
+        .merge(routes::router())
+        .layer(CompressionLayer::new())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
 
     tracing::info!(
         bind = %config.bind,
         public_base_url = %config.public_base_url,
-        "starting patrick-im Rust server skeleton"
+        "starting patrick-im axum server"
     );
 
-    let acceptor = TcpListener::new(config.bind.clone())
-        .try_bind()
+    let listener = TcpListener::bind(&config.bind)
         .await
         .with_context(|| format!("failed to bind {}", config.bind))?;
 
-    Server::new(acceptor).serve(router).await;
+    axum::serve(listener, app)
+        .await
+        .context("axum server failed")?;
     Ok(())
 }
 

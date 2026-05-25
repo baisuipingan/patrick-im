@@ -1,36 +1,30 @@
+use crate::http::{ApiError, JsonResponse, ok_json};
 use crate::protocol::{ClearThreadRequest, ServerToClientMessage};
 use crate::session::require_session;
 use crate::state::AppState;
 use crate::utils::sanitize_room_id;
-use salvo::prelude::*;
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 
-#[handler]
 pub async fn clear_thread(
-    req: &mut Request,
-    depot: &mut Depot,
-) -> Result<Json<crate::protocol::ClearThreadResponse>, StatusError> {
-    let state = depot
-        .obtain::<AppState>()
-        .map_err(|_| StatusError::internal_server_error())?;
-    let room_id = sanitize_room_id(&req.param::<String>("room_id").unwrap_or_default());
-    let session = require_session(req, &state.config.session_secret)
-        .map_err(|error| {
-            StatusError::internal_server_error().brief(format!("session decode error: {error}"))
-        })?
-        .ok_or_else(|| StatusError::unauthorized().brief("missing session"))?;
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    Json(body): Json<ClearThreadRequest>,
+) -> JsonResponse<crate::protocol::ClearThreadResponse> {
+    let room_id = sanitize_room_id(&room_id);
+    let session = require_session(&headers, &state.config.session_secret)
+        .map_err(|error| ApiError::internal(format!("session decode error: {error}")))?
+        .ok_or_else(|| ApiError::unauthorized("missing session"))?;
 
     if !state
         .room_hub
         .is_client_connected(&room_id, &session.clientId)
         .await
     {
-        return Err(StatusError::forbidden().brief("client is not connected to this room"));
+        return Err(ApiError::forbidden("client is not connected to this room"));
     }
-
-    let body = req
-        .parse_body::<ClearThreadRequest>()
-        .await
-        .map_err(|_| StatusError::bad_request().brief("invalid clear-thread payload"))?;
 
     let actor_name = state
         .room_hub
@@ -42,7 +36,7 @@ pub async fn clear_thread(
         .message_store
         .clear_thread(&room_id, &session.clientId, &actor_name, body.targetId)
         .await
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+        .map_err(ApiError::from_internal)?;
 
     let _ = state
         .relay_store
@@ -71,5 +65,5 @@ pub async fn clear_thread(
             .await;
     }
 
-    Ok(Json(outcome.response))
+    Ok(ok_json(outcome.response))
 }

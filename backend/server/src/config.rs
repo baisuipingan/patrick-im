@@ -18,13 +18,14 @@ pub struct AppConfig {
     pub rustfs_access_key: String,
     pub rustfs_secret_key: String,
     pub session_secret: String,
+    pub secure_cookies: bool,
     pub recent_message_limit: usize,
 }
 
 impl AppConfig {
     pub fn from_env() -> Result<Self> {
         let bind = env_or("PATRICK_IM_BIND", "0.0.0.0:5800");
-        let log_filter = env_or("PATRICK_IM_LOG", "info,salvo_core=info");
+        let log_filter = env_or("PATRICK_IM_LOG", "info,tower_http=info,axum=info");
         let public_base_url = normalize_base_url(env_required("PATRICK_IM_PUBLIC_BASE_URL")?);
         let rustfs_public_endpoint = normalize_base_url(env_or(
             "PATRICK_IM_RUSTFS_PUBLIC_ENDPOINT",
@@ -43,6 +44,10 @@ impl AppConfig {
         let rustfs_access_key = env_required("PATRICK_IM_RUSTFS_ACCESS_KEY")?;
         let rustfs_secret_key = env_required("PATRICK_IM_RUSTFS_SECRET_KEY")?;
         let session_secret = env_required("PATRICK_IM_SESSION_SECRET")?;
+        let secure_cookies = env_bool_or(
+            "PATRICK_IM_SECURE_COOKIES",
+            public_base_url.starts_with("https://"),
+        );
         let recent_message_limit = env_usize_or("PATRICK_IM_RECENT_MESSAGE_LIMIT", 60);
 
         Ok(Self {
@@ -60,6 +65,7 @@ impl AppConfig {
             rustfs_access_key,
             rustfs_secret_key,
             session_secret,
+            secure_cookies,
             recent_message_limit,
         })
     }
@@ -102,5 +108,16 @@ fn env_usize_or(key: &str, fallback: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
+        .unwrap_or(fallback)
+}
+
+fn env_bool_or(key: &str, fallback: bool) -> bool {
+    env::var(key)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
         .unwrap_or(fallback)
 }

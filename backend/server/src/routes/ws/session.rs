@@ -1,8 +1,8 @@
 use super::commands::handle_client_message;
 use crate::protocol::{ClientToServerMessage, ServerToClientMessage};
 use crate::state::{AppState, CLIENT_QUEUE_CAPACITY, ClientTx};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket};
 use futures_util::{SinkExt, StreamExt};
-use salvo::websocket::{Message, WebSocket};
 use tokio::sync::{mpsc, watch};
 
 pub(super) async fn handle_socket(
@@ -14,6 +14,7 @@ pub(super) async fn handle_socket(
 ) {
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<String>(CLIENT_QUEUE_CAPACITY);
+    let (control_tx, mut control_rx) = mpsc::channel::<Message>(16);
     let (shutdown_tx, _) = watch::channel(false);
     let tx = ClientTx::new(outbound_tx, shutdown_tx);
 
@@ -33,7 +34,15 @@ pub(super) async fn handle_socket(
                     let Some(outbound) = outbound else {
                         break;
                     };
-                    if ws_tx.send(Message::text(outbound)).await.is_err() {
+                    if ws_tx.send(Message::Text(Utf8Bytes::from(outbound))).await.is_err() {
+                        break;
+                    }
+                }
+                control = control_rx.recv() => {
+                    let Some(control) = control else {
+                        break;
+                    };
+                    if ws_tx.send(control).await.is_err() {
                         break;
                     }
                 }
@@ -77,15 +86,14 @@ pub(super) async fn handle_socket(
                 let Some(Ok(message)) = maybe_message else {
                     break;
                 };
-                if message.is_close() {
-                    break;
-                }
-                if !message.is_text() {
-                    continue;
-                }
-
-                let Some(text) = message.as_str().ok().map(ToOwned::to_owned) else {
-                    continue;
+                let text = match message {
+                    Message::Text(text) => text.to_string(),
+                    Message::Ping(bytes) => {
+                        let _ = control_tx.try_send(Message::Pong(bytes));
+                        continue;
+                    }
+                    Message::Close(_) => break,
+                    _ => continue,
                 };
                 if !state
                     .room_hub

@@ -1,4 +1,5 @@
-use salvo::prelude::*;
+use crate::http::ok_json;
+use axum::response::IntoResponse;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
@@ -7,9 +8,8 @@ struct HealthResponse<'a> {
     service: &'a str,
 }
 
-#[handler]
-pub async fn healthz() -> Json<HealthResponse<'static>> {
-    Json(HealthResponse {
+pub async fn healthz() -> impl IntoResponse {
+    ok_json(HealthResponse {
         status: "ok",
         service: "patrick-im-server",
     })

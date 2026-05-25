@@ -1,36 +1,37 @@
+use crate::http::{ApiError, ApiResult};
+use axum::body::Body;
+use axum::extract::Path as AxumPath;
+use axum::http::HeaderMap;
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::response::Response;
 use include_dir::{Dir, File, include_dir};
-use salvo::http::header::{CACHE_CONTROL, CONTENT_TYPE};
-use salvo::prelude::*;
 use std::path::{Component, Path, PathBuf};
 
 static WEB_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web-dist");
 const INDEX_FILE: &str = "index.html";
 
-#[handler]
-pub async fn index(res: &mut Response) -> Result<(), StatusError> {
-    serve_index(res)
+pub async fn index() -> ApiResult<Response> {
+    serve_index()
 }
 
-#[handler]
-pub async fn asset(req: &mut Request, res: &mut Response) -> Result<(), StatusError> {
-    let requested = req.param::<String>("path").unwrap_or_default();
+pub async fn asset(AxumPath(requested): AxumPath<String>) -> ApiResult<Response> {
     let relative = sanitize_relative_path(&requested)
-        .ok_or_else(|| StatusError::bad_request().brief("invalid asset path"))?;
+        .ok_or_else(|| ApiError::bad_request("invalid asset path"))?;
 
     if relative.as_os_str().is_empty() {
-        return serve_index(res);
+        return serve_index();
     }
 
     let normalized = normalize_asset_key(&relative);
     if let Some(file) = WEB_DIST.get_file(&normalized) {
-        return serve_file(file, immutable_cache(&relative), res);
+        return serve_file(file, immutable_cache(&relative));
     }
 
     if looks_like_asset_path(&relative) {
-        return Err(StatusError::not_found().brief("file not found"));
+        return Err(ApiError::not_found("file not found"));
     }
 
-    serve_index(res)
+    serve_index()
 }
 
 fn sanitize_relative_path(input: &str) -> Option<PathBuf> {
@@ -71,35 +72,37 @@ fn looks_like_asset_path(path: &Path) -> bool {
         .is_some()
 }
 
-fn serve_index(res: &mut Response) -> Result<(), StatusError> {
+fn serve_index() -> ApiResult<Response> {
     let index_file = WEB_DIST
         .get_file(INDEX_FILE)
-        .ok_or_else(|| StatusError::service_unavailable().brief("web bundle is not embedded"))?;
-    serve_file(index_file, false, res)
+        .ok_or_else(|| ApiError::service_unavailable("web bundle is not embedded"))?;
+    serve_file(index_file, false)
 }
 
-fn serve_file(
-    file: &File<'_>,
-    immutable_cache: bool,
-    res: &mut Response,
-) -> Result<(), StatusError> {
+fn serve_file(file: &File<'_>, immutable_cache: bool) -> ApiResult<Response> {
     let content_type = mime_guess::from_path(file.path()).first_or_octet_stream();
-
-    res.status_code = Some(StatusCode::OK);
-    res.headers_mut().insert(
+    let mut headers = HeaderMap::new();
+    headers.insert(
         CONTENT_TYPE,
-        salvo::http::HeaderValue::from_str(content_type.as_ref())
-            .map_err(|_| StatusError::internal_server_error())?,
+        content_type
+            .as_ref()
+            .parse()
+            .map_err(|_| ApiError::internal("invalid content-type header"))?,
     );
-    res.headers_mut().insert(
+    headers.insert(
         CACHE_CONTROL,
         if immutable_cache {
-            salvo::http::HeaderValue::from_static("public, max-age=31536000, immutable")
+            "public, max-age=31536000, immutable"
         } else {
-            salvo::http::HeaderValue::from_static("no-cache")
-        },
+            "no-cache"
+        }
+        .parse()
+        .map_err(|_| ApiError::internal("invalid cache-control header"))?,
     );
-    res.write_body(file.contents().to_vec())
-        .map_err(|_| StatusError::internal_server_error())?;
-    Ok(())
+
+    let mut response = Response::builder()
+        .body(Body::from(file.contents().to_vec()))
+        .map_err(ApiError::from_internal)?;
+    *response.headers_mut() = headers;
+    Ok(response)
 }

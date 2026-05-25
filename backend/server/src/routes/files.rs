@@ -1,3 +1,4 @@
+use crate::http::{ApiError, ApiResult, JsonResponse, ok_json};
 use crate::protocol::{
     RelayAbortUploadRequest, RelayCompleteUploadRequest, RelayCompleteUploadResponse,
     RelayDiscardUploadRequest, RelayUploadPartAckRequest, RelayUploadRequest, RelayUploadResponse,
@@ -10,8 +11,12 @@ use crate::store::message_store::{
     StoreRelayUploadRequestOutcome,
 };
 use crate::utils::{encode_content_disposition_name, sanitize_file_name, sanitize_room_id};
-use salvo::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
-use salvo::prelude::*;
+use axum::Json;
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::HeaderMap;
+use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
+use axum::response::Response;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
@@ -27,30 +32,20 @@ struct NormalizedRelayUploadRequest {
     target_id: Option<String>,
 }
 
-#[handler]
 pub async fn upload_request(
-    req: &mut Request,
-    depot: &mut Depot,
-) -> Result<Json<RelayUploadResponse>, StatusError> {
-    let state = depot
-        .obtain::<AppState>()
-        .map_err(|_| StatusError::internal_server_error())?;
-    let session = require_session(req, &state.config.session_secret)
-        .map_err(|error| {
-            StatusError::internal_server_error().brief(format!("session decode error: {error}"))
-        })?
-        .ok_or_else(|| StatusError::unauthorized().brief("missing session"))?;
-
-    let payload = req
-        .parse_body::<RelayUploadRequest>()
-        .await
-        .map_err(|_| StatusError::bad_request().brief("invalid upload request"))?;
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<RelayUploadRequest>,
+) -> JsonResponse<RelayUploadResponse> {
+    let session = require_session(&headers, &state.config.session_secret)
+        .map_err(|error| ApiError::internal(format!("session decode error: {error}")))?
+        .ok_or_else(|| ApiError::unauthorized("missing session"))?;
 
     if payload.fileName.trim().is_empty() || payload.roomId.trim().is_empty() || payload.size == 0 {
-        return Err(StatusError::bad_request().brief("file metadata is incomplete"));
+        return Err(ApiError::bad_request("file metadata is incomplete"));
     }
     if payload.size > RELAY_FILE_LIMIT_BYTES {
-        return Err(StatusError::payload_too_large().brief(format!(
+        return Err(ApiError::payload_too_large(format!(
             "file too large for relay mode ({RELAY_FILE_LIMIT_BYTES} bytes max)"
         )));
     }
@@ -60,15 +55,15 @@ pub async fn upload_request(
         .message_store
         .find_relay_upload_request(&session.clientId, &normalized.client_request_id)
         .await
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?
+        .map_err(ApiError::from_internal)?
     {
         validate_relay_upload_request_record(&existing, &session.clientId, &normalized)
-            .map_err(|error| StatusError::conflict().brief(error.to_string()))?;
+            .map_err(ApiError::from_conflict)?;
         let uploaded_parts = state
             .message_store
             .list_relay_upload_parts(&existing.file_id)
             .await
-            .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+            .map_err(ApiError::from_internal)?;
         let response = state
             .relay_store
             .resume_upload(
@@ -86,15 +81,15 @@ pub async fn upload_request(
                 uploaded_parts,
             )
             .await
-            .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
-        return Ok(Json(response));
+            .map_err(ApiError::from_internal)?;
+        return Ok(ok_json(response));
     }
 
     let created = state
         .relay_store
         .create_upload(&session, payload)
         .await
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+        .map_err(ApiError::from_internal)?;
     let record = RelayUploadRequestRecord {
         from_id: session.clientId.clone(),
         request_id: normalized.client_request_id.clone(),
@@ -113,9 +108,9 @@ pub async fn upload_request(
         .message_store
         .store_relay_upload_request(&record)
         .await
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?
+        .map_err(ApiError::from_internal)?
     {
-        StoreRelayUploadRequestOutcome::Inserted => Ok(Json(created.response)),
+        StoreRelayUploadRequestOutcome::Inserted => Ok(ok_json(created.response)),
         StoreRelayUploadRequestOutcome::Existing(existing) => {
             if let Err(error) = state
                 .relay_store
@@ -130,12 +125,12 @@ pub async fn upload_request(
             }
 
             validate_relay_upload_request_record(&existing, &session.clientId, &normalized)
-                .map_err(|error| StatusError::conflict().brief(error.to_string()))?;
+                .map_err(ApiError::from_conflict)?;
             let uploaded_parts = state
                 .message_store
                 .list_relay_upload_parts(&existing.file_id)
                 .await
-                .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+                .map_err(ApiError::from_internal)?;
             let response = state
                 .relay_store
                 .resume_upload(
@@ -153,77 +148,59 @@ pub async fn upload_request(
                     uploaded_parts,
                 )
                 .await
-                .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
-            Ok(Json(response))
+                .map_err(ApiError::from_internal)?;
+            Ok(ok_json(response))
         }
     }
 }
 
-#[handler]
 pub async fn ack_upload_part(
-    req: &mut Request,
-    depot: &mut Depot,
-) -> Result<Json<serde_json::Value>, StatusError> {
-    let state = depot
-        .obtain::<AppState>()
-        .map_err(|_| StatusError::internal_server_error())?;
-    let session = require_session(req, &state.config.session_secret)
-        .map_err(|error| {
-            StatusError::internal_server_error().brief(format!("session decode error: {error}"))
-        })?
-        .ok_or_else(|| StatusError::unauthorized().brief("missing session"))?;
-    let payload = req
-        .parse_body::<RelayUploadPartAckRequest>()
-        .await
-        .map_err(|_| StatusError::bad_request().brief("invalid upload part ack payload"))?;
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<RelayUploadPartAckRequest>,
+) -> JsonResponse<serde_json::Value> {
+    let session = require_session(&headers, &state.config.session_secret)
+        .map_err(|error| ApiError::internal(format!("session decode error: {error}")))?
+        .ok_or_else(|| ApiError::unauthorized("missing session"))?;
     if payload.part.partNumber <= 0 || payload.part.etag.trim().is_empty() {
-        return Err(StatusError::bad_request().brief("invalid upload part ack"));
+        return Err(ApiError::bad_request("invalid upload part ack"));
     }
 
     let upload = state
         .relay_store
         .verify_upload_token(&session, &payload.uploadToken)
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+        .map_err(ApiError::from_internal)?;
     state
         .message_store
         .store_relay_upload_part(&upload.file_id, &payload.part)
         .await
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+        .map_err(ApiError::from_internal)?;
 
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(ok_json(serde_json::json!({ "ok": true })))
 }
 
-#[handler]
 pub async fn complete_upload(
-    req: &mut Request,
-    depot: &mut Depot,
-) -> Result<Json<RelayCompleteUploadResponse>, StatusError> {
-    let state = depot
-        .obtain::<AppState>()
-        .map_err(|_| StatusError::internal_server_error())?;
-    let session = require_session(req, &state.config.session_secret)
-        .map_err(|error| {
-            StatusError::internal_server_error().brief(format!("session decode error: {error}"))
-        })?
-        .ok_or_else(|| StatusError::unauthorized().brief("missing session"))?;
-    let payload = req
-        .parse_body::<RelayCompleteUploadRequest>()
-        .await
-        .map_err(|_| StatusError::bad_request().brief("invalid complete payload"))?;
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<RelayCompleteUploadRequest>,
+) -> JsonResponse<RelayCompleteUploadResponse> {
+    let session = require_session(&headers, &state.config.session_secret)
+        .map_err(|error| ApiError::internal(format!("session decode error: {error}")))?
+        .ok_or_else(|| ApiError::unauthorized("missing session"))?;
     let upload_token = state
         .relay_store
         .describe_upload_token(&session, &payload.uploadToken)
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+        .map_err(ApiError::from_internal)?;
 
     if let Some(existing) = state
         .message_store
         .find_pending_relay_upload(&upload_token.fileId)
         .await
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?
+        .map_err(ApiError::from_internal)?
     {
         validate_pending_upload_matches_token(&existing, &upload_token)
-            .map_err(|error| StatusError::conflict().brief(error.to_string()))?;
-        return Ok(Json(build_complete_upload_response(
+            .map_err(ApiError::from_conflict)?;
+        return Ok(ok_json(build_complete_upload_response(
             &existing.file_id,
             &existing.object_key,
         )));
@@ -236,19 +213,16 @@ pub async fn complete_upload(
                 .message_store
                 .find_pending_relay_upload(&upload_token.fileId)
                 .await
-                .map_err(|db_error| {
-                    StatusError::internal_server_error().brief(db_error.to_string())
-                })?
+                .map_err(ApiError::from_internal)?
             {
-                validate_pending_upload_matches_token(&existing, &upload_token).map_err(
-                    |match_error| StatusError::conflict().brief(match_error.to_string()),
-                )?;
-                return Ok(Json(build_complete_upload_response(
+                validate_pending_upload_matches_token(&existing, &upload_token)
+                    .map_err(ApiError::from_conflict)?;
+                return Ok(ok_json(build_complete_upload_response(
                     &existing.file_id,
                     &existing.object_key,
                 )));
             }
-            return Err(StatusError::internal_server_error().brief(error.to_string()));
+            return Err(ApiError::from_internal(error));
         }
     };
 
@@ -270,8 +244,8 @@ pub async fn complete_upload(
         Ok(StorePendingRelayUploadOutcome::Inserted) => {}
         Ok(StorePendingRelayUploadOutcome::Existing(existing)) => {
             validate_pending_upload_matches_completed(&existing, &completed)
-                .map_err(|error| StatusError::conflict().brief(error.to_string()))?;
-            return Ok(Json(build_complete_upload_response(
+                .map_err(ApiError::from_conflict)?;
+            return Ok(ok_json(build_complete_upload_response(
                 &existing.file_id,
                 &existing.object_key,
             )));
@@ -298,109 +272,85 @@ pub async fn complete_upload(
                 .message_store
                 .remove_relay_upload_request_by_file_id(&completed.file_id)
                 .await;
-            return Err(StatusError::internal_server_error()
-                .brief("failed to persist relay upload metadata"));
+            return Err(ApiError::internal(
+                "failed to persist relay upload metadata",
+            ));
         }
     }
 
-    Ok(Json(build_complete_upload_response(
+    Ok(ok_json(build_complete_upload_response(
         &completed.file_id,
         &completed.object_key,
     )))
 }
 
-#[handler]
 pub async fn abort_upload(
-    req: &mut Request,
-    depot: &mut Depot,
-) -> Result<Json<serde_json::Value>, StatusError> {
-    let state = depot
-        .obtain::<AppState>()
-        .map_err(|_| StatusError::internal_server_error())?;
-    let session = require_session(req, &state.config.session_secret)
-        .map_err(|error| {
-            StatusError::internal_server_error().brief(format!("session decode error: {error}"))
-        })?
-        .ok_or_else(|| StatusError::unauthorized().brief("missing session"))?;
-    let payload = req
-        .parse_body::<RelayAbortUploadRequest>()
-        .await
-        .map_err(|_| StatusError::bad_request().brief("invalid abort payload"))?;
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<RelayAbortUploadRequest>,
+) -> JsonResponse<serde_json::Value> {
+    let session = require_session(&headers, &state.config.session_secret)
+        .map_err(|error| ApiError::internal(format!("session decode error: {error}")))?
+        .ok_or_else(|| ApiError::unauthorized("missing session"))?;
     let upload = state
         .relay_store
         .verify_upload_token(&session, &payload.uploadToken)
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+        .map_err(ApiError::from_internal)?;
 
     let aborted = state
         .relay_store
         .abort_upload(&session, payload)
         .await
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+        .map_err(ApiError::from_internal)?;
     if aborted {
         let _ = state
             .message_store
             .remove_relay_upload_request_by_file_id(&upload.file_id)
             .await;
     }
-    Ok(Json(serde_json::json!({ "aborted": aborted })))
+    Ok(ok_json(serde_json::json!({ "aborted": aborted })))
 }
 
-#[handler]
 pub async fn discard_upload(
-    req: &mut Request,
-    depot: &mut Depot,
-) -> Result<Json<serde_json::Value>, StatusError> {
-    let state = depot
-        .obtain::<AppState>()
-        .map_err(|_| StatusError::internal_server_error())?;
-    let session = require_session(req, &state.config.session_secret)
-        .map_err(|error| {
-            StatusError::internal_server_error().brief(format!("session decode error: {error}"))
-        })?
-        .ok_or_else(|| StatusError::unauthorized().brief("missing session"))?;
-    let payload = req
-        .parse_body::<RelayDiscardUploadRequest>()
-        .await
-        .map_err(|_| StatusError::bad_request().brief("invalid discard payload"))?;
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<RelayDiscardUploadRequest>,
+) -> JsonResponse<serde_json::Value> {
+    let session = require_session(&headers, &state.config.session_secret)
+        .map_err(|error| ApiError::internal(format!("session decode error: {error}")))?
+        .ok_or_else(|| ApiError::unauthorized("missing session"))?;
 
     let upload = state
         .relay_store
         .verify_upload_token(&session, &payload.uploadToken)
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+        .map_err(ApiError::from_internal)?;
     state
         .message_store
         .remove_pending_relay_upload(&upload.file_id)
         .await
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+        .map_err(ApiError::from_internal)?;
     state
         .message_store
         .remove_relay_upload_request_by_file_id(&upload.file_id)
         .await
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
+        .map_err(ApiError::from_internal)?;
     state
         .relay_store
         .delete_object_by_key(&upload.object_key)
         .await
-        .map_err(|error| StatusError::internal_server_error().brief(error.to_string()))?;
-    Ok(Json(serde_json::json!({ "discarded": true })))
+        .map_err(ApiError::from_internal)?;
+    Ok(ok_json(serde_json::json!({ "discarded": true })))
 }
 
-#[handler]
 pub async fn file_access(
-    req: &mut Request,
-    depot: &mut Depot,
-    res: &mut Response,
-) -> Result<(), StatusError> {
-    let state = depot
-        .obtain::<AppState>()
-        .map_err(|_| StatusError::internal_server_error())?;
-    let room_id = sanitize_room_id(&req.param::<String>("room_id").unwrap_or_default());
-    let file_id = req.param::<String>("file_id").unwrap_or_default();
-    let session = require_session(req, &state.config.session_secret)
-        .map_err(|error| {
-            StatusError::internal_server_error().brief(format!("session decode error: {error}"))
-        })?
-        .ok_or_else(|| StatusError::unauthorized().brief("missing session"))?;
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((room_id, file_id)): Path<(String, String)>,
+) -> ApiResult<Response> {
+    let room_id = sanitize_room_id(&room_id);
+    let session = require_session(&headers, &state.config.session_secret)
+        .map_err(|error| ApiError::internal(format!("session decode error: {error}")))?
+        .ok_or_else(|| ApiError::unauthorized("missing session"))?;
 
     let descriptor = match state
         .message_store
@@ -409,10 +359,10 @@ pub async fn file_access(
     {
         Ok(descriptor) => descriptor,
         Err(FileLookupError::NotFound) => {
-            return Err(StatusError::not_found().brief("file not found"));
+            return Err(ApiError::not_found("file not found"));
         }
         Err(FileLookupError::Forbidden) => {
-            return Err(StatusError::forbidden().brief("file not accessible"));
+            return Err(ApiError::forbidden("file not accessible"));
         }
     };
 
@@ -420,33 +370,39 @@ pub async fn file_access(
         .relay_store
         .get_object(&descriptor.objectKey)
         .await
-        .map_err(|error| StatusError::not_found().brief(error.to_string()))?;
+        .map_err(ApiError::from_not_found)?;
 
+    let mut headers = HeaderMap::new();
     if let Some(content_type) = object.content_type() {
-        res.headers_mut().insert(
+        headers.insert(
             CONTENT_TYPE,
-            salvo::http::HeaderValue::from_str(content_type)
-                .map_err(|_| StatusError::internal_server_error())?,
+            content_type
+                .parse()
+                .map_err(|_| ApiError::internal("invalid content-type header"))?,
         );
     }
     if let Some(length) = object.content_length() {
-        res.headers_mut().insert(
+        headers.insert(
             CONTENT_LENGTH,
-            salvo::http::HeaderValue::from_str(&length.to_string())
-                .map_err(|_| StatusError::internal_server_error())?,
+            length
+                .to_string()
+                .parse()
+                .map_err(|_| ApiError::internal("invalid content-length header"))?,
         );
     }
     if let Some(etag) = object.e_tag() {
-        res.headers_mut().insert(
+        headers.insert(
             ETAG,
-            salvo::http::HeaderValue::from_str(etag)
-                .map_err(|_| StatusError::internal_server_error())?,
+            etag.parse()
+                .map_err(|_| ApiError::internal("invalid etag header"))?,
         );
     }
 
-    res.headers_mut().insert(
+    headers.insert(
         CACHE_CONTROL,
-        salvo::http::HeaderValue::from_static("private, no-store"),
+        "private, no-store"
+            .parse()
+            .map_err(|_| ApiError::internal("invalid cache-control header"))?,
     );
     let disposition = if descriptor.previewable {
         format!(
@@ -459,15 +415,23 @@ pub async fn file_access(
             encode_content_disposition_name(&descriptor.fileName)
         )
     };
-    res.headers_mut().insert(
+    headers.insert(
         CONTENT_DISPOSITION,
-        salvo::http::HeaderValue::from_str(&disposition)
-            .map_err(|_| StatusError::internal_server_error())?,
+        disposition
+            .parse()
+            .map_err(|_| ApiError::internal("invalid content-disposition header"))?,
     );
 
     let stream = ReaderStream::new(object.body.into_async_read());
-    res.stream(stream);
-    Ok(())
+    build_response(headers, Body::from_stream(stream))
+}
+
+fn build_response(headers: HeaderMap, body: Body) -> ApiResult<Response> {
+    let mut response = Response::builder()
+        .body(body)
+        .map_err(ApiError::from_internal)?;
+    *response.headers_mut() = headers;
+    Ok(response)
 }
 
 fn normalize_upload_request(request: &RelayUploadRequest) -> NormalizedRelayUploadRequest {

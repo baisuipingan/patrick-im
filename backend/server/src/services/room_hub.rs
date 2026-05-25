@@ -1,6 +1,7 @@
 use crate::protocol::{RoomPeer, ServerToClientMessage};
 use crate::state::{ClientSendError, ClientTx};
 use crate::utils::{now_ms, sanitize_nickname};
+use axum::http::StatusCode;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -249,14 +250,14 @@ impl RoomHub {
         }
     }
 
-    pub fn send_json<T>(&self, tx: &ClientTx, payload: &T) -> Result<(), salvo::http::StatusCode>
+    pub fn send_json<T>(&self, tx: &ClientTx, payload: &T) -> Result<(), StatusCode>
     where
         T: Serialize,
     {
-        let encoded = serde_json::to_string(payload)
-            .map_err(|_| salvo::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        let encoded =
+            serde_json::to_string(payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         tx.try_send(encoded)
-            .map_err(|_| salvo::http::StatusCode::SERVICE_UNAVAILABLE)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
     }
 }
 
