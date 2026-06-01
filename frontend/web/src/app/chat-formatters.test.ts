@@ -33,6 +33,8 @@ describe('chat-formatters', () => {
 
   it('describes direct path kinds with current product wording', () => {
     expect(directPathLabel({ kind: 'lan' })).toBe('局域网直连');
+    expect(directPathLabel({ kind: 'stun' })).toBe('公网直连');
+    expect(directPathDescription({ kind: 'stun' })).toContain('数据不经过中继服务器');
     expect(directPathLabel({ kind: 'turn' })).toBe('中继');
     expect(directPathDescription({ kind: 'unknown' })).toContain('发送文件时会走中继');
   });

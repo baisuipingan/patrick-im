@@ -123,8 +123,8 @@ interface PeerSession {
   pendingCandidates: RTCIceCandidateInit[];
   pathInfoKey?: string;
   pathPollTimerId?: number;
-  lastLocalLanCandidate?: ParsedIceCandidate;
-  lastRemoteLanCandidate?: ParsedIceCandidate;
+  lastLocalDirectCandidate?: ParsedIceCandidate;
+  lastRemoteDirectCandidate?: ParsedIceCandidate;
 }
 
 function getBinarySize(chunk: ArrayBuffer | Blob): number {
@@ -175,8 +175,15 @@ function classifyDirectPath(
     return 'turn';
   }
 
-  if (isDirectCandidateType(localCandidateType) || isDirectCandidateType(remoteCandidateType)) {
+  if (
+    isLocalNetworkCandidate(localCandidateType, localAddress) &&
+    isLocalNetworkCandidate(remoteCandidateType, remoteAddress)
+  ) {
     return 'lan';
+  }
+
+  if (isDirectCandidateType(localCandidateType) || isDirectCandidateType(remoteCandidateType)) {
+    return 'stun';
   }
 
   return 'unknown';
@@ -230,17 +237,13 @@ function parseIceCandidate(candidate?: RTCIceCandidateInit | RTCIceCandidate | n
   };
 }
 
-function isLanIceCandidate(candidate?: RTCIceCandidateInit | RTCIceCandidate | null): boolean {
+function isDirectIceCandidate(candidate?: RTCIceCandidateInit | RTCIceCandidate | null): boolean {
   const parsed = parseIceCandidate(candidate);
-  if (parsed.candidateType !== 'host') {
-    return false;
-  }
-
-  if (!parsed.address) {
+  if (parsed.candidateType === 'srflx' || parsed.candidateType === 'prflx') {
     return true;
   }
 
-  return isMdnsHost(parsed.address) || isPrivateIpAddress(parsed.address);
+  return isLocalNetworkCandidate(parsed.candidateType, parsed.address);
 }
 
 function isLocalNetworkCandidate(candidateType?: string, address?: string): boolean {
@@ -332,7 +335,7 @@ export class PeerMesh {
     }
 
     const pc = new RTCPeerConnection({
-      iceServers: [],
+      iceServers: this.callbacks.iceServers,
     });
     const session: PeerSession = {
       peer,
@@ -345,10 +348,10 @@ export class PeerMesh {
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         const candidate = event.candidate.toJSON();
-        if (!isLanIceCandidate(candidate)) {
+        if (!isDirectIceCandidate(candidate)) {
           return;
         }
-        session.lastLocalLanCandidate = parseIceCandidate(candidate);
+        session.lastLocalDirectCandidate = parseIceCandidate(candidate);
         this.callbacks.sendSignal(peer.clientId, {
           candidate,
         });
@@ -431,8 +434,8 @@ export class PeerMesh {
       }
     }
 
-    if (payload.candidate && isLanIceCandidate(payload.candidate)) {
-      session.lastRemoteLanCandidate = parseIceCandidate(payload.candidate);
+    if (payload.candidate && isDirectIceCandidate(payload.candidate)) {
+      session.lastRemoteDirectCandidate = parseIceCandidate(payload.candidate);
       if (session.pc.remoteDescription) {
         await session.pc.addIceCandidate(payload.candidate);
       } else {
@@ -1231,8 +1234,8 @@ export class PeerMesh {
         typeof localCandidate?.candidateType === 'string' ? localCandidate.candidateType : undefined;
       const remoteCandidateType =
         typeof remoteCandidate?.candidateType === 'string' ? remoteCandidate.candidateType : undefined;
-      const localFallback = session.lastLocalLanCandidate;
-      const remoteFallback = session.lastRemoteLanCandidate;
+      const localFallback = session.lastLocalDirectCandidate;
+      const remoteFallback = session.lastRemoteDirectCandidate;
       const localAddress = readCandidateAddress(localCandidate) ?? localFallback?.address;
       const remoteAddress = readCandidateAddress(remoteCandidate) ?? remoteFallback?.address;
       const resolvedLocalCandidateType = localCandidateType ?? localFallback?.candidateType;

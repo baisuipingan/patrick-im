@@ -110,7 +110,7 @@ export function directPathLabel(path?: { kind?: 'lan' | 'stun' | 'turn' | 'unkno
     case 'lan':
       return '局域网直连';
     case 'stun':
-      return '局域网直连';
+      return '公网直连';
     case 'turn':
       return '中继';
     case 'unknown':
@@ -125,7 +125,7 @@ export function directPathDescription(path?: { kind?: 'lan' | 'stun' | 'turn' | 
     case 'lan':
       return '当前是局域网 WebRTC 直连。';
     case 'stun':
-      return '当前是局域网 WebRTC 直连。';
+      return '当前是 STUN 打洞后的 WebRTC 直连，数据不经过中继服务器。';
     case 'turn':
       return '当前实际经过中继链路，这种情况通常会慢很多。';
     case 'unknown':
