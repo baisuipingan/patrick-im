@@ -1,6 +1,36 @@
 import type { SessionResponse, TransferMode } from '@shared/protocol';
 import type { PendingAttachment, UiMessage } from '@/app/types';
 
+export const MAX_CHAT_TEXT_BYTES = 1024 * 1024;
+export const TEXT_ATTACHMENT_THRESHOLD_BYTES = 200 * 1024;
+
+export function getChatTextByteLength(text: string): number {
+  return new TextEncoder().encode(text).byteLength;
+}
+
+export function isChatTextWithinLimit(text: string): boolean {
+  return getChatTextByteLength(text) <= MAX_CHAT_TEXT_BYTES;
+}
+
+export function shouldSendTextAsAttachment(text: string): boolean {
+  return getChatTextByteLength(text) > TEXT_ATTACHMENT_THRESHOLD_BYTES;
+}
+
+export function createTextAttachmentFile(text: string, now = new Date()): File {
+  const timestamp = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+    '-',
+    String(now.getHours()).padStart(2, '0'),
+    String(now.getMinutes()).padStart(2, '0'),
+    String(now.getSeconds()).padStart(2, '0'),
+  ].join('');
+  return new File([text], `message-${timestamp}.txt`, {
+    type: 'text/plain;charset=utf-8',
+  });
+}
+
 export function canUseDirectTransfer(options: {
   directState: string | undefined;
   effectiveTransferMode: TransferMode;

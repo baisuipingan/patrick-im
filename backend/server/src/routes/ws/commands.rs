@@ -1,4 +1,4 @@
-use crate::protocol::{ClientToServerMessage, ServerToClientMessage};
+use crate::protocol::{ClientToServerMessage, MAX_CHAT_TEXT_BYTES, ServerToClientMessage};
 use crate::state::{AppState, ClientTx};
 use crate::store::message_store::{PersistRelayFileMessageOutcome, normalize_target_id};
 
@@ -23,7 +23,7 @@ pub(super) async fn handle_client_message(
             rename_peer(state, room_id, client_id, connection_id, nickname).await;
         }
         ClientToServerMessage::ChatSend { text, targetId } => {
-            handle_chat_send(state, room_id, client_id, connection_id, text, targetId).await;
+            handle_chat_send(state, room_id, client_id, connection_id, tx, text, targetId).await;
         }
         ClientToServerMessage::Signal { targetId, payload } => {
             forward_signal(state, room_id, client_id, connection_id, &targetId, payload).await;
@@ -65,10 +65,22 @@ async fn handle_chat_send(
     room_id: &str,
     client_id: &str,
     connection_id: &str,
+    tx: &ClientTx,
     text: String,
     target_id: Option<String>,
 ) {
-    if text.trim().is_empty() {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    if text.len() > MAX_CHAT_TEXT_BYTES {
+        let _ = state.room_hub.send_json(
+            tx,
+            &ServerToClientMessage::Error {
+                code: "chat_text_too_large".to_owned(),
+                message: "文字内容太长，请拆成多条发送或作为文件发送。".to_owned(),
+            },
+        );
         return;
     }
     if !state
@@ -90,12 +102,19 @@ async fn handle_chat_send(
         .map(|target| vec![client_id.to_owned(), target]);
     let message = match state
         .message_store
-        .persist_text_message(room_id, client_id, &from_name, normalized_target, &text)
+        .persist_text_message(room_id, client_id, &from_name, normalized_target, text)
         .await
     {
         Ok(message) => message,
         Err(error) => {
             tracing::error!(room_id, client_id, error = %error, "failed to persist text message");
+            let _ = state.room_hub.send_json(
+                tx,
+                &ServerToClientMessage::Error {
+                    code: "chat_text_persist_failed".to_owned(),
+                    message: "文字发送失败，请稍后重试。".to_owned(),
+                },
+            );
             return;
         }
     };

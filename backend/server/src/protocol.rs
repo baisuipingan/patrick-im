@@ -4,6 +4,8 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const MAX_CHAT_TEXT_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct IceServer {
     pub urls: Vec<String>,

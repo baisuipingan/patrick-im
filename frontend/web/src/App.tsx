@@ -70,7 +70,13 @@ import {
   removePeerFromList,
   upsertPeerList,
 } from '@/app/room-state';
-import { buildDirectFileMessage, canUseDirectTransfer, collectSendPayload } from '@/app/send-actions';
+import {
+  buildDirectFileMessage,
+  canUseDirectTransfer,
+  collectSendPayload,
+  createTextAttachmentFile,
+  shouldSendTextAsAttachment,
+} from '@/app/send-actions';
 import { handleServerEventMessage } from '@/app/server-events';
 import {
   clearThreadMessages,
@@ -1044,20 +1050,26 @@ export default function App() {
     if (!text && files.length === 0) {
       return;
     }
+    const textFile = text && shouldSendTextAsAttachment(text) ? createTextAttachmentFile(text) : null;
+    const textToSend = textFile ? '' : text;
+    const filesToSend = textFile ? [{ id: '', file: textFile }, ...files] : files;
 
     setIsSending(true);
 
     try {
-      if (text) {
-        sendServerMessage({
+      if (textToSend) {
+        const sent = sendServerMessage({
           type: 'chat-send',
-          text,
+          text: textToSend,
           targetId: activePeerId,
         });
+        if (!sent) {
+          throw new Error('socket_not_connected');
+        }
       }
 
-      for (const item of files) {
-        await handleSingleFile(item.file, activePeerId, item.id);
+      for (const item of filesToSend) {
+        await handleSingleFile(item.file, activePeerId, item.id || undefined);
       }
 
       setComposer('');
