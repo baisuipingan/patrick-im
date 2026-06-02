@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS message_records (
   kind VARCHAR(64) COLLATE utf8mb4_unicode_ci NOT NULL,
   created_at BIGINT NOT NULL,
   transport VARCHAR(64) COLLATE utf8mb4_unicode_ci NOT NULL,
-  text LONGTEXT COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  text TEXT COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   relay_file_id VARCHAR(191) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
   PRIMARY KEY (id),
   KEY index_message_records_by_room_id (room_id),
@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS relay_file_records (
 ALTER TABLE message_records
   MODIFY COLUMN kind VARCHAR(64) COLLATE utf8mb4_unicode_ci NOT NULL,
   MODIFY COLUMN transport VARCHAR(64) COLLATE utf8mb4_unicode_ci NOT NULL,
-  MODIFY COLUMN text LONGTEXT COLLATE utf8mb4_unicode_ci DEFAULT NULL;
+  MODIFY COLUMN text TEXT COLLATE utf8mb4_unicode_ci DEFAULT NULL;
 
 ALTER TABLE relay_file_records
   MODIFY COLUMN file_name VARCHAR(512) COLLATE utf8mb4_unicode_ci NOT NULL,
