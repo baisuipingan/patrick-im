@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 const RELAY_CHUNK_SIZE_BYTES: usize = 5 * 1024 * 1024;
 const RELAY_UPLOAD_URL_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+const RELAY_DOWNLOAD_URL_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
@@ -319,6 +320,28 @@ impl RelayStore {
             .send()
             .await
             .with_context(|| format!("failed to fetch relay object {object_key}"))
+    }
+
+    pub async fn create_presigned_download_url(
+        &self,
+        object_key: &str,
+        content_disposition: String,
+        content_type: String,
+    ) -> Result<String> {
+        let presigning_config =
+            PresigningConfig::expires_in(RELAY_DOWNLOAD_URL_TTL).context("invalid presign ttl")?;
+        let presigned = self
+            .presign_client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(object_key)
+            .response_content_disposition(content_disposition)
+            .response_content_type(content_type)
+            .presigned(presigning_config)
+            .await
+            .with_context(|| format!("failed to presign relay download {object_key}"))?;
+
+        Ok(presigned.uri().to_owned())
     }
 
     fn read_upload_token(&self, token: &str) -> Result<RelayUploadTokenPayload> {

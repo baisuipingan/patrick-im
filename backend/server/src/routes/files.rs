@@ -12,12 +12,10 @@ use crate::store::message_store::{
 };
 use crate::utils::{encode_content_disposition_name, sanitize_file_name, sanitize_room_id};
 use axum::Json;
-use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
-use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG};
+use axum::http::header::LOCATION;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 const RELAY_FILE_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -366,44 +364,6 @@ pub async fn file_access(
         }
     };
 
-    let object = state
-        .relay_store
-        .get_object(&descriptor.objectKey)
-        .await
-        .map_err(ApiError::from_not_found)?;
-
-    let mut headers = HeaderMap::new();
-    if let Some(content_type) = object.content_type() {
-        headers.insert(
-            CONTENT_TYPE,
-            content_type
-                .parse()
-                .map_err(|_| ApiError::internal("invalid content-type header"))?,
-        );
-    }
-    if let Some(length) = object.content_length() {
-        headers.insert(
-            CONTENT_LENGTH,
-            length
-                .to_string()
-                .parse()
-                .map_err(|_| ApiError::internal("invalid content-length header"))?,
-        );
-    }
-    if let Some(etag) = object.e_tag() {
-        headers.insert(
-            ETAG,
-            etag.parse()
-                .map_err(|_| ApiError::internal("invalid etag header"))?,
-        );
-    }
-
-    headers.insert(
-        CACHE_CONTROL,
-        "private, no-store"
-            .parse()
-            .map_err(|_| ApiError::internal("invalid cache-control header"))?,
-    );
     let disposition = if descriptor.previewable {
         format!(
             "inline; filename*=UTF-8''{}",
@@ -415,23 +375,21 @@ pub async fn file_access(
             encode_content_disposition_name(&descriptor.fileName)
         )
     };
-    headers.insert(
-        CONTENT_DISPOSITION,
-        disposition
-            .parse()
-            .map_err(|_| ApiError::internal("invalid content-disposition header"))?,
-    );
-
-    let stream = ReaderStream::new(object.body.into_async_read());
-    build_response(headers, Body::from_stream(stream))
-}
-
-fn build_response(headers: HeaderMap, body: Body) -> ApiResult<Response> {
-    let mut response = Response::builder()
-        .body(body)
+    let url = state
+        .relay_store
+        .create_presigned_download_url(
+            &descriptor.objectKey,
+            disposition,
+            descriptor.contentType.clone(),
+        )
+        .await
         .map_err(ApiError::from_internal)?;
-    *response.headers_mut() = headers;
-    Ok(response)
+
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(LOCATION, url)
+        .body(axum::body::Body::empty())
+        .map_err(ApiError::from_internal)
 }
 
 fn normalize_upload_request(request: &RelayUploadRequest) -> NormalizedRelayUploadRequest {
