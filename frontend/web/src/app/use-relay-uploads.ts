@@ -67,21 +67,8 @@ export interface RelayUploadControls {
   resumeRelayUpload: (transferId: string) => Promise<boolean>;
 }
 
-async function ackRelayUploadPart(task: RelayUploadTask, part: RelayUploadPartResponse): Promise<void> {
-  const response = await fetch('/api/files/upload-part', {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-    },
-    body: JSON.stringify({
-      uploadToken: task.uploadToken,
-      part,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error('relay_upload_part_ack_failed');
-  }
+async function ackRelayUploadPart(_task: RelayUploadTask, _part: RelayUploadPartResponse): Promise<void> {
+  // Uploading a part now stores and acknowledges it in one request.
 }
 
 export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadControls {
@@ -486,7 +473,7 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
           : buildRelayUploadNote(
               task.totalParts,
               task.concurrency,
-              wasOfflinePaused ? '网络已恢复，继续直传到中继存储' : '继续直传到中继存储',
+              wasOfflinePaused ? '网络已恢复，继续上传到服务器存储' : '继续上传到服务器存储',
             ),
     });
 
@@ -703,7 +690,7 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
       }
 
       const payload = (await uploadRequest.json()) as RelayUploadResponse;
-      const totalParts = payload.partUrls.length;
+      const totalParts = payload.parts.length;
       const concurrency = getRelayUploadConcurrency(file.size, totalParts);
       task = {
         transferId: payload.fileId,
@@ -719,8 +706,8 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
         totalBytes: file.size,
         totalParts,
         concurrency,
-        partUrlsByNumber: new Map(payload.partUrls.map((part) => [part.partNumber, part])),
-        pendingPartNumbers: payload.partUrls.map((part) => part.partNumber),
+        partsByNumber: new Map(payload.parts.map((part) => [part.partNumber, part])),
+        pendingPartNumbers: payload.parts.map((part) => part.partNumber),
         inFlightPartNumbers: new Set(),
         uploadedParts: new Map(),
         loadedByPart: new Map(),
@@ -754,8 +741,8 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
         status: 'pending',
         note:
           task.uploadedParts.size > 0
-            ? buildRelayUploadNote(totalParts, concurrency, '继续直传到中继存储')
-            : '等待直传到中继存储',
+            ? buildRelayUploadNote(totalParts, concurrency, '继续上传到服务器存储')
+            : '等待上传到服务器存储',
       });
       if (pendingAttachmentId) {
         removePendingFile(pendingAttachmentId);

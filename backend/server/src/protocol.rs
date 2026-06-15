@@ -172,7 +172,7 @@ pub struct RelayUploadResponse {
     pub chunkSizeBytes: u64,
     #[serde(default)]
     pub uploadedParts: Vec<RelayUploadedPart>,
-    pub partUrls: Vec<RelayPresignedPart>,
+    pub parts: Vec<RelayUploadPart>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,17 +182,9 @@ pub struct RelayUploadedPart {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RelayPresignedPart {
+pub struct RelayUploadPart {
     pub partNumber: i32,
-    pub url: String,
-    #[serde(default)]
-    pub headers: Vec<RelayPresignedHeader>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RelayPresignedHeader {
-    pub name: String,
-    pub value: String,
+    pub uploadUrl: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

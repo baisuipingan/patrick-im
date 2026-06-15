@@ -1,12 +1,12 @@
 # Patrick IM
 
-Patrick IM 是一个轻量级网页即时通讯项目，面向小团队、朋友之间或临时房间聊天场景。前端使用 React + Vite，后端使用 Rust + Axum，支持 WebSocket 实时消息、点对点信令、聊天记录持久化，以及基于 RustFS/S3 的中继文件传输。
+Patrick IM 是一个轻量级网页即时通讯项目，面向小团队、朋友之间或临时房间聊天场景。前端使用 React + Vite，后端使用 Rust + Axum，支持 WebSocket 实时消息、点对点信令、聊天记录持久化，以及本地磁盘文件传输。
 
 ## 功能特性
 
 - 房间制聊天：通过房间 ID 加入同一个实时会话。
 - WebSocket 实时通信：在线成员、文本消息、WebRTC 信令都走后端房间 hub。
-- 直连优先、Relay 兜底：前端可优先尝试点对点传输，必要时使用 RustFS/S3 中继文件。
+- 直连优先、Relay 兜底：前端可优先尝试点对点传输，必要时使用服务器本地文件存储中继。
 - 聊天记录持久化：MySQL 保存可见消息、线程清理和中继文件元数据。
 - 单二进制部署：前端构建产物会输出到 `backend/server/web-dist`，Rust 编译时内嵌进服务端。
 - Makefile 运维入口：开发、构建、Docker 打包、部署、日志查看都集中在 `make` 命令里。
@@ -14,8 +14,8 @@ Patrick IM 是一个轻量级网页即时通讯项目，面向小团队、朋友
 ## 技术栈
 
 - 前端：React 19、Vite、TypeScript、Tailwind CSS、Vitest
-- 后端：Rust 1.95、Axum、Tower HTTP、Tokio、SQLx、AWS S3 SDK
-- 存储：MySQL、RustFS/S3-compatible object storage
+- 后端：Rust 1.95、Axum、Tower HTTP、Tokio、SQLx、object_store
+- 存储：MySQL、本地磁盘文件存储
 - 部署：Docker Compose、OpenResty/Nginx 反向代理
 
 ## 项目结构
@@ -38,8 +38,8 @@ Makefile                      开发、构建和部署统一入口
 - Node.js + Corepack
 - pnpm：由 `frontend/web/package.json` 的 `packageManager` 指定
 - MySQL
-- RustFS 或兼容 S3 的对象存储
-- Docker：仅部署或本地启动 RustFS 容器时需要
+- 本地磁盘目录用于文件存储
+- Docker：用于部署服务容器时需要
 
 可以先检查本机工具链：
 
@@ -56,19 +56,6 @@ cp backend/server/.env.local.example backend/server/.env.local
 ```
 
 `make backend-dev` 会优先读取 `backend/server/.env.local`，如果不存在才读取 `backend/server/.env`。
-
-启动本地 RustFS：
-
-```bash
-make rustfs-dev
-```
-
-RustFS 默认地址：
-
-- API：`http://127.0.0.1:9000`
-- Console：`http://127.0.0.1:9001`
-- 默认账号：`rustfsadmin`
-- 默认密码：`rustfsadmin`
 
 启动后端：
 
@@ -105,11 +92,7 @@ Vite 会把 `/api` 和 WebSocket 请求代理到 `http://127.0.0.1:5800`。
 | `PATRICK_IM_PUBLIC_BASE_URL` | 站点公网地址，用于生成公开 URL 和推断 cookie 安全策略 |
 | `PATRICK_IM_SECURE_COOKIES` | 是否给 session cookie 加 `Secure`；生产 HTTPS 建议 `true` |
 | `PATRICK_IM_MYSQL_URL` | MySQL 连接串 |
-| `PATRICK_IM_RUSTFS_ENDPOINT` | 服务端访问 RustFS/S3 的内网地址 |
-| `PATRICK_IM_RUSTFS_PUBLIC_ENDPOINT` | 浏览器直传/直下 RustFS 时使用的公网入口 |
-| `PATRICK_IM_RUSTFS_BUCKET` | 中继文件 bucket |
-| `PATRICK_IM_RUSTFS_ACCESS_KEY` | RustFS/S3 access key |
-| `PATRICK_IM_RUSTFS_SECRET_KEY` | RustFS/S3 secret key |
+| `PATRICK_IM_FILE_STORE_PATH` | 本地文件存储目录 |
 | `PATRICK_IM_SESSION_SECRET` | session 签名密钥，生产必须换成足够长的随机字符串 |
 | `PATRICK_IM_RECENT_MESSAGE_LIMIT` | 进入房间时加载的最近消息数量 |
 | `PATRICK_IM_STUN_URLS` | 前端 WebRTC 使用的 STUN 地址，逗号分隔 |
@@ -130,7 +113,6 @@ make help
 | `make env-check` | 检查 node/corepack/cargo/docker |
 | `make frontend-dev` | 启动 Vite 前端开发服务 |
 | `make backend-dev` | 启动 Rust Axum 后端开发服务 |
-| `make rustfs-dev` | 启动本地测试用 RustFS 容器 |
 | `make frontend-build` | 构建前端到 `backend/server/web-dist` |
 | `make release` | 按当前宿主机架构构建 release 二进制 |
 | `make release-x86` | 构建 `x86_64-unknown-linux-gnu` release 二进制 |
@@ -215,25 +197,7 @@ location / {
 }
 ```
 
-如果启用浏览器直传 RustFS，公网反代还需要把 bucket path-style 请求直接转给 RustFS。默认 bucket 是 `patrick-im`：
-
-```nginx
-location ^~ /patrick-im/ {
-    proxy_pass http://127.0.0.1:9000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_http_version 1.1;
-    proxy_connect_timeout 60s;
-    proxy_read_timeout 3600s;
-    proxy_send_timeout 3600s;
-    proxy_request_buffering off;
-    proxy_buffering off;
-}
-```
-
-如果中继下载很慢，请检查站点层是否配置了类似 `limit_rate 10240k;` 的限速规则。
+上传接口现在直接由后端接收分片并写入本地文件目录，因此反代不再需要额外的 RustFS 路径转发。
 
 ## 开发约定
 

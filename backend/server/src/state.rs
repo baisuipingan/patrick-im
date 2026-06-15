@@ -59,7 +59,7 @@ impl AppState {
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
         let message_store = MessageStore::new(&config).await?;
         Ok(Self {
-            relay_store: Arc::new(RelayStore::new(&config)),
+            relay_store: Arc::new(RelayStore::new(&config).await?),
             room_hub: Arc::new(RoomHub::new()),
             message_store: Arc::new(message_store),
             config,

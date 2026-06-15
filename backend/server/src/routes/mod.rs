@@ -14,7 +14,10 @@ pub fn router() -> Router<AppState> {
         .route("/api/healthz", get(health::healthz))
         .route("/api/session", get(session::session_info))
         .route("/api/files/upload-request", post(files::upload_request))
-        .route("/api/files/upload-part", post(files::ack_upload_part))
+        .route(
+            "/api/files/upload-part/{part_number}",
+            post(files::upload_part),
+        )
         .route("/api/files/complete", post(files::complete_upload))
         .route("/api/files/abort", post(files::abort_upload))
         .route("/api/files/discard", post(files::discard_upload))

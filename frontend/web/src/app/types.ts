@@ -1,4 +1,4 @@
-import type { ChatMessage, RelayPresignedPart, RelayUploadPartResponse, TransferMode } from '@shared/protocol';
+import type { ChatMessage, RelayUploadPart, RelayUploadPartResponse, TransferMode } from '@shared/protocol';
 import type { TransferUpdate } from '@/lib/peer-mesh';
 
 export interface UiMessage extends ChatMessage {
@@ -34,7 +34,7 @@ export interface RelayUploadTask {
   totalBytes: number;
   totalParts: number;
   concurrency: number;
-  partUrlsByNumber: Map<number, RelayPresignedPart>;
+  partsByNumber: Map<number, RelayUploadPart>;
   pendingPartNumbers: number[];
   inFlightPartNumbers: Set<number>;
   uploadedParts: Map<number, RelayUploadPartResponse>;

@@ -83,7 +83,7 @@ describe('use-relay-uploads', () => {
               uploadToken: 'token-1',
               chunkSizeBytes: 5,
               uploadedParts: [],
-              partUrls: [{ partNumber: 1, url: 'https://example.com/1', headers: [] }],
+              parts: [{ partNumber: 1, uploadUrl: '/api/files/upload-part/1' }],
             }),
             { status: 200, headers: { 'content-type': 'application/json' } },
           );

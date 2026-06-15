@@ -30,7 +30,7 @@ function createTask(): RelayUploadTask {
     totalBytes: file.size,
     totalParts: 2,
     concurrency: 1,
-    partUrlsByNumber: new Map(),
+    partsByNumber: new Map(),
     pendingPartNumbers: [],
     inFlightPartNumbers: new Set(),
     uploadedParts: new Map(),
@@ -147,9 +147,9 @@ describe('relay-utils', () => {
       uploadToken: 'token-2',
       chunkSizeBytes: 5 * MIB,
       uploadedParts: [{ partNumber: 1, etag: '"etag-1"' }],
-      partUrls: [
-        { partNumber: 1, url: 'https://example.com/1', headers: [] },
-        { partNumber: 2, url: 'https://example.com/2', headers: [] },
+      parts: [
+        { partNumber: 1, uploadUrl: '/api/files/upload-part/1' },
+        { partNumber: 2, uploadUrl: '/api/files/upload-part/2' },
       ],
     });
 

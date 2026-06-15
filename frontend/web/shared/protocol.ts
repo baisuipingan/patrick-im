@@ -171,7 +171,7 @@ export interface RelayUploadResponse {
   uploadToken: string;
   chunkSizeBytes: number;
   uploadedParts: RelayUploadedPart[];
-  partUrls: RelayPresignedPart[];
+  parts: RelayUploadPart[];
 }
 
 export interface RelayUploadedPart {
@@ -179,15 +179,9 @@ export interface RelayUploadedPart {
   etag: string;
 }
 
-export interface RelayPresignedHeader {
-  name: string;
-  value: string;
-}
-
-export interface RelayPresignedPart {
+export interface RelayUploadPart {
   partNumber: number;
-  url: string;
-  headers: RelayPresignedHeader[];
+  uploadUrl: string;
 }
 
 export interface RelayUploadPartResponse {

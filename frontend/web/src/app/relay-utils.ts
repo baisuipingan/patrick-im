@@ -1,4 +1,4 @@
-import type { RelayPresignedPart, RelayUploadPartResponse, RelayUploadResponse } from '@shared/protocol';
+import type { RelayUploadPart, RelayUploadPartResponse, RelayUploadResponse } from '@shared/protocol';
 import type { PendingRelayAbortTicket, PendingRelayAnnounceTicket, RelayUploadTask } from '@/app/types';
 
 export const PENDING_RELAY_ABORTS_KEY = 'patrick-im:pending-relay-aborts';
@@ -129,7 +129,7 @@ export function getRelayUploadConcurrency(fileSizeBytes: number, totalParts: num
   return Math.min(16, totalParts);
 }
 
-export function buildRelayUploadNote(totalParts: number, concurrency: number, prefix = '正在直传到中继存储'): string {
+export function buildRelayUploadNote(totalParts: number, concurrency: number, prefix = '正在上传到服务器存储'): string {
   return totalParts > 1 ? `${prefix}（共 ${totalParts} 个分片，并发 ${concurrency}）` : prefix;
 }
 
@@ -181,10 +181,10 @@ export function applyRelayUploadSnapshot(task: RelayUploadTask, payload: RelayUp
 
   task.uploadToken = payload.uploadToken;
   task.chunkSizeBytes = payload.chunkSizeBytes;
-  task.totalParts = payload.partUrls.length;
+  task.totalParts = payload.parts.length;
   task.concurrency = getRelayUploadConcurrency(task.totalBytes, task.totalParts);
-  task.partUrlsByNumber = new Map(payload.partUrls.map((part) => [part.partNumber, part]));
-  task.pendingPartNumbers = payload.partUrls
+  task.partsByNumber = new Map(payload.parts.map((part) => [part.partNumber, part]));
+  task.pendingPartNumbers = payload.parts
     .map((part) => part.partNumber)
     .filter((partNumber) => !uploadedPartNumbers.has(partNumber));
   task.inFlightPartNumbers.clear();
@@ -193,8 +193,8 @@ export function applyRelayUploadSnapshot(task: RelayUploadTask, payload: RelayUp
   rememberRelayTaskDisplayedBytes(task, getRelayTaskTransferredBytes(task));
 }
 
-export function uploadPresignedPartWithProgress(
-  part: RelayPresignedPart,
+export function uploadRelayPartWithProgress(
+  part: RelayUploadPart,
   chunk: Blob,
   onProgress: (loaded: number) => void,
   task: RelayUploadTask,
@@ -207,10 +207,9 @@ export function uploadPresignedPartWithProgress(
 
     const xhr = new XMLHttpRequest();
     task.xhrs.add(xhr);
-    xhr.open('PUT', part.url, true);
-    for (const header of part.headers) {
-      xhr.setRequestHeader(header.name, header.value);
-    }
+    xhr.open('POST', part.uploadUrl, true);
+    xhr.setRequestHeader('content-type', 'application/octet-stream');
+    xhr.setRequestHeader('x-patrick-im-upload-token', task.uploadToken);
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) {
         onProgress(event.loaded);
@@ -227,15 +226,12 @@ export function uploadPresignedPartWithProgress(
     xhr.onload = () => {
       task.xhrs.delete(xhr);
       if (xhr.status >= 200 && xhr.status < 300) {
-        const etag = xhr.getResponseHeader('etag') ?? xhr.getResponseHeader('ETag');
-        if (!etag) {
-          reject(new Error('upload_part_missing_etag'));
+        try {
+          resolve(JSON.parse(xhr.responseText) as RelayUploadPartResponse);
+        } catch {
+          reject(new Error('upload_part_bad_response'));
           return;
         }
-        resolve({
-          partNumber: part.partNumber,
-          etag,
-        });
       } else {
         reject(new Error(`upload_part_failed_${xhr.status}`));
       }
@@ -312,23 +308,23 @@ export async function uploadRelayPartsConcurrently(options: {
         return;
       }
 
-      const partUrl = task.partUrlsByNumber.get(partNumber);
-      if (!partUrl) {
+      const part = task.partsByNumber.get(partNumber);
+      if (!part) {
         task.inFlightPartNumbers.delete(partNumber);
-        throw new Error(`upload_part_url_missing_${partNumber}`);
+        throw new Error(`upload_part_missing_${partNumber}`);
       }
 
       const chunk = getRelayPartBlob(task.file, task.chunkSizeBytes, partNumber);
       const pauseGeneration = task.pauseGeneration;
 
       try {
-        const part = await uploadPresignedPartWithProgress(partUrl, chunk, (loaded) => {
+        const uploadedPart = await uploadRelayPartWithProgress(part, chunk, (loaded) => {
           task.loadedByPart.set(partNumber, loaded);
           recomputeLoadedBytes();
         }, task);
-        await onAckPart(task, part);
+        await onAckPart(task, uploadedPart);
         task.inFlightPartNumbers.delete(partNumber);
-        task.uploadedParts.set(partNumber, part);
+        task.uploadedParts.set(partNumber, uploadedPart);
         task.loadedByPart.set(partNumber, chunk.size);
         recomputeLoadedBytes(true);
       } catch (error) {

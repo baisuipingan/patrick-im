@@ -1,7 +1,7 @@
 use crate::http::{ApiError, ApiResult, JsonResponse, ok_json};
 use crate::protocol::{
     RelayAbortUploadRequest, RelayCompleteUploadRequest, RelayCompleteUploadResponse,
-    RelayDiscardUploadRequest, RelayUploadPartAckRequest, RelayUploadRequest, RelayUploadResponse,
+    RelayDiscardUploadRequest, RelayUploadRequest, RelayUploadResponse, RelayUploadedPart,
 };
 use crate::services::relay_store::{RelayUploadTokenPayload, ResumeRelayUploadInput};
 use crate::session::require_session;
@@ -12,10 +12,13 @@ use crate::store::message_store::{
 };
 use crate::utils::{encode_content_disposition_name, sanitize_file_name, sanitize_room_id};
 use axum::Json;
+use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::header::LOCATION;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 const RELAY_FILE_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -78,7 +81,6 @@ pub async fn upload_request(
                 },
                 uploaded_parts,
             )
-            .await
             .map_err(ApiError::from_internal)?;
         return Ok(ok_json(response));
     }
@@ -145,36 +147,46 @@ pub async fn upload_request(
                     },
                     uploaded_parts,
                 )
-                .await
                 .map_err(ApiError::from_internal)?;
             Ok(ok_json(response))
         }
     }
 }
 
-pub async fn ack_upload_part(
+pub async fn upload_part(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<RelayUploadPartAckRequest>,
-) -> JsonResponse<serde_json::Value> {
+    Path(part_number): Path<i32>,
+    body: Bytes,
+) -> JsonResponse<crate::protocol::RelayUploadPartResponse> {
     let session = require_session(&headers, &state.config.session_secret)
         .map_err(|error| ApiError::internal(format!("session decode error: {error}")))?
         .ok_or_else(|| ApiError::unauthorized("missing session"))?;
-    if payload.part.partNumber <= 0 || payload.part.etag.trim().is_empty() {
-        return Err(ApiError::bad_request("invalid upload part ack"));
-    }
+    let upload_token = headers
+        .get("x-patrick-im-upload-token")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("missing upload token"))?;
 
-    let upload = state
+    let part = state
         .relay_store
-        .verify_upload_token(&session, &payload.uploadToken)
+        .upload_part(&session, upload_token, part_number, body)
+        .await
         .map_err(ApiError::from_internal)?;
+    let uploaded_part = RelayUploadedPart {
+        partNumber: part.partNumber,
+        etag: part.etag.clone(),
+    };
     state
         .message_store
-        .store_relay_upload_part(&upload.file_id, &payload.part)
+        .store_relay_upload_part(
+            &part_upload_file_id(&state, &session, upload_token)?,
+            &uploaded_part,
+        )
         .await
         .map_err(ApiError::from_internal)?;
 
-    Ok(ok_json(serde_json::json!({ "ok": true })))
+    Ok(ok_json(part))
 }
 
 pub async fn complete_upload(
@@ -375,21 +387,44 @@ pub async fn file_access(
             encode_content_disposition_name(&descriptor.fileName)
         )
     };
-    let url = state
+    let object = state
         .relay_store
-        .create_presigned_download_url(
-            &descriptor.objectKey,
-            disposition,
-            descriptor.contentType.clone(),
-        )
+        .get_object(&descriptor.objectKey)
         .await
         .map_err(ApiError::from_internal)?;
 
-    Response::builder()
-        .status(StatusCode::SEE_OTHER)
-        .header(LOCATION, url)
-        .body(axum::body::Body::empty())
-        .map_err(ApiError::from_internal)
+    let file = tokio::fs::File::open(&object.path)
+        .await
+        .map_err(ApiError::from_internal)?;
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
+    let mut response = body.into_response();
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition).map_err(ApiError::from_internal)?,
+    );
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(&descriptor.contentType).map_err(ApiError::from_internal)?,
+    );
+    response.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&object.size.to_string()).map_err(ApiError::from_internal)?,
+    );
+    Ok(response)
+}
+
+fn part_upload_file_id(
+    state: &AppState,
+    session: &crate::session::SessionPayload,
+    upload_token: &str,
+) -> Result<String, ApiError> {
+    Ok(state
+        .relay_store
+        .verify_upload_token(session, upload_token)
+        .map_err(ApiError::from_internal)?
+        .file_id)
 }
 
 fn normalize_upload_request(request: &RelayUploadRequest) -> NormalizedRelayUploadRequest {

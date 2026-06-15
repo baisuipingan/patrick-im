@@ -1,22 +1,19 @@
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::env;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AppConfig {
     pub bind: String,
     pub log_filter: String,
     pub public_base_url: String,
-    pub rustfs_public_endpoint: String,
     pub stun_urls: Vec<String>,
     pub turn_urls: Vec<String>,
     pub turn_username: Option<String>,
     pub turn_credential: Option<String>,
     pub mysql_url: String,
-    pub rustfs_endpoint: String,
-    pub rustfs_bucket: String,
-    pub rustfs_access_key: String,
-    pub rustfs_secret_key: String,
+    pub file_store_path: PathBuf,
     pub session_secret: String,
     pub secure_cookies: bool,
     pub recent_message_limit: usize,
@@ -27,10 +24,6 @@ impl AppConfig {
         let bind = env_or("PATRICK_IM_BIND", "0.0.0.0:5800");
         let log_filter = env_or("PATRICK_IM_LOG", "info,tower_http=info,axum=info");
         let public_base_url = normalize_base_url(env_required("PATRICK_IM_PUBLIC_BASE_URL")?);
-        let rustfs_public_endpoint = normalize_base_url(env_or(
-            "PATRICK_IM_RUSTFS_PUBLIC_ENDPOINT",
-            &public_base_url,
-        ));
         let stun_urls = split_csv(&env_or(
             "PATRICK_IM_STUN_URLS",
             "stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302",
@@ -39,10 +32,7 @@ impl AppConfig {
         let turn_username = env_optional("PATRICK_IM_TURN_USERNAME");
         let turn_credential = env_optional("PATRICK_IM_TURN_CREDENTIAL");
         let mysql_url = env_required("PATRICK_IM_MYSQL_URL")?;
-        let rustfs_endpoint = env_required("PATRICK_IM_RUSTFS_ENDPOINT")?;
-        let rustfs_bucket = env_required("PATRICK_IM_RUSTFS_BUCKET")?;
-        let rustfs_access_key = env_required("PATRICK_IM_RUSTFS_ACCESS_KEY")?;
-        let rustfs_secret_key = env_required("PATRICK_IM_RUSTFS_SECRET_KEY")?;
+        let file_store_path = PathBuf::from(env_or("PATRICK_IM_FILE_STORE_PATH", "./data/files"));
         let session_secret = env_required("PATRICK_IM_SESSION_SECRET")?;
         let secure_cookies = env_bool_or(
             "PATRICK_IM_SECURE_COOKIES",
@@ -54,16 +44,12 @@ impl AppConfig {
             bind,
             log_filter,
             public_base_url,
-            rustfs_public_endpoint,
             stun_urls,
             turn_urls,
             turn_username,
             turn_credential,
             mysql_url,
-            rustfs_endpoint,
-            rustfs_bucket,
-            rustfs_access_key,
-            rustfs_secret_key,
+            file_store_path,
             session_secret,
             secure_cookies,
             recent_message_limit,
