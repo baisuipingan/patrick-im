@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="patrick-im"
 INSTALL_DIR="${PATRICK_IM_INSTALL_DIR:-/opt/patrick-im}"
-COMPOSE_URL="${PATRICK_IM_COMPOSE_URL:-https://gitee.com/cai-happy/patrickim/raw/main/ops/docker-compose.yml}"
+COMPOSE_URL="${PATRICK_IM_COMPOSE_URL:-https://gitee.com/cai-happy/patrick-im/raw/main/ops/docker-compose.yml}"
 IMAGE="${PATRICK_IM_IMAGE:-crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com/patrickcmh/patrick-im:latest}"
 PUBLIC_BASE_URL="${PATRICK_IM_PUBLIC_BASE_URL:-http://127.0.0.1:5800}"
 HOST_BIND="${PATRICK_IM_HOST_BIND:-0.0.0.0:5800}"
