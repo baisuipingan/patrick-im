@@ -11,8 +11,9 @@ use anyhow::{Context, Result, anyhow};
 use relay_files::{
     collect_orphaned_files, load_relay_files_by_ids, relay_file_record_to_descriptor,
 };
-use sqlx::MySqlPool;
+use sqlx::{MySql, MySqlPool};
 use sqlx::migrate::Migrator;
+use sqlx::migrate::MigrateDatabase;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -152,6 +153,8 @@ impl MessageStore {
     pub async fn new(config: &AppConfig) -> Result<Self> {
         let recent_message_limit = i64::try_from(config.recent_message_limit)
             .context("recent_message_limit exceeds i64 range")?;
+        ensure_database_exists(&config.mysql_url).await?;
+
         let connect_options = MySqlConnectOptions::from_str(&config.mysql_url)
             .context("failed to parse mysql url for sqlx")?
             .ssl_mode(MySqlSslMode::Disabled);
@@ -161,10 +164,12 @@ impl MessageStore {
             .await
             .context("failed to connect to mysql through sqlx")?;
 
+        tracing::info!("running sqlx database migrations");
         MIGRATOR
             .run(&pool)
             .await
             .context("failed to run sqlx migrations")?;
+        tracing::info!("sqlx database migrations completed");
 
         Ok(Self {
             pool,
@@ -828,6 +833,21 @@ impl MessageStore {
             .map(|row| message_row_to_chat_message(row, &files_by_id))
             .collect()
     }
+}
+
+async fn ensure_database_exists(mysql_url: &str) -> Result<()> {
+    if MySql::database_exists(mysql_url)
+        .await
+        .context("failed to check mysql database existence")?
+    {
+        return Ok(());
+    }
+
+    MySql::create_database(mysql_url)
+        .await
+        .context("failed to create mysql database")?;
+    tracing::info!("created mysql database for patrick-im");
+    Ok(())
 }
 
 fn validate_pending_relay_upload(

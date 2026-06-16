@@ -40,6 +40,7 @@ Makefile                      开发、构建和部署统一入口
 - MySQL
 - 本地磁盘目录用于文件存储
 - Docker：用于部署服务容器时需要
+- 可选：`cargo-zigbuild`，推荐在 macOS 上交叉编译 Linux x86_64 二进制时使用
 
 可以先检查本机工具链：
 
@@ -116,55 +117,108 @@ make help
 | `make frontend-build` | 构建前端到 `backend/server/web-dist` |
 | `make release` | 按当前宿主机架构构建 release 二进制 |
 | `make release-x86` | 构建 `x86_64-unknown-linux-gnu` release 二进制 |
-| `make docker-build` | 用现成二进制重建 runtime 镜像 |
+| `make docker-build` | 用现成二进制构建 runtime 镜像 |
+| `make docker-build-x86` | `release-x86 + docker-build`，构建 `linux/amd64` 镜像 |
+| `make docker-login-aliyun` | 登录阿里云镜像仓库 |
+| `make docker-push-aliyun` | 推送镜像到阿里云镜像仓库 |
+| `make publish-x86` | 本机交叉编译 x86、打镜像并推送阿里云 |
 | `make docker-up` | 重启服务容器 |
-| `make deploy` | `release + docker-build + docker-up` |
-| `make deploy-x86` | `release-x86 + docker-build + docker-up` |
+| `make deploy` | `deploy-x86` 的别名 |
+| `make deploy-x86` | 本机 `release-x86 + docker-build + docker-up` |
 | `make status` | 查看容器状态 |
 | `make logs` | 跟随服务日志 |
 | `make clean` | 清理本地构建产物 |
 
 ## 构建与部署
 
-生产部署推荐流程：
+生产部署推荐改为本机完成构建和镜像发布，服务器只拉取镜像并重启容器。Dockerfile 只复制本机已经编译好的 `backend/server/build/patrick-im-server`，不会在 Docker 镜像里编译前端或 Rust。
 
-1. 本地提交并推送代码。
-2. 服务器进入项目目录执行 `git pull --ff-only`。
-3. 确认 `backend/server/.env` 已按生产环境配置。
-4. 执行部署：
+本机首次使用阿里云镜像仓库时先登录：
 
 ```bash
-make deploy
+docker login --username=百岁平安1 crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com
 ```
 
-`make deploy` 会依次完成：
+发布默认 `latest` 镜像：
+
+```bash
+make publish-x86
+```
+
+默认推送到：
+
+```text
+crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com/patrickcmh/patrick-im:latest
+```
+
+`make publish-x86` 会依次完成：
 
 1. 检查并加载 Node、pnpm、Cargo 工具链。
 2. 安装前端依赖并构建 Vite 产物。
 3. 输出前端产物到 `backend/server/web-dist`。
-4. 构建 Rust release 二进制。
+4. 交叉编译 `x86_64-unknown-linux-gnu` release 二进制。
 5. 复制二进制到 `backend/server/build/patrick-im-server`。
-6. 使用 Docker Compose 重建 runtime 镜像。
-7. 重启 `patrick-im-server` 容器。
+6. 用本地二进制构建 `linux/amd64` runtime 镜像。
+7. 给镜像打上阿里云仓库 tag 并 push。
 
-如果服务器架构是 x86_64 Linux，可以使用：
+如果 macOS 上已经安装 `cargo-zigbuild`，`make release-x86` 会优先使用它交叉编译，通常比直接 `cargo build --target x86_64-unknown-linux-gnu` 更稳。
+
+### 新服务器一键安装
+
+新服务器推荐直接使用一键安装脚本，不需要在服务器拉源码或本地构建。脚本只检查 Docker Engine 和 Docker Compose plugin 是否存在，不会替你安装 Docker；检查通过后会生成 `/opt/patrick-im/.env`，创建 MySQL 和文件存储目录，然后拉起服务：
 
 ```bash
-make deploy-x86
+curl -fsSL https://gitee.com/cai-happy/patrickim/raw/main/ops/install.sh | sudo bash
 ```
 
-如果只想先构建二进制，不重启服务：
+如果镜像仓库需要登录，可以先手动登录：
+
+```bash
+docker login --username=百岁平安1 crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com
+```
+
+也可以把公网地址一起传入：
+
+```bash
+curl -fsSL https://gitee.com/cai-happy/patrickim/raw/main/ops/install.sh | sudo env PATRICK_IM_PUBLIC_BASE_URL=https://im.example.com bash
+```
+
+默认安装目录：
+
+```text
+/opt/patrick-im
+```
+
+服务更新：
+
+```bash
+cd /opt/patrick-im
+docker compose pull
+docker compose up -d --remove-orphans
+```
+
+后端启动时会自动确保 MySQL database 存在，然后按 `backend/server/migrations` 内嵌的 SQLx migrations 逐层升级。已有迁移不会重复执行。
+
+### 手动 Compose 更新
+
+如果服务器上已经有自己的 compose/env 布局，也可以只拉新镜像并重启：
+
+```bash
+export PATRICK_IM_IMAGE=crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com/patrickcmh/patrick-im:latest
+docker compose -f ops/docker-compose.server.yml pull patrick-im-server
+docker compose -f ops/docker-compose.server.yml up -d --force-recreate --remove-orphans patrick-im-server
+```
+
+本机自测容器仍然可以使用：
 
 ```bash
 make release-x86
-```
-
-然后再手动执行：
-
-```bash
 make docker-build
 make docker-up
 ```
+
+如果服务器是 x86_64 Linux，请保持默认 `DOCKER_PLATFORM=linux/amd64`。如果以后要发布到 ARM 服务器，可以显式调整平台和 Rust target 后再构建。
+
 
 ## 日志
 
@@ -197,14 +251,14 @@ location / {
 }
 ```
 
-上传接口现在直接由后端接收分片并写入本地文件目录，因此反代不再需要额外的 RustFS 路径转发。
+上传接口现在直接由后端接收分片并写入本地文件目录，因此反代只需要转发到后端即可。
 
 ## 开发约定
 
 - 前端和后端目录分离，协议类型在 `frontend/web/shared` 和 `backend/server/src/protocol.rs` 保持同步。
 - 前端生产构建先输出到 `backend/server/web-dist`，后端再把静态资源内嵌进单二进制。
 - Docker 镜像只负责运行时打包，不在镜像构建阶段编译前端或 Rust。
-- 远端部署不走源码同步脚本，统一使用 `git pull + make`。
+- 远端部署不在服务器构建源码，统一由本机交叉编译、打镜像并推送到镜像仓库，服务器只拉取镜像重启。
 
 ## 开源许可
 

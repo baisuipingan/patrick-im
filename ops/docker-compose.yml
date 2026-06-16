@@ -1,0 +1,47 @@
+services:
+  mysql:
+    image: ${PATRICK_IM_MYSQL_IMAGE:-mysql:8.4}
+    container_name: patrick-im-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${PATRICK_IM_MYSQL_ROOT_PASSWORD:-patrick-im-root-change-me}
+      MYSQL_DATABASE: ${PATRICK_IM_MYSQL_DATABASE:-patrick_im}
+      MYSQL_USER: ${PATRICK_IM_MYSQL_USER:-patrick_im}
+      MYSQL_PASSWORD: ${PATRICK_IM_MYSQL_PASSWORD:-patrick-im-change-me}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - mysqladmin ping -h 127.0.0.1 -u"$${MYSQL_USER}" -p"$${MYSQL_PASSWORD}" --silent
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+    networks:
+      - patrick-im
+
+  patrick-im-server:
+    image: ${PATRICK_IM_IMAGE:-crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com/patrickcmh/patrick-im:latest}
+    container_name: patrick-im-server
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    env_file:
+      - path: ./.env
+        required: false
+    ports:
+      - "${PATRICK_IM_HOST_BIND:-127.0.0.1:5800}:5800"
+    volumes:
+      - ./data/files:/app/data/files
+    networks:
+      - patrick-im
+
+networks:
+  patrick-im:
+    name: patrick-im

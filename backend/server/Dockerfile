@@ -1,5 +1,5 @@
 ## syntax=docker/dockerfile:1.7
-ARG RUNTIME_IMAGE=ubuntu:24.04
+ARG RUNTIME_IMAGE=debian:bookworm-slim
 
 FROM ${RUNTIME_IMAGE}
 ENV DEBIAN_FRONTEND=noninteractive

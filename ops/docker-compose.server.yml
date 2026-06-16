@@ -1,9 +1,6 @@
 services:
   patrick-im-server:
-    image: patrick-im-server:latest
-    build:
-      context: ..
-      dockerfile: backend/server/Dockerfile
+    image: ${PATRICK_IM_IMAGE:-patrick-im-server:latest}
     container_name: patrick-im-server
     restart: unless-stopped
     env_file:
