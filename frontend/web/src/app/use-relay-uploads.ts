@@ -91,6 +91,53 @@ async function readRelayError(response: Response, fallback: string): Promise<str
   return fallback;
 }
 
+async function fetchRelayJson(
+  input: RequestInfo | URL,
+  init: RequestInit,
+  options: { fallback: string; timeoutMs: number },
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => {
+    controller.abort();
+  }, options.timeoutMs);
+
+  try {
+    const response = await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      throw new Error(await readRelayError(response, options.fallback));
+    }
+    return response;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error(`${options.fallback}_timeout`);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+function formatRelayUploadError(error: unknown): string {
+  const message = error instanceof Error && error.message ? error.message : '';
+  switch (message) {
+    case 'upload_part_timeout':
+      return '分片上传等待服务器响应超时，请检查反向代理或服务器文件写入是否卡住';
+    case 'upload_part_failed':
+      return '分片上传网络异常';
+    case 'upload_part_bad_response':
+      return '服务器返回了无法识别的分片响应';
+    case 'upload_complete_failed_timeout':
+      return '服务器合并文件超时，请检查服务端日志';
+    case 'upload_request_failed_timeout':
+      return '创建上传任务超时，请检查服务端连接';
+    default:
+      return message || '服务端中继上传失败，请重试';
+  }
+}
+
 export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadControls {
   const {
     activeRoom,
@@ -690,24 +737,24 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
     const clientRequestId = pendingAttachmentId ?? crypto.randomUUID();
     let task: RelayUploadTask | null = null;
     try {
-      const uploadRequest = await fetch('/api/files/upload-request', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
+      const uploadRequest = await fetchRelayJson(
+        '/api/files/upload-request',
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            clientRequestId,
+            roomId,
+            fileName: file.name,
+            contentType: file.type,
+            size: file.size,
+            targetId,
+          }),
         },
-        body: JSON.stringify({
-          clientRequestId,
-          roomId,
-          fileName: file.name,
-          contentType: file.type,
-          size: file.size,
-          targetId,
-        }),
-      });
-
-      if (!uploadRequest.ok) {
-        throw new Error(await readRelayError(uploadRequest, 'upload_request_failed'));
-      }
+        { fallback: 'upload_request_failed', timeoutMs: 30_000 },
+      );
 
       const payload = (await uploadRequest.json()) as RelayUploadResponse;
       const totalParts = payload.parts.length;
@@ -811,20 +858,32 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
       }
 
       task.stage = 'completing';
-      const completeResponse = await fetch('/api/files/complete', {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          uploadToken: task.uploadToken,
-          parts: [...task.uploadedParts.values()].sort((left, right) => left.partNumber - right.partNumber),
-        }),
+      updateTransfer({
+        transferId: payload.fileId,
+        peerId,
+        peerName,
+        fileName: file.name,
+        totalBytes: file.size,
+        transferredBytes: rememberRelayTaskDisplayedBytes(task, file.size),
+        direction: 'upload',
+        transport: 'server-relay',
+        status: 'streaming',
+        note: '分片已上传，正在等待服务器合并确认',
       });
-
-      if (!completeResponse.ok) {
-        throw new Error(await readRelayError(completeResponse, 'upload_complete_failed'));
-      }
+      const completeResponse = await fetchRelayJson(
+        '/api/files/complete',
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            uploadToken: task.uploadToken,
+            parts: [...task.uploadedParts.values()].sort((left, right) => left.partNumber - right.partNumber),
+          }),
+        },
+        { fallback: 'upload_complete_failed', timeoutMs: 120_000 },
+      );
 
       if (task.cancelled || closedTransferIdsRef.current.has(task.transferId)) {
         return;
@@ -890,7 +949,7 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
       if (task) {
         task.stage = 'failed';
       }
-      const errorMessage = error instanceof Error && error.message ? error.message : '服务端中继上传失败，请重试';
+      const errorMessage = formatRelayUploadError(error);
 
       updateTransfer({
         transferId: task?.transferId ?? `relay-failed:${crypto.randomUUID()}`,

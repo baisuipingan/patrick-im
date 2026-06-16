@@ -11,10 +11,10 @@ use anyhow::{Context, Result, anyhow};
 use relay_files::{
     collect_orphaned_files, load_relay_files_by_ids, relay_file_record_to_descriptor,
 };
-use sqlx::{MySql, MySqlPool};
-use sqlx::migrate::Migrator;
 use sqlx::migrate::MigrateDatabase;
+use sqlx::migrate::Migrator;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode};
+use sqlx::{MySql, MySqlPool};
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 pub use threading::{build_thread_key, normalize_target_id};

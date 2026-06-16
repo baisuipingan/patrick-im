@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   applyRelayUploadSnapshot,
   getRelayUploadConcurrency,
@@ -6,6 +6,7 @@ import {
   loadPendingRelayAnnounceTickets,
   storePendingRelayAbortTickets,
   storePendingRelayAnnounceTickets,
+  uploadRelayPartWithProgress,
 } from '@/app/relay-utils';
 import type { RelayUploadTask } from '@/app/types';
 
@@ -46,9 +47,35 @@ function createTask(): RelayUploadTask {
   };
 }
 
+class TimeoutUploadXHR {
+  static latest: TimeoutUploadXHR | null = null;
+
+  status = 0;
+  responseText = '';
+  timeout = 0;
+  upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
+  onabort: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  onload: (() => void) | null = null;
+  ontimeout: (() => void) | null = null;
+
+  open(): void {
+    TimeoutUploadXHR.latest = this;
+  }
+
+  setRequestHeader(): void {}
+
+  send(): void {}
+
+  abort(): void {
+    this.onabort?.();
+  }
+}
+
 describe('relay-utils', () => {
   beforeEach(() => {
     window.localStorage.clear();
+    TimeoutUploadXHR.latest = null;
   });
 
   it('loads abort tickets and removes invalid or duplicate items', () => {
@@ -184,4 +211,27 @@ describe('relay-utils', () => {
     expect(loadPendingRelayAbortTickets()).toHaveLength(64);
     expect(loadPendingRelayAnnounceTickets()).toHaveLength(128);
   });
+
+  it('times out an upload part instead of waiting forever', async () => {
+    vi.stubGlobal('XMLHttpRequest', TimeoutUploadXHR);
+    const task = createTask();
+    const promise = uploadRelayPartWithProgress(
+      { partNumber: 1, uploadUrl: '/api/files/upload-part/1' },
+      getRelayPartBlobForTest(task, 1),
+      vi.fn(),
+      task,
+    );
+
+    expect(TimeoutUploadXHR.latest?.timeout).toBeGreaterThan(0);
+    TimeoutUploadXHR.latest?.ontimeout?.();
+
+    await expect(promise).rejects.toThrow('upload_part_timeout');
+    expect(task.xhrs.size).toBe(0);
+    vi.unstubAllGlobals();
+  });
 });
+
+function getRelayPartBlobForTest(task: RelayUploadTask, partNumber: number): Blob {
+  const start = (partNumber - 1) * task.chunkSizeBytes;
+  return task.file.slice(start, Math.min(task.file.size, start + task.chunkSizeBytes));
+}

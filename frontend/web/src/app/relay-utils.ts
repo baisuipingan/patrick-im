@@ -4,6 +4,7 @@ import type { PendingRelayAbortTicket, PendingRelayAnnounceTicket, RelayUploadTa
 export const PENDING_RELAY_ABORTS_KEY = 'patrick-im:pending-relay-aborts';
 export const PENDING_RELAY_ANNOUNCES_KEY = 'patrick-im:pending-relay-announces';
 const MIB = 1024 * 1024;
+const RELAY_PART_UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
 
 export function isRelayUploadCancelledError(error: unknown): boolean {
   return error instanceof Error && error.message === 'relay_upload_cancelled';
@@ -208,6 +209,7 @@ export function uploadRelayPartWithProgress(
     const xhr = new XMLHttpRequest();
     task.xhrs.add(xhr);
     xhr.open('POST', part.uploadUrl, true);
+    xhr.timeout = RELAY_PART_UPLOAD_TIMEOUT_MS;
     xhr.setRequestHeader('content-type', 'application/octet-stream');
     xhr.setRequestHeader('x-patrick-im-upload-token', task.uploadToken);
     xhr.upload.onprogress = (event) => {
@@ -222,6 +224,10 @@ export function uploadRelayPartWithProgress(
     xhr.onerror = () => {
       task.xhrs.delete(xhr);
       reject(new Error('upload_part_failed'));
+    };
+    xhr.ontimeout = () => {
+      task.xhrs.delete(xhr);
+      reject(new Error('upload_part_timeout'));
     };
     xhr.onload = () => {
       task.xhrs.delete(xhr);

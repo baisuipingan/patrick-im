@@ -167,6 +167,17 @@ pub async fn upload_part(
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| ApiError::bad_request("missing upload token"))?;
+    let upload = state
+        .relay_store
+        .verify_upload_token(&session, upload_token)
+        .map_err(ApiError::from_internal)?;
+
+    tracing::info!(
+        file_id = %upload.file_id,
+        part_number,
+        bytes = body.len(),
+        "received relay upload part"
+    );
 
     let part = state
         .relay_store
@@ -179,12 +190,15 @@ pub async fn upload_part(
     };
     state
         .message_store
-        .store_relay_upload_part(
-            &part_upload_file_id(&state, &session, upload_token)?,
-            &uploaded_part,
-        )
+        .store_relay_upload_part(&upload.file_id, &uploaded_part)
         .await
         .map_err(ApiError::from_internal)?;
+
+    tracing::info!(
+        file_id = %upload.file_id,
+        part_number = part.partNumber,
+        "stored relay upload part"
+    );
 
     Ok(ok_json(part))
 }
@@ -215,6 +229,14 @@ pub async fn complete_upload(
             &existing.object_key,
         )));
     }
+
+    tracing::info!(
+        room_id = %upload_token.roomId,
+        file_id = %upload_token.fileId,
+        object_key = %upload_token.objectKey,
+        parts = payload.parts.len(),
+        "completing relay upload"
+    );
 
     let completed = match state.relay_store.complete_upload(&session, payload).await {
         Ok(completed) => completed,
@@ -294,6 +316,14 @@ pub async fn complete_upload(
             ));
         }
     }
+
+    tracing::info!(
+        room_id = %completed.room_id,
+        file_id = %completed.file_id,
+        object_key = %completed.object_key,
+        size = completed.size,
+        "completed relay upload"
+    );
 
     Ok(ok_json(build_complete_upload_response(
         &completed.file_id,
@@ -420,18 +450,6 @@ pub async fn file_access(
         HeaderValue::from_str(&object.size.to_string()).map_err(ApiError::from_internal)?,
     );
     Ok(response)
-}
-
-fn part_upload_file_id(
-    state: &AppState,
-    session: &crate::session::SessionPayload,
-    upload_token: &str,
-) -> Result<String, ApiError> {
-    Ok(state
-        .relay_store
-        .verify_upload_token(session, upload_token)
-        .map_err(ApiError::from_internal)?
-        .file_id)
 }
 
 fn normalize_upload_request(request: &RelayUploadRequest) -> NormalizedRelayUploadRequest {

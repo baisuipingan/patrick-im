@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-const RELAY_CHUNK_SIZE_BYTES: usize = 5 * 1024 * 1024;
+pub const RELAY_CHUNK_SIZE_BYTES: usize = 5 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(non_snake_case)]
@@ -577,5 +577,163 @@ fn normalize_content_type(content_type: &str) -> String {
         "application/octet-stream".to_owned()
     } else {
         content_type.to_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::AppConfig;
+
+    fn test_config(root: PathBuf) -> AppConfig {
+        AppConfig {
+            bind: "127.0.0.1:0".to_owned(),
+            log_filter: "info".to_owned(),
+            public_base_url: "http://127.0.0.1:5800".to_owned(),
+            stun_urls: Vec::new(),
+            turn_urls: Vec::new(),
+            turn_username: None,
+            turn_credential: None,
+            mysql_url: "mysql://patrick:patrick@127.0.0.1/patrick_im_test".to_owned(),
+            file_store_path: root,
+            session_secret: "test-secret".to_owned(),
+            secure_cookies: false,
+            recent_message_limit: 60,
+        }
+    }
+
+    fn test_session() -> SessionPayload {
+        SessionPayload {
+            clientId: "client-1".to_owned(),
+            nickname: "tester".to_owned(),
+            issuedAt: 1,
+            expiresAt: u64::MAX,
+        }
+    }
+
+    #[tokio::test]
+    async fn completes_local_upload_by_concatenating_parts() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let store = RelayStore::new(&test_config(temp_dir.path().join("files")))
+            .await
+            .expect("create relay store");
+        let session = test_session();
+        let file_size = RELAY_CHUNK_SIZE_BYTES as u64 + 7;
+        let created = store
+            .create_upload(
+                &session,
+                RelayUploadRequest {
+                    clientRequestId: Some("req-1".to_owned()),
+                    roomId: "room-a".to_owned(),
+                    fileName: "demo.bin".to_owned(),
+                    contentType: "application/octet-stream".to_owned(),
+                    size: file_size,
+                    targetId: None,
+                },
+            )
+            .await
+            .expect("create upload");
+        let first = Bytes::from(vec![b'a'; RELAY_CHUNK_SIZE_BYTES]);
+        let second = Bytes::from_static(b"tail-ok");
+        let first_part = store
+            .upload_part(&session, &created.response.uploadToken, 1, first.clone())
+            .await
+            .expect("upload first part");
+        let second_part = store
+            .upload_part(&session, &created.response.uploadToken, 2, second.clone())
+            .await
+            .expect("upload second part");
+
+        let completed = store
+            .complete_upload(
+                &session,
+                RelayCompleteUploadRequest {
+                    uploadToken: created.response.uploadToken.clone(),
+                    parts: vec![
+                        RelayUploadedPart {
+                            partNumber: first_part.partNumber,
+                            etag: first_part.etag,
+                        },
+                        RelayUploadedPart {
+                            partNumber: second_part.partNumber,
+                            etag: second_part.etag,
+                        },
+                    ],
+                },
+            )
+            .await
+            .expect("complete upload");
+
+        let object = store
+            .get_object(&completed.object_key)
+            .await
+            .expect("read completed object");
+        let bytes = tokio::fs::read(&object.path)
+            .await
+            .expect("read object bytes");
+        assert_eq!(object.size, file_size);
+        assert_eq!(bytes.len() as u64, file_size);
+        assert!(
+            bytes[..RELAY_CHUNK_SIZE_BYTES]
+                .iter()
+                .all(|byte| *byte == b'a')
+        );
+        assert_eq!(&bytes[RELAY_CHUNK_SIZE_BYTES..], b"tail-ok");
+        assert!(
+            !temp_dir
+                .path()
+                .join("files")
+                .join(".uploads")
+                .join(&created.token_payload.uploadId)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_completion_when_part_checksum_does_not_match() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let store = RelayStore::new(&test_config(temp_dir.path().join("files")))
+            .await
+            .expect("create relay store");
+        let session = test_session();
+        let created = store
+            .create_upload(
+                &session,
+                RelayUploadRequest {
+                    clientRequestId: Some("req-1".to_owned()),
+                    roomId: "room-a".to_owned(),
+                    fileName: "demo.bin".to_owned(),
+                    contentType: "application/octet-stream".to_owned(),
+                    size: 3,
+                    targetId: None,
+                },
+            )
+            .await
+            .expect("create upload");
+        store
+            .upload_part(
+                &session,
+                &created.response.uploadToken,
+                1,
+                Bytes::from_static(b"abc"),
+            )
+            .await
+            .expect("upload part");
+
+        let error = store
+            .complete_upload(
+                &session,
+                RelayCompleteUploadRequest {
+                    uploadToken: created.response.uploadToken,
+                    parts: vec![RelayUploadedPart {
+                        partNumber: 1,
+                        etag: "bad-etag".to_owned(),
+                    }],
+                },
+            )
+            .await
+            .expect_err("checksum mismatch should fail");
+
+        assert!(format!("{error:#}").contains("checksum mismatch"));
     }
 }

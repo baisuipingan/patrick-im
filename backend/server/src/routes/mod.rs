@@ -7,6 +7,7 @@ mod ws;
 
 use crate::state::AppState;
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
 
 pub fn router() -> Router<AppState> {
@@ -16,7 +17,9 @@ pub fn router() -> Router<AppState> {
         .route("/api/files/upload-request", post(files::upload_request))
         .route(
             "/api/files/upload-part/{part_number}",
-            post(files::upload_part),
+            post(files::upload_part).layer(DefaultBodyLimit::max(
+                crate::services::relay_store::RELAY_CHUNK_SIZE_BYTES,
+            )),
         )
         .route("/api/files/complete", post(files::complete_upload))
         .route("/api/files/abort", post(files::abort_upload))
@@ -37,9 +40,11 @@ pub fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use crate::services::relay_store::RELAY_CHUNK_SIZE_BYTES;
+    use axum::body::{Body, Bytes};
+    use axum::extract::{DefaultBodyLimit, Path};
     use axum::http::{Request, StatusCode};
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use tower::ServiceExt;
 
     #[tokio::test]
@@ -58,5 +63,53 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("<title>Patrick-IM</title>"));
         assert!(body.contains("<div id=\"root\"></div>"));
+    }
+
+    #[tokio::test]
+    async fn relay_part_route_accepts_full_chunk_body() {
+        let default_response = relay_part_test_router(false)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/files/upload-part/1")
+                    .body(Body::from(vec![7_u8; RELAY_CHUNK_SIZE_BYTES]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let response = relay_part_test_router(true)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/files/upload-part/1")
+                    .body(Body::from(vec![7_u8; RELAY_CHUNK_SIZE_BYTES]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    fn relay_part_test_router(with_relay_limit: bool) -> Router {
+        let method = post(|Path(part_number): Path<i32>, body: Bytes| async move {
+            assert_eq!(part_number, 1);
+            assert_eq!(body.len(), RELAY_CHUNK_SIZE_BYTES);
+            StatusCode::OK
+        });
+
+        if with_relay_limit {
+            Router::new().route(
+                "/api/files/upload-part/{part_number}",
+                method.layer(DefaultBodyLimit::max(RELAY_CHUNK_SIZE_BYTES)),
+            )
+        } else {
+            Router::new().route(
+                "/api/files/upload-part/{part_number}",
+                post(|_part_number: Path<i32>, _body: Bytes| async move { StatusCode::OK }),
+            )
+        }
     }
 }
