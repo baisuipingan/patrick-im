@@ -219,6 +219,13 @@ pub async fn complete_upload(
     let completed = match state.relay_store.complete_upload(&session, payload).await {
         Ok(completed) => completed,
         Err(error) => {
+            tracing::error!(
+                room_id = %upload_token.roomId,
+                file_id = %upload_token.fileId,
+                object_key = %upload_token.objectKey,
+                error = %format!("{error:#}"),
+                "failed to complete relay upload"
+            );
             if let Some(existing) = state
                 .message_store
                 .find_pending_relay_upload(&upload_token.fileId)

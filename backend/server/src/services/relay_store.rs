@@ -14,6 +14,7 @@ use object_store::{ObjectStore, PutPayload};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 const RELAY_CHUNK_SIZE_BYTES: usize = 5 * 1024 * 1024;
@@ -214,58 +215,126 @@ impl RelayStore {
             return Err(anyhow!("uploaded part count mismatch"));
         }
 
-        let mut upload = self
-            .store
-            .put_multipart(&object_path(&payload.objectKey))
-            .await
-            .with_context(|| format!("failed to create relay object {}", payload.objectKey))?;
-
         let mut parts = request.parts.clone();
         parts.sort_by_key(|part| part.partNumber);
         let mut total_size = 0_u64;
+        let final_path = self.object_filesystem_path(&payload.objectKey)?;
+        if let Some(parent) = final_path.parent() {
+            tokio::fs::create_dir_all(parent).await.with_context(|| {
+                format!(
+                    "failed to create relay object directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let temp_path = final_path.with_file_name(format!(
+            ".{}.{}.assembling",
+            payload.fileId, payload.uploadId
+        ));
+        let mut output = tokio::fs::File::create(&temp_path).await.with_context(|| {
+            format!("failed to create relay temp object {}", temp_path.display())
+        })?;
 
-        for expected_part_number in 1..=total_parts {
-            let part = parts
-                .get((expected_part_number - 1) as usize)
-                .ok_or_else(|| anyhow!("missing uploaded part {expected_part_number}"))?;
-            if part.partNumber != i32::try_from(expected_part_number)? {
-                return Err(anyhow!("uploaded part sequence mismatch"));
-            }
-            validate_part_number(&payload, part.partNumber)?;
+        let assemble_result = async {
+            for expected_part_number in 1..=total_parts {
+                let part = parts
+                    .get((expected_part_number - 1) as usize)
+                    .ok_or_else(|| anyhow!("missing uploaded part {expected_part_number}"))?;
+                if part.partNumber != i32::try_from(expected_part_number)? {
+                    return Err(anyhow!("uploaded part sequence mismatch"));
+                }
+                validate_part_number(&payload, part.partNumber)?;
 
-            let bytes = self
-                .store
-                .get(&part_path(&payload, part.partNumber))
-                .await
-                .with_context(|| format!("failed to read relay upload part {}", part.partNumber))?
-                .bytes()
-                .await
-                .with_context(|| {
-                    format!("failed to buffer relay upload part {}", part.partNumber)
-                })?;
-            validate_part_size(&payload, part.partNumber, bytes.len() as u64)?;
+                let bytes = self
+                    .store
+                    .get(&part_path(&payload, part.partNumber))
+                    .await
+                    .with_context(|| {
+                        format!("failed to read relay upload part {}", part.partNumber)
+                    })?
+                    .bytes()
+                    .await
+                    .with_context(|| {
+                        format!("failed to buffer relay upload part {}", part.partNumber)
+                    })?;
+                validate_part_size(&payload, part.partNumber, bytes.len() as u64)?;
 
-            let actual_etag = sha256_hex(&bytes);
-            if actual_etag != part.etag {
-                return Err(anyhow!("uploaded part checksum mismatch"));
-            }
-            total_size += bytes.len() as u64;
-            upload
-                .put_part(PutPayload::from(bytes))
-                .await
-                .with_context(|| {
+                let actual_etag = sha256_hex(&bytes);
+                if actual_etag != part.etag {
+                    return Err(anyhow!("uploaded part checksum mismatch"));
+                }
+                total_size += bytes.len() as u64;
+                output.write_all(&bytes).await.with_context(|| {
                     format!("failed to append relay upload part {}", part.partNumber)
                 })?;
+            }
+
+            if total_size != payload.size {
+                return Err(anyhow!("completed relay upload size mismatch"));
+            }
+
+            output.flush().await.with_context(|| {
+                format!("failed to flush relay temp object {}", temp_path.display())
+            })?;
+            output.sync_all().await.with_context(|| {
+                format!("failed to sync relay temp object {}", temp_path.display())
+            })?;
+            drop(output);
+
+            match tokio::fs::rename(&temp_path, &final_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    tokio::fs::remove_file(&final_path).await.with_context(|| {
+                        format!(
+                            "failed to replace existing relay object {}",
+                            final_path.display()
+                        )
+                    })?;
+                    tokio::fs::rename(&temp_path, &final_path)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to move relay temp object {} to {}",
+                                temp_path.display(),
+                                final_path.display()
+                            )
+                        })?;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to move relay temp object {} to {}",
+                            temp_path.display(),
+                            final_path.display()
+                        )
+                    });
+                }
+            }
+
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(error) = assemble_result {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return Err(error);
         }
 
-        if total_size != payload.size {
-            return Err(anyhow!("completed relay upload size mismatch"));
+        let metadata = tokio::fs::metadata(&final_path).await.with_context(|| {
+            format!(
+                "failed to stat completed relay object {}",
+                final_path.display()
+            )
+        })?;
+        if metadata.len() != payload.size {
+            let _ = tokio::fs::remove_file(&final_path).await;
+            return Err(anyhow!(
+                "completed relay object size mismatch: expected {}, got {}",
+                payload.size,
+                metadata.len()
+            ));
         }
 
-        upload
-            .complete()
-            .await
-            .with_context(|| format!("failed to complete relay object {}", payload.objectKey))?;
         self.delete_upload_parts(&payload).await?;
 
         Ok(CompletedRelayUpload {
@@ -356,6 +425,16 @@ impl RelayStore {
             .head(&object_path)
             .await
             .with_context(|| format!("failed to stat relay object {object_key}"))?;
+        let path = self.object_filesystem_path(object_key)?;
+
+        Ok(RelayObject {
+            path,
+            size: meta.size,
+        })
+    }
+
+    fn object_filesystem_path(&self, object_key: &str) -> Result<PathBuf> {
+        let object_path = object_path(object_key);
         let path = self
             .store
             .path_to_filesystem(&object_path)
@@ -363,11 +442,7 @@ impl RelayStore {
         if !path.starts_with(&self.root) {
             return Err(anyhow!("relay object path escapes file store root"));
         }
-
-        Ok(RelayObject {
-            path,
-            size: meta.size,
-        })
+        Ok(path)
     }
 
     fn read_upload_token(&self, token: &str) -> Result<RelayUploadTokenPayload> {

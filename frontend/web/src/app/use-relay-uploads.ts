@@ -71,6 +71,26 @@ async function ackRelayUploadPart(_task: RelayUploadTask, _part: RelayUploadPart
   // Uploading a part now stores and acknowledges it in one request.
 }
 
+async function readRelayError(response: Response, fallback: string): Promise<string> {
+  try {
+    const contentType = response.headers.get('content-type') ?? '';
+    if (contentType.includes('application/json')) {
+      const payload = (await response.json()) as { error?: unknown };
+      if (typeof payload.error === 'string' && payload.error.trim()) {
+        return payload.error.trim();
+      }
+    } else {
+      const text = await response.text();
+      if (text.trim()) {
+        return text.trim();
+      }
+    }
+  } catch {
+    // Keep the original upload failure if the error body is not readable.
+  }
+  return fallback;
+}
+
 export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadControls {
   const {
     activeRoom,
@@ -686,7 +706,7 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
       });
 
       if (!uploadRequest.ok) {
-        throw new Error('upload_request_failed');
+        throw new Error(await readRelayError(uploadRequest, 'upload_request_failed'));
       }
 
       const payload = (await uploadRequest.json()) as RelayUploadResponse;
@@ -803,7 +823,7 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
       });
 
       if (!completeResponse.ok) {
-        throw new Error('upload_complete_failed');
+        throw new Error(await readRelayError(completeResponse, 'upload_complete_failed'));
       }
 
       if (task.cancelled || closedTransferIdsRef.current.has(task.transferId)) {
@@ -870,6 +890,7 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
       if (task) {
         task.stage = 'failed';
       }
+      const errorMessage = error instanceof Error && error.message ? error.message : '服务端中继上传失败，请重试';
 
       updateTransfer({
         transferId: task?.transferId ?? `relay-failed:${crypto.randomUUID()}`,
@@ -881,9 +902,9 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
         direction: 'upload',
         transport: 'server-relay',
         status: 'failed',
-        note: '服务端中继上传失败，请重试',
+        note: `服务端中继上传失败：${errorMessage}`,
       });
-      showTransientNotice(`${file.name} 中继上传失败，请重试。`, 3200);
+      showTransientNotice(`${file.name} 中继上传失败：${errorMessage}`, 4200);
     } finally {
       if (task) {
         relayUploadTasksRef.current.delete(task.transferId);
