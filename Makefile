@@ -25,7 +25,7 @@ IMAGE_TAG ?= latest
 LOCAL_IMAGE ?= $(IMAGE_NAME):$(IMAGE_TAG)
 REMOTE_IMAGE := $(ALIYUN_REGISTRY)/$(ALIYUN_NAMESPACE)/$(IMAGE_NAME):$(IMAGE_TAG)
 
-.PHONY: help env-check frontend-dev backend-dev frontend-build release release-host release-x86 docker-build docker-build-x86 docker-login-aliyun docker-push-aliyun publish-x86 docker-up deploy deploy-x86 status logs clean
+.PHONY: help env-check frontend-dev backend-dev frontend-build release release-host release-x86 docker-build docker-build-x86 docker-login-aliyun docker-push-aliyun publish-x86 sync-remotes docker-up deploy deploy-x86 status logs clean
 
 define load_toolchains
 source $$HOME/.cargo/env >/dev/null 2>&1 || true; \
@@ -56,6 +56,7 @@ help:
 	  'make docker-login-aliyun # 登录阿里云镜像仓库' \
 	  'make docker-push-aliyun # 推送镜像到阿里云镜像仓库' \
 	  'make publish-x86   # 本机交叉编译 x86 + 打镜像 + 推送阿里云' \
+	  'make sync-remotes  # 同步推送 GitHub 和 Gitee，Gitee 版自动替换安装链接' \
 	  'make docker-up     # 重启容器' \
 	  'make deploy        # deploy-x86 的别名' \
 	  'make deploy-x86    # release-x86 + docker-build + docker-up' \
@@ -162,6 +163,9 @@ docker-push-aliyun:
 	@printf 'pushed image: %s\n' '$(REMOTE_IMAGE)'
 
 publish-x86: docker-build-x86 docker-push-aliyun
+
+sync-remotes:
+	@bash ops/sync-remotes.sh
 
 docker-up:
 	@PATRICK_IM_IMAGE=$(LOCAL_IMAGE) $(DOCKER_COMPOSE) up -d --force-recreate --remove-orphans $(SERVICE_NAME)

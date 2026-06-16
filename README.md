@@ -150,6 +150,16 @@ make publish-x86
 
 如果 macOS 上已经安装 `cargo-zigbuild`，`make release-x86` 会优先使用它交叉编译，通常比直接 `cargo build --target x86_64-unknown-linux-gnu` 更稳。
 
+### 同步 GitHub 和 Gitee
+
+项目同时维护 GitHub 和 Gitee 镜像时，不要手动双推安装链接相关改动。GitHub 版 README 和安装脚本默认使用 GitHub raw 地址；同步到 Gitee 时使用：
+
+```bash
+make sync-remotes
+```
+
+这个命令会先推送当前 `main` 到 GitHub，然后在临时 worktree 中把 README 和 `ops/install.sh` 里的安装地址替换成 Gitee raw 地址，再推送到 Gitee，不会污染本地 `main` 分支。
+
 ### 新服务器一键安装
 
 新服务器推荐直接使用一键安装脚本，不需要在服务器拉源码或本地构建。脚本只检查 Docker Engine 和 Docker Compose plugin 是否存在，不会替你安装 Docker；检查通过后会生成 `/opt/patrick-im/.env`，创建 MySQL 和文件存储目录，然后拉起服务：
