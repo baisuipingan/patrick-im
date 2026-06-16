@@ -119,9 +119,8 @@ make help
 | `make release-x86` | 构建 `x86_64-unknown-linux-gnu` release 二进制 |
 | `make docker-build` | 用现成二进制构建 runtime 镜像 |
 | `make docker-build-x86` | `release-x86 + docker-build`，构建 `linux/amd64` 镜像 |
-| `make docker-login-aliyun` | 登录阿里云镜像仓库 |
-| `make docker-push-aliyun` | 推送镜像到阿里云镜像仓库 |
-| `make publish-x86` | 本机交叉编译 x86、打镜像并推送阿里云 |
+| `make docker-push-aliyun` | 推送镜像到默认镜像仓库 |
+| `make publish-x86` | 本机交叉编译 x86、打镜像并推送 |
 | `make docker-up` | 重启服务容器 |
 | `make deploy` | `deploy-x86` 的别名 |
 | `make deploy-x86` | 本机 `release-x86 + docker-build + docker-up` |
@@ -131,24 +130,12 @@ make help
 
 ## 构建与部署
 
-生产部署推荐改为本机完成构建和镜像发布，服务器只拉取镜像并重启容器。Dockerfile 只复制本机已经编译好的 `backend/server/build/patrick-im-server`，不会在 Docker 镜像里编译前端或 Rust。
-
-本机首次使用阿里云镜像仓库时先登录：
-
-```bash
-docker login --username=百岁平安1 crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com
-```
+生产部署推荐改为本机完成构建和镜像发布，服务器只拉取公共镜像并重启容器。Dockerfile 只复制本机已经编译好的 `backend/server/build/patrick-im-server`，不会在 Docker 镜像里编译前端或 Rust。
 
 发布默认 `latest` 镜像：
 
 ```bash
 make publish-x86
-```
-
-默认推送到：
-
-```text
-crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com/patrickcmh/patrick-im:latest
 ```
 
 `make publish-x86` 会依次完成：
@@ -159,7 +146,7 @@ crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com/patrickcmh/patrick-im:
 4. 交叉编译 `x86_64-unknown-linux-gnu` release 二进制。
 5. 复制二进制到 `backend/server/build/patrick-im-server`。
 6. 用本地二进制构建 `linux/amd64` runtime 镜像。
-7. 给镜像打上阿里云仓库 tag 并 push。
+7. 给镜像打上远端 tag 并 push。
 
 如果 macOS 上已经安装 `cargo-zigbuild`，`make release-x86` 会优先使用它交叉编译，通常比直接 `cargo build --target x86_64-unknown-linux-gnu` 更稳。
 
@@ -168,19 +155,13 @@ crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com/patrickcmh/patrick-im:
 新服务器推荐直接使用一键安装脚本，不需要在服务器拉源码或本地构建。脚本只检查 Docker Engine 和 Docker Compose plugin 是否存在，不会替你安装 Docker；检查通过后会生成 `/opt/patrick-im/.env`，创建 MySQL 和文件存储目录，然后拉起服务：
 
 ```bash
-curl -fsSL https://gitee.com/cai-happy/patrickim/raw/main/ops/install.sh | sudo bash
-```
-
-如果镜像仓库需要登录，可以先手动登录：
-
-```bash
-docker login --username=百岁平安1 crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com
+curl -fsSL https://gitee.com/cai-happy/patrick-im/raw/main/ops/install.sh | sudo bash
 ```
 
 也可以把公网地址一起传入：
 
 ```bash
-curl -fsSL https://gitee.com/cai-happy/patrickim/raw/main/ops/install.sh | sudo env PATRICK_IM_PUBLIC_BASE_URL=https://im.example.com bash
+curl -fsSL https://gitee.com/cai-happy/patrick-im/raw/main/ops/install.sh | sudo env PATRICK_IM_PUBLIC_BASE_URL=https://im.example.com bash
 ```
 
 默认安装目录：
@@ -204,7 +185,6 @@ docker compose up -d --remove-orphans
 如果服务器上已经有自己的 compose/env 布局，也可以只拉新镜像并重启：
 
 ```bash
-export PATRICK_IM_IMAGE=crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com/patrickcmh/patrick-im:latest
 docker compose -f ops/docker-compose.server.yml pull patrick-im-server
 docker compose -f ops/docker-compose.server.yml up -d --force-recreate --remove-orphans patrick-im-server
 ```

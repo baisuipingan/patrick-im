@@ -9,7 +9,6 @@ PUBLIC_BASE_URL="${PATRICK_IM_PUBLIC_BASE_URL:-http://127.0.0.1:5800}"
 HOST_BIND="${PATRICK_IM_HOST_BIND:-0.0.0.0:5800}"
 MYSQL_DATABASE="${PATRICK_IM_MYSQL_DATABASE:-patrick_im}"
 MYSQL_USER="${PATRICK_IM_MYSQL_USER:-patrick_im}"
-REGISTRY_HOST="crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com"
 SCRIPT_PATH="${BASH_SOURCE[0]:-}"
 SCRIPT_DIR=""
 if [[ -n "${SCRIPT_PATH}" && -f "${SCRIPT_PATH}" && "$(basename -- "${SCRIPT_PATH}")" != "bash" ]]; then
@@ -95,15 +94,6 @@ EOF
   chmod 600 "${INSTALL_DIR}/.env"
 }
 
-docker_login_if_requested() {
-  if [[ -n "${ALIYUN_USERNAME:-}" && -n "${ALIYUN_PASSWORD:-}" ]]; then
-    log "Logging in to Aliyun Container Registry..."
-    printf '%s' "${ALIYUN_PASSWORD}" | docker login --username="${ALIYUN_USERNAME}" --password-stdin "${REGISTRY_HOST}"
-  else
-    warn "Skipping docker login. If image pull fails, run: docker login --username=<your-aliyun-username> ${REGISTRY_HOST}"
-  fi
-}
-
 start_stack() {
   cd "${INSTALL_DIR}"
   docker compose pull
@@ -115,7 +105,6 @@ need_root
 check_docker
 download_compose
 write_env
-docker_login_if_requested
 start_stack
 
 log "${APP_NAME} installed at ${INSTALL_DIR}"
