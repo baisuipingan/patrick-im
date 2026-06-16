@@ -155,13 +155,13 @@ make publish-x86
 新服务器推荐直接使用一键安装脚本，不需要在服务器拉源码或本地构建。脚本只检查 Docker Engine 和 Docker Compose plugin 是否存在，不会替你安装 Docker；检查通过后会生成 `/opt/patrick-im/.env`，创建 MySQL 和文件存储目录，然后拉起服务：
 
 ```bash
-curl -fsSL https://gitee.com/cai-happy/patrick-im/raw/main/ops/install.sh | sudo bash
+curl -fsSL https://gitee.com/cai-happy/patrickim/raw/main/ops/install.sh | sudo bash
 ```
 
 也可以把公网地址一起传入：
 
 ```bash
-curl -fsSL https://gitee.com/cai-happy/patrick-im/raw/main/ops/install.sh | sudo env PATRICK_IM_PUBLIC_BASE_URL=https://im.example.com bash
+curl -fsSL https://gitee.com/cai-happy/patrickim/raw/main/ops/install.sh | sudo env PATRICK_IM_PUBLIC_BASE_URL=https://im.example.com bash
 ```
 
 默认安装目录：
