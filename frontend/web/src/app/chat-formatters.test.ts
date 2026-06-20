@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   directPathDescription,
   directPathLabel,
+  formatClockTime,
   formatTransferNote,
   getMessageThreadKey,
   socketStatusLabel,
@@ -43,6 +44,10 @@ describe('chat-formatters', () => {
     expect(transportLabel('direct-p2p')).toBe('局域网直连');
     expect(transportLabel('server-relay')).toBe('中继');
     expect(formatTransferNote('saved directly to receive directory')).toBe('已直接写入接收目录');
+  });
+
+  it('formats message timestamps with full date and time', () => {
+    expect(formatClockTime(new Date(2026, 5, 20, 16, 13).getTime())).toBe('2026-06-20 16:13');
   });
 
   it('derives thread key for global and private messages', () => {
