@@ -256,22 +256,17 @@ export function TransferPanel({
   return (
     <div className="border-t border-slate-200 bg-white px-4 py-3">
       {transferRows.map((transfer) => {
-        const relayTaskState = getRelayTaskState(transfer.id);
         const percent =
           transfer.totalBytes > 0 ? Math.min(100, Math.round((transfer.transferredBytes / transfer.totalBytes) * 100)) : 0;
         const isDone = transfer.status === 'complete';
         const isFailed = transfer.status === 'failed' || transfer.status === 'declined';
         const isPaused = transfer.status === 'paused';
-        const canPause =
-          transfer.transport === 'server-relay' &&
-          transfer.direction === 'upload' &&
-          transfer.status === 'streaming' &&
-          relayTaskState === 'uploading';
+        const canPause = false;
         const canResume =
           transfer.transport === 'server-relay' &&
           transfer.direction === 'upload' &&
           transfer.status === 'paused' &&
-          relayTaskState === 'paused';
+          getRelayTaskState(transfer.id) === 'paused';
         const canCancel =
           transfer.status === 'pending' || transfer.status === 'streaming' || transfer.status === 'paused';
 

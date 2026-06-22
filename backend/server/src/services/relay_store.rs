@@ -8,9 +8,11 @@ use crate::signing::{create_signed_token, read_signed_token};
 use crate::utils::{build_object_key, now_ms, sanitize_file_name, sanitize_room_id};
 use anyhow::{Context, Result, anyhow};
 use axum::body::Bytes;
+use axum::extract::multipart::Field;
+use futures_util::{Stream, StreamExt};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
+use object_store::{ObjectStore, PutPayload, WriteMultipart};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -70,6 +72,16 @@ pub struct ResumeRelayUploadInput {
 pub struct RelayUploadHandle {
     pub file_id: String,
     pub object_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoreRelayFileInput {
+    pub room_id: String,
+    pub file_name: String,
+    pub content_type: String,
+    pub size: u64,
+    pub target_id: Option<String>,
+    pub from_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +206,109 @@ impl RelayStore {
         Ok(RelayUploadPartResponse {
             partNumber: part_number,
             etag,
+        })
+    }
+
+    pub async fn store_file_field(
+        &self,
+        input: StoreRelayFileInput,
+        field: Field<'_>,
+    ) -> Result<CompletedRelayUpload> {
+        let chunks = futures_util::stream::unfold(field, |mut field| async move {
+            match field.chunk().await {
+                Ok(Some(chunk)) => Some((Ok(chunk), field)),
+                Ok(None) => None,
+                Err(error) => Some((
+                    Err(anyhow!(error).context("failed to read relay upload stream")),
+                    field,
+                )),
+            }
+        });
+
+        self.store_file_stream(input, chunks).await
+    }
+
+    async fn store_file_stream<S>(
+        &self,
+        input: StoreRelayFileInput,
+        chunks: S,
+    ) -> Result<CompletedRelayUpload>
+    where
+        S: Stream<Item = Result<Bytes>>,
+    {
+        let room_id = sanitize_room_id(&input.room_id);
+        let file_name = sanitize_file_name(&input.file_name);
+        let content_type = normalize_content_type(&input.content_type);
+        let file_id = Uuid::new_v4().to_string();
+        let object_key = build_object_key(&room_id, &file_id, &file_name);
+        let object_path = object_path(&object_key);
+        let upload = self
+            .store
+            .put_multipart(&object_path)
+            .await
+            .with_context(|| {
+                format!("failed to open relay object multipart upload {object_key}")
+            })?;
+        let mut writer = WriteMultipart::new(upload);
+        let mut total_size = 0_u64;
+        futures_util::pin_mut!(chunks);
+
+        while let Some(chunk) = chunks.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    writer.abort().await.with_context(|| {
+                        format!(
+                            "failed to abort errored relay object multipart upload {object_key}"
+                        )
+                    })?;
+                    return Err(error);
+                }
+            };
+            total_size = total_size
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| anyhow!("relay upload size overflow"))?;
+            if total_size > input.size {
+                writer.abort().await.with_context(|| {
+                    format!("failed to abort oversized relay object multipart upload {object_key}")
+                })?;
+                return Err(anyhow!(
+                    "relay upload exceeded declared size: expected {}, got at least {}",
+                    input.size,
+                    total_size
+                ));
+            }
+            writer.wait_for_capacity(4).await.with_context(|| {
+                format!("failed while waiting to store relay object {object_key}")
+            })?;
+            writer.put(chunk);
+        }
+
+        if total_size != input.size {
+            writer.abort().await.with_context(|| {
+                format!("failed to abort mismatched relay object multipart upload {object_key}")
+            })?;
+            return Err(anyhow!(
+                "relay upload size mismatch: expected {}, got {}",
+                input.size,
+                total_size
+            ));
+        }
+
+        writer.finish().await.with_context(|| {
+            format!("failed to finish relay object multipart upload {object_key}")
+        })?;
+
+        Ok(CompletedRelayUpload {
+            file_id,
+            room_id,
+            file_name,
+            size: input.size,
+            content_type,
+            object_key,
+            target_id: input.target_id,
+            from_id: input.from_id,
+            created_at: now_ms(),
         })
     }
 
@@ -687,6 +802,67 @@ mod tests {
                 .join(&created.token_payload.uploadId)
                 .exists()
         );
+    }
+
+    #[tokio::test]
+    async fn stores_streamed_file_with_object_store_multipart_writer() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let store = RelayStore::new(&test_config(temp_dir.path().join("files")))
+            .await
+            .expect("create relay store");
+        let chunks = vec![
+            Ok(Bytes::from_static(b"hello ")),
+            Ok(Bytes::from_static(b"streamed ")),
+            Ok(Bytes::from_static(b"upload")),
+        ];
+        let completed = store
+            .store_file_stream(
+                StoreRelayFileInput {
+                    room_id: "room-a".to_owned(),
+                    file_name: "demo.txt".to_owned(),
+                    content_type: "text/plain".to_owned(),
+                    size: 21,
+                    target_id: None,
+                    from_id: "client-1".to_owned(),
+                },
+                futures_util::stream::iter(chunks),
+            )
+            .await
+            .expect("store streamed file");
+
+        let object = store
+            .get_object(&completed.object_key)
+            .await
+            .expect("read stored object");
+        let bytes = tokio::fs::read(&object.path)
+            .await
+            .expect("read object bytes");
+        assert_eq!(object.size, 21);
+        assert_eq!(&bytes, b"hello streamed upload");
+    }
+
+    #[tokio::test]
+    async fn streamed_file_upload_rejects_size_mismatch() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let store = RelayStore::new(&test_config(temp_dir.path().join("files")))
+            .await
+            .expect("create relay store");
+        let error = store
+            .store_file_stream(
+                StoreRelayFileInput {
+                    room_id: "room-a".to_owned(),
+                    file_name: "demo.txt".to_owned(),
+                    content_type: "text/plain".to_owned(),
+                    size: 100,
+                    target_id: None,
+                    from_id: "client-1".to_owned(),
+                },
+                futures_util::stream::iter(vec![Ok(Bytes::from_static(b"too small"))]),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("relay upload size mismatch"));
     }
 
     #[tokio::test]

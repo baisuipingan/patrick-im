@@ -5,6 +5,7 @@ import type {
   RelayDiscardUploadRequest,
   RelayUploadPartResponse,
   RelayUploadResponse,
+  RelayUploadStoredResponse,
 } from '@shared/protocol';
 import type { TransferUpdate } from '@/lib/peer-mesh';
 import type {
@@ -19,6 +20,7 @@ import {
   buildRelayAwaitingSyncNote,
   buildRelayPausedNote,
   buildRelayUploadNote,
+  createRelayUploadCancelledError,
   getRelayTaskVisibleTransferredBytes,
   getRelayUploadConcurrency,
   isRelayUploadCancelledError,
@@ -123,6 +125,16 @@ async function fetchRelayJson(
 function formatRelayUploadError(error: unknown): string {
   const message = error instanceof Error && error.message ? error.message : '';
   switch (message) {
+    case 'relay_upload_idle_timeout':
+      return '上传长时间没有进度，已自动中断，请重试或检查反向代理上传超时设置';
+    case 'relay_upload_timeout':
+      return '上传等待服务器响应超时，请检查反向代理或服务器文件写入是否卡住';
+    case 'relay_upload_failed':
+      return '上传网络异常';
+    case 'relay_upload_bad_response':
+      return '服务器返回了无法识别的上传响应';
+    case 'upload_part_idle_timeout':
+      return '分片上传长时间没有进度，已自动中断，请重试或检查反向代理上传超时设置';
     case 'upload_part_timeout':
       return '分片上传等待服务器响应超时，请检查反向代理或服务器文件写入是否卡住';
     case 'upload_part_failed':
@@ -136,6 +148,96 @@ function formatRelayUploadError(error: unknown): string {
     default:
       return message || '服务端中继上传失败，请重试';
   }
+}
+
+function uploadRelayFileWithFormData(options: {
+  file: File;
+  roomId: string;
+  task: RelayUploadTask;
+  targetId: string | null;
+  onProgress: (transferredBytes: number) => void;
+}): Promise<RelayUploadStoredResponse> {
+  const { file, onProgress, roomId, targetId, task } = options;
+
+  return new Promise<RelayUploadStoredResponse>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    let settled = false;
+    let lastActivityAt = Date.now();
+    let idleTimedOut = false;
+    const idleTimer = window.setInterval(() => {
+      if (settled) {
+        return;
+      }
+      if (Date.now() - lastActivityAt < 60_000) {
+        return;
+      }
+
+      idleTimedOut = true;
+      xhr.abort();
+    }, 5_000);
+    const finish = (callback: () => void) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      window.clearInterval(idleTimer);
+      task.xhrs.delete(xhr);
+      callback();
+    };
+
+    task.xhrs.add(xhr);
+    xhr.open('POST', '/api/files/relay-upload', true);
+    xhr.timeout = 10 * 60 * 1000;
+    xhr.upload.onprogress = (event) => {
+      lastActivityAt = Date.now();
+      if (event.lengthComputable) {
+        onProgress(Math.min(file.size, event.loaded));
+      }
+    };
+    xhr.onabort = () => {
+      finish(() => {
+        reject(idleTimedOut ? new Error('relay_upload_idle_timeout') : createRelayUploadCancelledError());
+      });
+    };
+    xhr.onerror = () => {
+      finish(() => {
+        reject(new Error('relay_upload_failed'));
+      });
+    };
+    xhr.ontimeout = () => {
+      finish(() => {
+        reject(new Error('relay_upload_timeout'));
+      });
+    };
+    xhr.onload = () => {
+      lastActivityAt = Date.now();
+      finish(() => {
+        if (xhr.status < 200 || xhr.status >= 300) {
+          try {
+            const payload = JSON.parse(xhr.responseText) as { error?: unknown };
+            reject(new Error(typeof payload.error === 'string' ? payload.error : `relay_upload_failed_${xhr.status}`));
+          } catch {
+            reject(new Error(`relay_upload_failed_${xhr.status}`));
+          }
+          return;
+        }
+
+        try {
+          resolve(JSON.parse(xhr.responseText) as RelayUploadStoredResponse);
+        } catch {
+          reject(new Error('relay_upload_bad_response'));
+        }
+      });
+    };
+
+    const formData = new FormData();
+    formData.set('roomId', roomId);
+    formData.set('targetId', targetId ?? '');
+    formData.set('size', String(file.size));
+    formData.set('file', file, file.name);
+    xhr.send(formData);
+  });
 }
 
 export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadControls {
@@ -226,13 +328,15 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
   }
 
   function markRelayTransferSynced(fileId: string): void {
-    const existing = transfersRef.current[fileId];
+    const ticket = relayAnnounceQueueRef.current.find((item) => item.fileId === fileId);
+    const transferId = ticket?.transferId ?? fileId;
+    const existing = transfersRef.current[transferId];
     if (!existing || existing.transport !== 'server-relay' || existing.direction !== 'upload') {
       return;
     }
 
     updateTransfer({
-      transferId: existing.id,
+      transferId,
       peerId: existing.peerId,
       peerName: existing.peerName,
       fileName: existing.fileName,
@@ -263,11 +367,12 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
     });
 
     if (announced) {
+      const transferId = ticket.transferId ?? ticket.fileId;
       updateTransfer({
-        transferId: ticket.fileId,
-        peerId: transfersRef.current[ticket.fileId]?.peerId ?? (ticket.targetId ?? '__global__'),
+        transferId,
+        peerId: transfersRef.current[transferId]?.peerId ?? (ticket.targetId ?? '__global__'),
         peerName:
-          transfersRef.current[ticket.fileId]?.peerName ??
+          transfersRef.current[transferId]?.peerName ??
           (ticket.targetId ? getPeerDisplayName(ticket.targetId) : '整个房间'),
         fileName: ticket.fileName,
         totalBytes: ticket.size,
@@ -573,10 +678,12 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
     wakeRelayTaskResume(task);
     closedTransferIdsRef.current.add(task.transferId);
     forgetRelayAnnounce(task.transferId);
-    if (abortOptions.cleanup === 'discard') {
-      dispatchRelayDiscard(task.uploadToken, abortOptions.transport);
-    } else {
-      dispatchRelayAbort(task.uploadToken, abortOptions.transport);
+    if (task.uploadToken) {
+      if (abortOptions.cleanup === 'discard') {
+        dispatchRelayDiscard(task.uploadToken, abortOptions.transport);
+      } else {
+        dispatchRelayAbort(task.uploadToken, abortOptions.transport);
+      }
     }
     relayUploadTasksRef.current.delete(task.transferId);
     setTransfers((current) => {
@@ -737,44 +844,22 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
     const clientRequestId = pendingAttachmentId ?? crypto.randomUUID();
     let task: RelayUploadTask | null = null;
     try {
-      const uploadRequest = await fetchRelayJson(
-        '/api/files/upload-request',
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            clientRequestId,
-            roomId,
-            fileName: file.name,
-            contentType: file.type,
-            size: file.size,
-            targetId,
-          }),
-        },
-        { fallback: 'upload_request_failed', timeoutMs: 30_000 },
-      );
-
-      const payload = (await uploadRequest.json()) as RelayUploadResponse;
-      const totalParts = payload.parts.length;
-      const concurrency = getRelayUploadConcurrency(file.size, totalParts);
       task = {
-        transferId: payload.fileId,
+        transferId: clientRequestId,
         clientRequestId,
         fileName: file.name,
-        uploadToken: payload.uploadToken,
+        uploadToken: '',
         roomId,
         targetId,
         peerId,
         peerName,
         file,
-        chunkSizeBytes: payload.chunkSizeBytes,
+        chunkSizeBytes: file.size,
         totalBytes: file.size,
-        totalParts,
-        concurrency,
-        partsByNumber: new Map(payload.parts.map((part) => [part.partNumber, part])),
-        pendingPartNumbers: payload.parts.map((part) => part.partNumber),
+        totalParts: 1,
+        concurrency: 1,
+        partsByNumber: new Map(),
+        pendingPartNumbers: [],
         inFlightPartNumbers: new Set(),
         uploadedParts: new Map(),
         loadedByPart: new Map(),
@@ -787,14 +872,12 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
         cancelled: false,
         xhrs: new Set(),
       };
-      applyRelayUploadSnapshot(task, payload);
 
       if (activeRoomRef.current !== roomId) {
-        dispatchRelayAbort(task.uploadToken, 'fetch');
         return;
       }
 
-      relayUploadTasksRef.current.set(payload.fileId, task);
+      relayUploadTasksRef.current.set(task.transferId, task);
 
       updateTransfer({
         transferId: task.transferId,
@@ -806,60 +889,42 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
         direction: 'upload',
         transport: 'server-relay',
         status: 'pending',
-        note:
-          task.uploadedParts.size > 0
-            ? buildRelayUploadNote(totalParts, concurrency, '继续上传到服务器存储')
-            : '等待上传到服务器存储',
+        note: '等待上传到服务器存储',
       });
       if (pendingAttachmentId) {
         removePendingFile(pendingAttachmentId);
       }
 
-      while (task.uploadedParts.size < task.totalParts) {
-        if (task.cancelled || closedTransferIdsRef.current.has(task.transferId)) {
-          return;
-        }
+      const completed = await uploadRelayFileWithFormData({
+        file,
+        roomId,
+        task,
+        targetId,
+        onProgress: (transferredBytes) => {
+          if (!task) {
+            return;
+          }
+          task.loadedByPart.set(1, transferredBytes);
+          updateTransfer({
+            transferId: task.transferId,
+            peerId,
+            peerName,
+            fileName: file.name,
+            totalBytes: file.size,
+            transferredBytes: rememberRelayTaskDisplayedBytes(task, transferredBytes),
+            direction: 'upload',
+            transport: 'server-relay',
+            status: 'streaming',
+            note: '正在上传到服务器存储',
+          });
+        },
+      });
 
-        if (task.stage === 'paused') {
-          await waitForRelayTaskResume(task);
-          continue;
-        }
-
-        await uploadRelayPartsConcurrently({
-          task,
-          onAckPart: ackRelayUploadPart,
-          onProgress: (transferredBytes, nextTotalParts, nextConcurrency) => {
-            if (!task) {
-              return;
-            }
-            const relayStage = task.stage;
-            const pauseReason = task.pauseReason;
-            updateTransfer({
-              transferId: payload.fileId,
-              peerId,
-              peerName,
-              fileName: file.name,
-              totalBytes: file.size,
-              transferredBytes: rememberRelayTaskDisplayedBytes(task, transferredBytes),
-              direction: 'upload',
-              transport: 'server-relay',
-              status: relayStage === 'paused' ? 'paused' : 'streaming',
-              note:
-                relayStage === 'paused'
-                  ? buildRelayPausedNote(pauseReason)
-                  : buildRelayUploadNote(nextTotalParts, nextConcurrency),
-            });
-          },
-        });
-      }
-
-      if (task.cancelled || closedTransferIdsRef.current.has(task.transferId)) {
+      if (!task) {
         return;
       }
-
-      task.stage = 'completing';
       updateTransfer({
-        transferId: payload.fileId,
+        transferId: task.transferId,
         peerId,
         peerName,
         fileName: file.name,
@@ -868,31 +933,17 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
         direction: 'upload',
         transport: 'server-relay',
         status: 'streaming',
-        note: '分片已上传，正在等待服务器合并确认',
+        note: '文件已上传，等待同步到聊天记录',
       });
-      const completeResponse = await fetchRelayJson(
-        '/api/files/complete',
-        {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            uploadToken: task.uploadToken,
-            parts: [...task.uploadedParts.values()].sort((left, right) => left.partNumber - right.partNumber),
-          }),
-        },
-        { fallback: 'upload_complete_failed', timeoutMs: 120_000 },
-      );
 
       if (task.cancelled || closedTransferIdsRef.current.has(task.transferId)) {
         return;
       }
 
-      const completed = (await completeResponse.json()) as Pick<RelayUploadResponse, 'fileId' | 'objectKey'>;
       task.stage = 'awaiting-sync';
       const announceTicket: PendingRelayAnnounceTicket = {
-        uploadToken: task.uploadToken,
+        uploadToken: '',
+        transferId: task.transferId,
         roomId,
         fileId: completed.fileId,
         fileName: file.name,
@@ -912,12 +963,12 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
 
       if (!canAnnounce) {
         updateTransfer({
-          transferId: payload.fileId,
+          transferId: task.transferId,
           peerId,
           peerName,
           fileName: file.name,
           totalBytes: file.size,
-          transferredBytes: task ? rememberRelayTaskDisplayedBytes(task, file.size) : file.size,
+          transferredBytes: rememberRelayTaskDisplayedBytes(task, file.size),
           direction: 'upload',
           transport: 'server-relay',
           status: 'streaming',
@@ -926,12 +977,12 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
         return;
       }
       updateTransfer({
-        transferId: payload.fileId,
+        transferId: task.transferId,
         peerId,
         peerName,
         fileName: file.name,
         totalBytes: file.size,
-        transferredBytes: task ? rememberRelayTaskDisplayedBytes(task, file.size) : file.size,
+        transferredBytes: rememberRelayTaskDisplayedBytes(task, file.size),
         direction: 'upload',
         transport: 'server-relay',
         status: 'streaming',
@@ -942,7 +993,7 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
         return;
       }
 
-      if (task && (task.stage === 'uploading' || task.stage === 'completing' || task.stage === 'failed')) {
+      if (task?.uploadToken && (task.stage === 'uploading' || task.stage === 'completing' || task.stage === 'failed')) {
         dispatchRelayAbort(task.uploadToken, 'keepalive');
       }
 
@@ -976,8 +1027,8 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
   }
 
   function acknowledgeRelayMessage(fileId: string): void {
-    forgetRelayAnnounce(fileId);
     markRelayTransferSynced(fileId);
+    forgetRelayAnnounce(fileId);
   }
 
   return {

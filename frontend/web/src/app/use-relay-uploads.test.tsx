@@ -2,31 +2,11 @@ import React from 'react';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { uploadRelayPartsConcurrently } from '@/app/relay-utils';
 import { useRelayUploads, type RelayUploadControls } from '@/app/use-relay-uploads';
 import type { TransferRow, UiMessage } from '@/app/types';
 
 let latestControls: RelayUploadControls | null = null;
 let latestHarnessState: HarnessState | null = null;
-let mockUploadRelayParts = true;
-
-vi.mock('@/app/relay-utils', async () => {
-  const actual = await vi.importActual<typeof import('@/app/relay-utils')>('@/app/relay-utils');
-  return {
-    ...actual,
-    uploadRelayPartsConcurrently: vi.fn(
-      async (...args: Parameters<typeof actual.uploadRelayPartsConcurrently>) => {
-        if (!mockUploadRelayParts) {
-          return await actual.uploadRelayPartsConcurrently(...args);
-        }
-        await new Promise<void>(() => {
-          // Keep the mocked upload in-flight so the hook has a live relay task to abort.
-        });
-      },
-    ),
-  };
-});
-
 interface HarnessState {
   messagesRef: React.RefObject<UiMessage[]>;
   transfersRef: React.RefObject<Record<string, TransferRow>>;
@@ -90,29 +70,54 @@ class SuccessfulUploadXHR {
   onerror: (() => void) | null = null;
   onload: (() => void) | null = null;
   ontimeout: (() => void) | null = null;
-  private partNumber = 0;
+  aborted = false;
 
-  open(_method: string, url: string): void {
-    this.partNumber = Number(url.split('/').pop());
-  }
+  open(): void {}
 
   setRequestHeader(): void {}
 
-  send(chunk: Blob): void {
+  send(body: BodyInit): void {
     SuccessfulUploadXHR.requests.push(this);
     window.setTimeout(() => {
-      this.upload.onprogress?.({ lengthComputable: true, loaded: chunk.size } as ProgressEvent);
+      this.upload.onprogress?.({ lengthComputable: true, loaded: getBodySize(body) } as ProgressEvent);
       this.responseText = JSON.stringify({
-        partNumber: this.partNumber,
-        etag: `etag-${this.partNumber}`,
+        fileId: 'file-1',
+        objectKey: 'obj/file-1',
       });
       this.onload?.();
     }, 0);
   }
 
   abort(): void {
+    this.aborted = true;
     this.onabort?.();
   }
+}
+
+class HangingUploadXHR extends SuccessfulUploadXHR {
+  send(_body: BodyInit): void {
+    SuccessfulUploadXHR.requests.push(this);
+  }
+}
+
+class TimeoutUploadXHR extends SuccessfulUploadXHR {
+  send(_body: BodyInit): void {
+    SuccessfulUploadXHR.requests.push(this);
+  }
+}
+
+function getBodySize(body: BodyInit): number {
+  if (body instanceof Blob) {
+    return body.size;
+  }
+  if (body instanceof FormData) {
+    const file = body.get('file');
+    return file instanceof File ? file.size : 0;
+  }
+  if (typeof body === 'string') {
+    return body.length;
+  }
+  return 0;
 }
 
 function renderHarness() {
@@ -138,7 +143,6 @@ describe('use-relay-uploads', () => {
   beforeEach(() => {
     latestControls = null;
     latestHarnessState = null;
-    mockUploadRelayParts = true;
     SuccessfulUploadXHR.requests = [];
     window.localStorage.clear();
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
@@ -189,6 +193,7 @@ describe('use-relay-uploads', () => {
   });
 
   it('aborts thread-scoped relay upload tasks when thread is cleared', async () => {
+    vi.stubGlobal('XMLHttpRequest', HangingUploadXHR);
     const view = renderHarness();
     const file = new File(['hello'], 'hello.txt', { type: 'text/plain' });
 
@@ -201,52 +206,20 @@ describe('use-relay-uploads', () => {
       await Promise.resolve();
     });
 
-    expect(latestControls?.getRelayTaskState('file-1')).toBe('uploading');
+    expect(latestControls?.getRelayTaskState('pending-1')).toBe('uploading');
 
     act(() => {
       latestControls?.abortRelayUploadsForThread('peer-1');
     });
 
-    expect(latestControls?.getRelayTaskState('file-1')).toBe(null);
+    expect(SuccessfulUploadXHR.requests[0]?.aborted).toBe(true);
+    expect(latestControls?.getRelayTaskState('pending-1')).toBe(null);
 
     view.unmount();
   });
 
   it('completes relay upload after all parts are acknowledged', async () => {
-    mockUploadRelayParts = false;
     vi.stubGlobal('XMLHttpRequest', SuccessfulUploadXHR);
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
-      const url = typeof input === 'string' ? input : input.toString();
-      if (url.endsWith('/api/files/upload-request')) {
-        return new Response(
-          JSON.stringify({
-            fileId: 'file-1',
-            objectKey: 'obj/file-1',
-            uploadToken: 'token-1',
-            chunkSizeBytes: 5,
-            uploadedParts: [],
-            parts: [
-              { partNumber: 1, uploadUrl: '/api/files/upload-part/1' },
-              { partNumber: 2, uploadUrl: '/api/files/upload-part/2' },
-            ],
-          }),
-          { status: 200, headers: { 'content-type': 'application/json' } },
-        );
-      }
-
-      if (url.endsWith('/api/files/complete')) {
-        return new Response(
-          JSON.stringify({
-            fileId: 'file-1',
-            objectKey: 'obj/file-1',
-          }),
-          { status: 200, headers: { 'content-type': 'application/json' } },
-        );
-      }
-
-      throw new Error(`unexpected fetch: ${url}`);
-    });
-    vi.stubGlobal('fetch', fetchMock);
     const view = renderHarness();
     const file = new File(['hello-world'], 'hello.txt', { type: 'text/plain' });
 
@@ -258,58 +231,23 @@ describe('use-relay-uploads', () => {
       await new Promise((resolve) => window.setTimeout(resolve, 20));
     });
 
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/api/files/complete',
-      expect.objectContaining({
-        method: 'POST',
-      }),
-    );
-    const completeCall = fetchMock.mock.calls.find(([url]) => url === '/api/files/complete');
-    expect(completeCall).toBeDefined();
-    const completeInit = completeCall?.[1] as unknown as RequestInit;
-    const completeBody = JSON.parse(completeInit.body as string) as { parts: unknown[] };
-    expect(completeBody.parts).toHaveLength(2);
+    expect(SuccessfulUploadXHR.requests).toHaveLength(1);
     expect(latestHarnessState?.sendServerMessage).toHaveBeenCalledWith(
       expect.objectContaining({
         type: 'relay-file-announced',
+        file: expect.objectContaining({
+          fileId: 'file-1',
+          objectKey: 'obj/file-1',
+        }),
       }),
     );
-    expect(uploadRelayPartsConcurrently).toHaveBeenCalled();
 
     view.unmount();
   });
 
   it('shows a clear failure when server completion times out', async () => {
-    mockUploadRelayParts = false;
     vi.useFakeTimers();
-    vi.stubGlobal('XMLHttpRequest', SuccessfulUploadXHR);
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === 'string' ? input : input.toString();
-      if (url.endsWith('/api/files/upload-request')) {
-        return new Response(
-          JSON.stringify({
-            fileId: 'file-1',
-            objectKey: 'obj/file-1',
-            uploadToken: 'token-1',
-            chunkSizeBytes: 5,
-            uploadedParts: [],
-            parts: [{ partNumber: 1, uploadUrl: '/api/files/upload-part/1' }],
-          }),
-          { status: 200, headers: { 'content-type': 'application/json' } },
-        );
-      }
-
-      if (url.endsWith('/api/files/complete')) {
-        return await new Promise<Response>((_resolve, reject) => {
-          init?.signal?.addEventListener('abort', () => {
-            reject(new DOMException('aborted', 'AbortError'));
-          });
-        });
-      }
-
-      throw new Error(`unexpected fetch: ${url}`);
-    });
-    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('XMLHttpRequest', TimeoutUploadXHR);
     const view = renderHarness();
     const file = new File(['hello'], 'hello.txt', { type: 'text/plain' });
 
@@ -318,21 +256,18 @@ describe('use-relay-uploads', () => {
     });
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(20);
-    });
-    await act(async () => {
-      await vi.advanceTimersByTimeAsync(120_000);
+      await vi.advanceTimersByTimeAsync(65_000);
       await Promise.resolve();
     });
 
     expect(latestHarnessState?.updateTransfer).toHaveBeenCalledWith(
       expect.objectContaining({
         status: 'failed',
-        note: expect.stringContaining('服务器合并文件超时'),
+        note: expect.stringContaining('长时间没有进度'),
       }),
     );
     expect(latestHarnessState?.showTransientNotice).toHaveBeenCalledWith(
-      expect.stringContaining('服务器合并文件超时'),
+      expect.stringContaining('长时间没有进度'),
       4200,
     );
 

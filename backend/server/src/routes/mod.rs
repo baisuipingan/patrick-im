@@ -14,6 +14,13 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/healthz", get(health::healthz))
         .route("/api/session", get(session::session_info))
+        .route(
+            "/api/files/relay-upload",
+            post(files::relay_upload).layer(DefaultBodyLimit::max(
+                (crate::routes::files::RELAY_FILE_LIMIT_BYTES as usize)
+                    + crate::services::relay_store::RELAY_CHUNK_SIZE_BYTES,
+            )),
+        )
         .route("/api/files/upload-request", post(files::upload_request))
         .route(
             "/api/files/upload-part/{part_number}",

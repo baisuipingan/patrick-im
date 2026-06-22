@@ -194,6 +194,11 @@ export interface RelayCompleteUploadRequest {
   parts: RelayUploadedPart[];
 }
 
+export interface RelayUploadStoredResponse {
+  fileId: string;
+  objectKey: string;
+}
+
 export interface RelayAbortUploadRequest {
   uploadToken: string;
 }

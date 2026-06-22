@@ -56,6 +56,7 @@ export interface PendingRelayAbortTicket {
 
 export interface PendingRelayAnnounceTicket {
   uploadToken: string;
+  transferId?: string;
   roomId: string;
   fileId: string;
   fileName: string;

@@ -53,6 +53,7 @@ class TimeoutUploadXHR {
   status = 0;
   responseText = '';
   timeout = 0;
+  aborted = false;
   upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
   onabort: (() => void) | null = null;
   onerror: (() => void) | null = null;
@@ -68,6 +69,7 @@ class TimeoutUploadXHR {
   send(): void {}
 
   abort(): void {
+    this.aborted = true;
     this.onabort?.();
   }
 }
@@ -227,6 +229,27 @@ describe('relay-utils', () => {
 
     await expect(promise).rejects.toThrow('upload_part_timeout');
     expect(task.xhrs.size).toBe(0);
+    vi.unstubAllGlobals();
+  });
+
+  it('aborts a stalled upload part when no progress or response arrives', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('XMLHttpRequest', TimeoutUploadXHR);
+    const task = createTask();
+    const promise = uploadRelayPartWithProgress(
+      { partNumber: 1, uploadUrl: '/api/files/upload-part/1' },
+      getRelayPartBlobForTest(task, 1),
+      vi.fn(),
+      task,
+    );
+    const assertion = expect(promise).rejects.toThrow('upload_part_idle_timeout');
+
+    await vi.advanceTimersByTimeAsync(65_000);
+
+    expect(TimeoutUploadXHR.latest?.aborted).toBe(true);
+    await assertion;
+    expect(task.xhrs.size).toBe(0);
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 });

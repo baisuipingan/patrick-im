@@ -5,6 +5,8 @@ export const PENDING_RELAY_ABORTS_KEY = 'patrick-im:pending-relay-aborts';
 export const PENDING_RELAY_ANNOUNCES_KEY = 'patrick-im:pending-relay-announces';
 const MIB = 1024 * 1024;
 const RELAY_PART_UPLOAD_TIMEOUT_MS = 5 * 60 * 1000;
+const RELAY_PART_IDLE_TIMEOUT_MS = 60 * 1000;
+const RELAY_PART_IDLE_CHECK_MS = 5 * 1000;
 
 export function isRelayUploadCancelledError(error: unknown): boolean {
   return error instanceof Error && error.message === 'relay_upload_cancelled';
@@ -88,6 +90,9 @@ export function loadPendingRelayAnnounceTickets(): PendingRelayAnnounceTicket[] 
       }
 
       if (item.targetId !== null && typeof item.targetId !== 'string') {
+        return false;
+      }
+      if (item.transferId !== undefined && typeof item.transferId !== 'string') {
         return false;
       }
 
@@ -207,40 +212,75 @@ export function uploadRelayPartWithProgress(
     }
 
     const xhr = new XMLHttpRequest();
+    let settled = false;
+    let lastActivityAt = Date.now();
+    let idleTimedOut = false;
+
+    const clearIdleTimer = () => {
+      window.clearInterval(idleTimer);
+    };
+    const finish = (callback: () => void) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearIdleTimer();
+      task.xhrs.delete(xhr);
+      callback();
+    };
+    const idleTimer = window.setInterval(() => {
+      if (settled || task.cancelled) {
+        return;
+      }
+      if (Date.now() - lastActivityAt < RELAY_PART_IDLE_TIMEOUT_MS) {
+        return;
+      }
+
+      idleTimedOut = true;
+      xhr.abort();
+    }, RELAY_PART_IDLE_CHECK_MS);
+
     task.xhrs.add(xhr);
     xhr.open('POST', part.uploadUrl, true);
     xhr.timeout = RELAY_PART_UPLOAD_TIMEOUT_MS;
     xhr.setRequestHeader('content-type', 'application/octet-stream');
     xhr.setRequestHeader('x-patrick-im-upload-token', task.uploadToken);
     xhr.upload.onprogress = (event) => {
+      lastActivityAt = Date.now();
       if (event.lengthComputable) {
         onProgress(event.loaded);
       }
     };
     xhr.onabort = () => {
-      task.xhrs.delete(xhr);
-      reject(createRelayUploadCancelledError());
+      finish(() => {
+        reject(idleTimedOut ? new Error('upload_part_idle_timeout') : createRelayUploadCancelledError());
+      });
     };
     xhr.onerror = () => {
-      task.xhrs.delete(xhr);
-      reject(new Error('upload_part_failed'));
+      finish(() => {
+        reject(new Error('upload_part_failed'));
+      });
     };
     xhr.ontimeout = () => {
-      task.xhrs.delete(xhr);
-      reject(new Error('upload_part_timeout'));
+      finish(() => {
+        reject(new Error('upload_part_timeout'));
+      });
     };
     xhr.onload = () => {
-      task.xhrs.delete(xhr);
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          resolve(JSON.parse(xhr.responseText) as RelayUploadPartResponse);
-        } catch {
-          reject(new Error('upload_part_bad_response'));
-          return;
+      lastActivityAt = Date.now();
+      finish(() => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText) as RelayUploadPartResponse);
+          } catch {
+            reject(new Error('upload_part_bad_response'));
+            return;
+          }
+        } else {
+          reject(new Error(`upload_part_failed_${xhr.status}`));
         }
-      } else {
-        reject(new Error(`upload_part_failed_${xhr.status}`));
-      }
+      });
     };
 
     if (task.cancelled) {

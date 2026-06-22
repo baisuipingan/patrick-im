@@ -212,6 +212,12 @@ pub struct RelayCompleteUploadResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayUploadStoredResponse {
+    pub fileId: String,
+    pub objectKey: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayAbortUploadRequest {
     pub uploadToken: String,
 }

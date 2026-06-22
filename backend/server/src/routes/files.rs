@@ -1,9 +1,12 @@
 use crate::http::{ApiError, ApiResult, JsonResponse, ok_json};
 use crate::protocol::{
     RelayAbortUploadRequest, RelayCompleteUploadRequest, RelayCompleteUploadResponse,
-    RelayDiscardUploadRequest, RelayUploadRequest, RelayUploadResponse, RelayUploadedPart,
+    RelayDiscardUploadRequest, RelayUploadRequest, RelayUploadResponse, RelayUploadStoredResponse,
+    RelayUploadedPart,
 };
-use crate::services::relay_store::{RelayUploadTokenPayload, ResumeRelayUploadInput};
+use crate::services::relay_store::{
+    CompletedRelayUpload, RelayUploadTokenPayload, ResumeRelayUploadInput, StoreRelayFileInput,
+};
 use crate::session::require_session;
 use crate::state::AppState;
 use crate::store::message_store::{
@@ -14,6 +17,7 @@ use crate::utils::{encode_content_disposition_name, sanitize_file_name, sanitize
 use axum::Json;
 use axum::body::Body;
 use axum::body::Bytes;
+use axum::extract::Multipart;
 use axum::extract::{Path, State};
 use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -21,7 +25,7 @@ use axum::response::{IntoResponse, Response};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
-const RELAY_FILE_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+pub const RELAY_FILE_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct NormalizedRelayUploadRequest {
@@ -153,6 +157,93 @@ pub async fn upload_request(
     }
 }
 
+pub async fn relay_upload(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> JsonResponse<RelayUploadStoredResponse> {
+    let session = require_session(&headers, &state.config.session_secret)
+        .map_err(|error| ApiError::internal(format!("session decode error: {error}")))?
+        .ok_or_else(|| ApiError::unauthorized("missing session"))?;
+    let mut room_id: Option<String> = None;
+    let mut target_id: Option<String> = None;
+    let mut declared_size: Option<u64> = None;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request(format!("invalid multipart upload: {error}")))?
+    {
+        match field.name() {
+            Some("roomId") => {
+                room_id = Some(read_multipart_text(field, "roomId").await?);
+            }
+            Some("targetId") => {
+                let value = read_multipart_text(field, "targetId").await?;
+                if !value.trim().is_empty() {
+                    target_id = Some(value);
+                }
+            }
+            Some("size") => {
+                let value = read_multipart_text(field, "size").await?;
+                let size = value
+                    .parse::<u64>()
+                    .map_err(|_| ApiError::bad_request("invalid upload size"))?;
+                declared_size = Some(size);
+            }
+            Some("file") => {
+                let room_id = room_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| ApiError::bad_request("missing roomId"))?
+                    .to_owned();
+                let size = declared_size.ok_or_else(|| ApiError::bad_request("missing size"))?;
+                if size == 0 {
+                    return Err(ApiError::bad_request("file metadata is incomplete"));
+                }
+                if size > RELAY_FILE_LIMIT_BYTES {
+                    return Err(ApiError::payload_too_large(format!(
+                        "file too large for relay mode ({RELAY_FILE_LIMIT_BYTES} bytes max)"
+                    )));
+                }
+
+                let file_name = field
+                    .file_name()
+                    .map(ToOwned::to_owned)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| ApiError::bad_request("missing file name"))?;
+                let content_type = field
+                    .content_type()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "application/octet-stream".to_owned());
+                let completed = state
+                    .relay_store
+                    .store_file_field(
+                        StoreRelayFileInput {
+                            room_id,
+                            file_name,
+                            content_type,
+                            size,
+                            target_id,
+                            from_id: session.clientId.clone(),
+                        },
+                        field,
+                    )
+                    .await
+                    .map_err(ApiError::from_internal)?;
+                persist_completed_relay_upload(&state, &completed).await?;
+                return Ok(ok_json(RelayUploadStoredResponse {
+                    fileId: completed.file_id,
+                    objectKey: completed.object_key,
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    Err(ApiError::bad_request("missing file"))
+}
+
 pub async fn upload_part(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -201,6 +292,73 @@ pub async fn upload_part(
     );
 
     Ok(ok_json(part))
+}
+
+async fn persist_completed_relay_upload(
+    state: &AppState,
+    completed: &CompletedRelayUpload,
+) -> ApiResult<Option<RelayCompleteUploadResponse>> {
+    match state
+        .message_store
+        .store_completed_relay_upload(PendingRelayUpload {
+            file_id: completed.file_id.clone(),
+            room_id: completed.room_id.clone(),
+            from_id: completed.from_id.clone(),
+            target_id: completed.target_id.clone(),
+            file_name: completed.file_name.clone(),
+            size: completed.size,
+            content_type: completed.content_type.clone(),
+            object_key: completed.object_key.clone(),
+            created_at: completed.created_at,
+        })
+        .await
+    {
+        Ok(StorePendingRelayUploadOutcome::Inserted) => {}
+        Ok(StorePendingRelayUploadOutcome::Existing(existing)) => {
+            validate_pending_upload_matches_completed(&existing, completed)
+                .map_err(ApiError::from_conflict)?;
+            return Ok(Some(build_complete_upload_response(
+                &existing.file_id,
+                &existing.object_key,
+            )));
+        }
+        Err(error) => {
+            tracing::error!(
+                room_id = %completed.room_id,
+                file_id = %completed.file_id,
+                error = %error,
+                "failed to persist completed relay upload metadata"
+            );
+            if let Err(cleanup_error) = state
+                .relay_store
+                .delete_object_by_key(&completed.object_key)
+                .await
+            {
+                tracing::error!(
+                    object_key = %completed.object_key,
+                    error = %cleanup_error,
+                    "failed to cleanup relay object after metadata persist failure"
+                );
+            }
+            let _ = state
+                .message_store
+                .remove_relay_upload_request_by_file_id(&completed.file_id)
+                .await;
+            return Err(ApiError::internal(
+                "failed to persist relay upload metadata",
+            ));
+        }
+    }
+
+    tracing::info!(
+        room_id = %completed.room_id,
+        file_id = %completed.file_id,
+        object_key = %completed.object_key,
+        size = completed.size,
+        "completed relay upload"
+    );
+
+    Ok(None)
 }
 
 pub async fn complete_upload(
@@ -265,65 +423,9 @@ pub async fn complete_upload(
         }
     };
 
-    match state
-        .message_store
-        .store_completed_relay_upload(PendingRelayUpload {
-            file_id: completed.file_id.clone(),
-            room_id: completed.room_id.clone(),
-            from_id: completed.from_id.clone(),
-            target_id: completed.target_id.clone(),
-            file_name: completed.file_name.clone(),
-            size: completed.size,
-            content_type: completed.content_type.clone(),
-            object_key: completed.object_key.clone(),
-            created_at: completed.created_at,
-        })
-        .await
-    {
-        Ok(StorePendingRelayUploadOutcome::Inserted) => {}
-        Ok(StorePendingRelayUploadOutcome::Existing(existing)) => {
-            validate_pending_upload_matches_completed(&existing, &completed)
-                .map_err(ApiError::from_conflict)?;
-            return Ok(ok_json(build_complete_upload_response(
-                &existing.file_id,
-                &existing.object_key,
-            )));
-        }
-        Err(error) => {
-            tracing::error!(
-                room_id = %completed.room_id,
-                file_id = %completed.file_id,
-                error = %error,
-                "failed to persist completed relay upload metadata"
-            );
-            if let Err(cleanup_error) = state
-                .relay_store
-                .delete_object_by_key(&completed.object_key)
-                .await
-            {
-                tracing::error!(
-                    object_key = %completed.object_key,
-                    error = %cleanup_error,
-                    "failed to cleanup relay object after metadata persist failure"
-                );
-            }
-            let _ = state
-                .message_store
-                .remove_relay_upload_request_by_file_id(&completed.file_id)
-                .await;
-            return Err(ApiError::internal(
-                "failed to persist relay upload metadata",
-            ));
-        }
+    if let Some(existing) = persist_completed_relay_upload(&state, &completed).await? {
+        return Ok(ok_json(existing));
     }
-
-    tracing::info!(
-        room_id = %completed.room_id,
-        file_id = %completed.file_id,
-        object_key = %completed.object_key,
-        size = completed.size,
-        "completed relay upload"
-    );
 
     Ok(ok_json(build_complete_upload_response(
         &completed.file_id,
@@ -469,6 +571,15 @@ fn normalize_upload_request(request: &RelayUploadRequest) -> NormalizedRelayUplo
         size: request.size,
         target_id: request.targetId.clone(),
     }
+}
+
+async fn read_multipart_text(
+    field: axum::extract::multipart::Field<'_>,
+    field_name: &str,
+) -> ApiResult<String> {
+    field.text().await.map_err(|error| {
+        ApiError::bad_request(format!("invalid multipart field {field_name}: {error}"))
+    })
 }
 
 fn normalize_content_type(content_type: &str) -> String {
