@@ -95,7 +95,7 @@ import {
   supportsDirectoryPicker,
   type StoredDirectoryState,
 } from '@/lib/file-system';
-import { cn, formatBytes, roomToSlug } from '@/lib/utils';
+import { cn, createClientId, formatBytes, roomToSlug } from '@/lib/utils';
 import type { DirectPathInfo, IncomingFilePayload, TransferUpdate } from '@/lib/peer-mesh';
 import { useRelayUploads, type RelayUploadControls } from '@/app/use-relay-uploads';
 import { useRoomConnection } from '@/app/use-room-connection';
@@ -908,7 +908,7 @@ export default function App() {
       objectUrlsRef.current.push(previewUrl);
     }
     return {
-      id: crypto.randomUUID(),
+      id: createClientId(),
       file,
       previewUrl,
     };

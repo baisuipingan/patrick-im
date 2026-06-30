@@ -11,7 +11,7 @@ import type {
   RoomPeer,
   SignalEnvelope,
 } from '@shared/protocol';
-import { sleep } from './utils';
+import { createClientId, sleep } from './utils';
 
 const FILE_CHANNEL_PREFIX = 'file:';
 const DIRECT_FILE_HARD_LIMIT_BYTES = Number.MAX_SAFE_INTEGER;
@@ -450,7 +450,7 @@ export class PeerMesh {
       throw new Error('peer is not ready for direct transfer');
     }
 
-    const transferId = crypto.randomUUID();
+    const transferId = createClientId();
     session.outgoingTransfers.set(transferId, {
       file,
       transferId,

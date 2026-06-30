@@ -31,6 +31,7 @@ import {
   storePendingRelayAnnounceTickets,
   uploadRelayPartsConcurrently,
 } from '@/app/relay-utils';
+import { createClientId } from '@/lib/utils';
 
 interface UseRelayUploadsOptions {
   activeRoom: string | null;
@@ -131,6 +132,8 @@ function formatRelayUploadError(error: unknown): string {
       return '上传等待服务器响应超时，请检查反向代理或服务器文件写入是否卡住';
     case 'relay_upload_failed':
       return '上传网络异常';
+    case 'relay_upload_failed_413':
+      return '上传被反向代理拒绝：请求体太大，请调大 OpenResty/Nginx 的 client_max_body_size';
     case 'relay_upload_bad_response':
       return '服务器返回了无法识别的上传响应';
     case 'upload_part_idle_timeout':
@@ -841,7 +844,7 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
 
     const peerId = targetId ?? '__global__';
     const peerName = targetId ? getPeerDisplayName(targetId) : '整个房间';
-    const clientRequestId = pendingAttachmentId ?? crypto.randomUUID();
+    const clientRequestId = pendingAttachmentId ?? createClientId();
     let task: RelayUploadTask | null = null;
     try {
       task = {
@@ -1003,7 +1006,7 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
       const errorMessage = formatRelayUploadError(error);
 
       updateTransfer({
-        transferId: task?.transferId ?? `relay-failed:${crypto.randomUUID()}`,
+        transferId: task?.transferId ?? `relay-failed:${createClientId()}`,
         peerId,
         peerName,
         fileName: file.name,
