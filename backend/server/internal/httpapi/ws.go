@@ -25,6 +25,11 @@ const (
 	maxMessageSize = protocol.MaxChatTextBytes + 128*1024
 )
 
+const (
+	wsProtocolName          = "patrick-im"
+	wsSessionProtocolPrefix = "patrick-im-session."
+)
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
@@ -39,12 +44,16 @@ func (api *API) roomWS(c *gin.Context) {
 		api.fail(c, http.StatusBadRequest, "missing room_id")
 		return
 	}
-	sess, err := session.Require(c.Request, api.cfg.SessionSecret)
+	sess, err := api.requireWebSocketSession(c.Request)
 	if err != nil {
 		api.fail(c, http.StatusUnauthorized, "missing session")
 		return
 	}
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	responseHeader := http.Header{}
+	if websocketSubprotocolRequested(c.Request, wsProtocolName) {
+		responseHeader.Set("Sec-WebSocket-Protocol", wsProtocolName)
+	}
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, responseHeader)
 	if err != nil {
 		api.logger.Warn("websocket upgrade failed", "error", err)
 		return
@@ -54,6 +63,56 @@ func (api *API) roomWS(c *gin.Context) {
 		nickname = queryName
 	}
 	go api.handleSocket(roomID, sess.ClientID, nickname, conn)
+}
+
+func (api *API) requireWebSocketSession(r *http.Request) (session.Payload, error) {
+	if payload, err := session.Require(r, api.cfg.SessionSecret); err == nil {
+		return payload, nil
+	}
+	token := websocketSessionToken(r)
+	if token == "" {
+		return session.Payload{}, http.ErrNoCookie
+	}
+	payload, err := session.ReadToken(token, api.cfg.SessionSecret)
+	if err != nil || payload == nil {
+		if err != nil {
+			return session.Payload{}, err
+		}
+		return session.Payload{}, http.ErrNoCookie
+	}
+	return *payload, nil
+}
+
+func websocketSessionToken(r *http.Request) string {
+	for _, item := range websocketSubprotocols(r) {
+		if strings.HasPrefix(item, wsSessionProtocolPrefix) {
+			return strings.TrimPrefix(item, wsSessionProtocolPrefix)
+		}
+	}
+	return ""
+}
+
+func websocketSubprotocolRequested(r *http.Request, protocol string) bool {
+	for _, item := range websocketSubprotocols(r) {
+		if item == protocol {
+			return true
+		}
+	}
+	return false
+}
+
+func websocketSubprotocols(r *http.Request) []string {
+	raw := r.Header.Values("Sec-WebSocket-Protocol")
+	out := make([]string, 0)
+	for _, header := range raw {
+		for _, item := range strings.Split(header, ",") {
+			item = strings.TrimSpace(item)
+			if item != "" {
+				out = append(out, item)
+			}
+		}
+	}
+	return out
 }
 
 func (api *API) handleSocket(roomID, clientID, nickname string, conn *websocket.Conn) {

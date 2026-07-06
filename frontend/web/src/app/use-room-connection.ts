@@ -17,12 +17,22 @@ const WS_CONNECT_TIMEOUT_MS = 12_000;
 const WS_RECONNECT_BASE_DELAY_MS = 1_000;
 const WS_RECONNECT_MAX_DELAY_MS = 30_000;
 
+const WS_PROTOCOL_NAME = 'patrick-im';
+const WS_SESSION_PROTOCOL_PREFIX = 'patrick-im-session.';
+
 function buildRoomWebSocketUrl(roomId: string, nickname: string): string {
   const url = new URL(buildWsUrl(`/api/rooms/${roomId}/ws`));
   if (nickname.trim()) {
     url.searchParams.set('nickname', nickname.trim());
   }
   return url.toString();
+}
+
+function buildRoomWebSocketProtocols(session: SessionResponse): string[] | undefined {
+  if (!session.sessionToken) {
+    return undefined;
+  }
+  return [WS_PROTOCOL_NAME, `${WS_SESSION_PROTOCOL_PREFIX}${session.sessionToken}`];
 }
 
 function useLatest<T>(value: T): MutableRefObject<T> {
@@ -338,7 +348,10 @@ export function useRoomConnection(options: UseRoomConnectionOptions): RoomConnec
       const epoch = connectionEpochRef.current + 1;
       connectionEpochRef.current = epoch;
 
-      const ws = new WebSocket(buildRoomWebSocketUrl(activeRoom, nicknameRef.current || session.nickname));
+      const ws = new WebSocket(
+        buildRoomWebSocketUrl(activeRoom, nicknameRef.current || session.nickname),
+        buildRoomWebSocketProtocols(session),
+      );
       wsRef.current = ws;
       setSignalStatus(hasConnectedOnceRef.current || reconnectAttemptRef.current > 0 ? 'reconnecting' : 'connecting');
       armConnectTimeout(epoch, ws);

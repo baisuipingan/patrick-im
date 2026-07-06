@@ -13,6 +13,7 @@ type IceServer struct {
 type SessionResponse struct {
 	ClientID                 string      `json:"clientId"`
 	Nickname                 string      `json:"nickname"`
+	SessionToken             string      `json:"sessionToken,omitempty"`
 	IceServers               []IceServer `json:"iceServers"`
 	RelayFileLimitBytes      uint64      `json:"relayFileLimitBytes"`
 	DirectFileSoftLimitBytes uint64      `json:"directFileSoftLimitBytes"`

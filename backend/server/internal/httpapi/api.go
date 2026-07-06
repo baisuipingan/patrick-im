@@ -76,9 +76,15 @@ func (api *API) sessionInfo(c *gin.Context) {
 		api.fail(c, http.StatusInternalServerError, "session error")
 		return
 	}
+	sessionToken, err := session.CreateSignedToken(api.cfg.SessionSecret, payload)
+	if err != nil {
+		api.fail(c, http.StatusInternalServerError, "session error")
+		return
+	}
 	response := protocol.SessionResponse{
 		ClientID:                 payload.ClientID,
 		Nickname:                 payload.Nickname,
+		SessionToken:             sessionToken,
 		IceServers:               api.iceServers(),
 		RelayFileLimitBytes:      relay.FileLimitBytes,
 		DirectFileSoftLimitBytes: ^uint64(0),

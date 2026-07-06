@@ -4,6 +4,7 @@ export type DirectPeerState = 'offline' | 'connecting' | 'connected' | 'failed';
 export interface SessionResponse {
   clientId: string;
   nickname: string;
+  sessionToken?: string;
   iceServers: RTCIceServer[];
   relayFileLimitBytes: number;
   directFileSoftLimitBytes: number;

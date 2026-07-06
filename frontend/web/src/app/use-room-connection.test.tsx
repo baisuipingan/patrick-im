@@ -36,7 +36,10 @@ class FakeWebSocket {
   onclose: ((event: CloseEvent) => void) | null = null;
   sent: string[] = [];
 
-  constructor(public url: string) {
+  constructor(
+    public url: string,
+    public protocols?: string | string[],
+  ) {
     FakeWebSocket.instances.push(this);
   }
 
@@ -160,6 +163,17 @@ describe('use-room-connection', () => {
     });
 
     expect(onRoomConnected).toHaveBeenCalledWith('room-a');
+  });
+
+  it('passes session token as websocket subprotocol', () => {
+    renderHookHarness(
+      <HookHarness session={{ ...session, sessionToken: 'signed-session-token' }} activeRoom="room-a" />,
+    );
+
+    expect(FakeWebSocket.instances[0].protocols).toEqual([
+      'patrick-im',
+      'patrick-im-session.signed-session-token',
+    ]);
   });
 
   it('forwards non-pong server events', async () => {

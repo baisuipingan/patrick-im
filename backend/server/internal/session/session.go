@@ -69,8 +69,12 @@ func Read(r *http.Request, secret string) (*Payload, error) {
 	if err != nil {
 		return nil, nil
 	}
+	return ReadToken(cookie.Value, secret)
+}
+
+func ReadToken(token, secret string) (*Payload, error) {
 	var payload Payload
-	if err := ReadSignedToken(secret, cookie.Value, &payload); err != nil {
+	if err := ReadSignedToken(secret, token, &payload); err != nil {
 		return nil, err
 	}
 	if payload.ExpiresAt < util.NowMS() {
