@@ -52,7 +52,7 @@ func (s *Store) ListVisibleMessages(ctx context.Context, roomID, clientID string
 	var rows []repository.MessageRecord
 	err := s.db.WithContext(ctx).
 		Where("room_id = ? AND (target_id IS NULL OR from_id = ? OR target_id = ?)", roomID, clientID, clientID).
-		Order("created_at DESC, id DESC").
+		Order("created_at DESC, rowid DESC").
 		Limit(s.recentMessageLimit).
 		Find(&rows).Error
 	if err != nil {
