@@ -7,8 +7,6 @@ COMPOSE_URL="${PATRICK_IM_COMPOSE_URL:-https://raw.githubusercontent.com/baisuip
 IMAGE="${PATRICK_IM_IMAGE:-crpi-6yrxqnyn3y05zbgq.cn-qingdao.personal.cr.aliyuncs.com/patrickcmh/patrick-im:latest}"
 PUBLIC_BASE_URL="${PATRICK_IM_PUBLIC_BASE_URL:-http://127.0.0.1:5800}"
 HOST_BIND="${PATRICK_IM_HOST_BIND:-0.0.0.0:5800}"
-MYSQL_DATABASE="${PATRICK_IM_MYSQL_DATABASE:-patrick_im}"
-MYSQL_USER="${PATRICK_IM_MYSQL_USER:-patrick_im}"
 SCRIPT_PATH="${BASH_SOURCE[0]:-}"
 SCRIPT_DIR=""
 if [[ -n "${SCRIPT_PATH}" && -f "${SCRIPT_PATH}" && "$(basename -- "${SCRIPT_PATH}")" != "bash" ]]; then
@@ -53,7 +51,7 @@ check_docker() {
 }
 
 download_compose() {
-  mkdir -p "${INSTALL_DIR}/data/mysql" "${INSTALL_DIR}/data/files"
+  mkdir -p "${INSTALL_DIR}/data/files"
   if [[ -n "${SCRIPT_DIR}" && -f "${SCRIPT_DIR}/docker-compose.yml" ]]; then
     cp "${SCRIPT_DIR}/docker-compose.yml" "${INSTALL_DIR}/docker-compose.yml"
   else
@@ -67,27 +65,22 @@ write_env() {
     return
   fi
 
-  local mysql_password="${PATRICK_IM_MYSQL_PASSWORD:-$(random_hex 18)}"
-  local mysql_root_password="${PATRICK_IM_MYSQL_ROOT_PASSWORD:-$(random_hex 24)}"
   local session_secret="${PATRICK_IM_SESSION_SECRET:-$(random_hex 32)}"
 
   cat > "${INSTALL_DIR}/.env" <<EOF
 PATRICK_IM_IMAGE=${IMAGE}
 PATRICK_IM_HOST_BIND=${HOST_BIND}
 PATRICK_IM_BIND=0.0.0.0:5800
-PATRICK_IM_LOG=info,tower_http=info,axum=info
+PATRICK_IM_LOG=info
 PATRICK_IM_PUBLIC_BASE_URL=${PUBLIC_BASE_URL}
 PATRICK_IM_SECURE_COOKIES=false
 PATRICK_IM_STUN_URLS=stun:stun.cloudflare.com:3478,stun:stun.l.google.com:19302
 PATRICK_IM_TURN_URLS=
 PATRICK_IM_TURN_USERNAME=
 PATRICK_IM_TURN_CREDENTIAL=
-PATRICK_IM_MYSQL_DATABASE=${MYSQL_DATABASE}
-PATRICK_IM_MYSQL_USER=${MYSQL_USER}
-PATRICK_IM_MYSQL_PASSWORD=${mysql_password}
-PATRICK_IM_MYSQL_ROOT_PASSWORD=${mysql_root_password}
-PATRICK_IM_MYSQL_URL=mysql://${MYSQL_USER}:${mysql_password}@mysql:3306/${MYSQL_DATABASE}
+PATRICK_IM_SQLITE_PATH=/app/data/patrick-im.sqlite
 PATRICK_IM_FILE_STORE_PATH=/app/data/files
+PATRICK_IM_WEB_DIST_PATH=/app/web-dist
 PATRICK_IM_SESSION_SECRET=${session_secret}
 PATRICK_IM_RECENT_MESSAGE_LIMIT=60
 EOF

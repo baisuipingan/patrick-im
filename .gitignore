@@ -13,6 +13,10 @@ backend/server/build/*
 !backend/server/build/.gitkeep
 backend/server/web-dist/*
 !backend/server/web-dist/.gitkeep
+backend/_legacy/rust/server/build/*
+!backend/_legacy/rust/server/build/.gitkeep
+backend/_legacy/rust/server/web-dist/*
+!backend/_legacy/rust/server/web-dist/.gitkeep
 
 # Local env and secrets
 .env

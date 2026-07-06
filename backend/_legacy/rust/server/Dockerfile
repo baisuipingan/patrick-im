@@ -9,11 +9,6 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY backend/server/build/patrick-im-server /usr/local/bin/patrick-im-server
-COPY backend/server/web-dist /app/web-dist
-
-ENV PATRICK_IM_SQLITE_PATH=/app/data/patrick-im.sqlite
-ENV PATRICK_IM_FILE_STORE_PATH=/app/data/files
-ENV PATRICK_IM_WEB_DIST_PATH=/app/web-dist
 
 EXPOSE 5800
 CMD ["patrick-im-server"]

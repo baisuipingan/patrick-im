@@ -7,5 +7,5 @@ target
 backend/server/.env
 backend/server/.env.*
 frontend/web/node_modules
-backend/server/web-dist
+backend/_legacy
 logs
