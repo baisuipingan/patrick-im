@@ -163,8 +163,8 @@ type RelayDiscardUploadRequest struct {
 type ServerToClientMessage struct {
 	Type              string          `json:"type"`
 	RoomID            string          `json:"roomId,omitempty"`
-	Peers             []RoomPeer      `json:"peers,omitempty"`
-	Messages          []ChatMessage   `json:"messages,omitempty"`
+	Peers             []RoomPeer      `json:"peers"`
+	Messages          []ChatMessage   `json:"messages"`
 	ServerTime        uint64          `json:"serverTime,omitempty"`
 	Peer              *RoomPeer       `json:"peer,omitempty"`
 	ClientID          string          `json:"clientId,omitempty"`

@@ -32,8 +32,10 @@ export interface ServerEventHandlers {
 export function handleServerEventMessage(event: ServerToClientMessage, handlers: ServerEventHandlers): void {
   switch (event.type) {
     case 'room-snapshot': {
-      const peerNames = Object.fromEntries(event.peers.map((peer) => [peer.clientId, peer.nickname]));
-      for (const message of event.messages) {
+      const peers = Array.isArray(event.peers) ? event.peers.filter(Boolean) : [];
+      const messages = Array.isArray(event.messages) ? event.messages.filter(Boolean) : [];
+      const peerNames = Object.fromEntries(peers.map((peer) => [peer.clientId, peer.nickname]));
+      for (const message of messages) {
         peerNames[message.fromId] = message.fromName;
         if (message.targetId) {
           peerNames[message.targetId] = peerNames[message.targetId] ?? message.targetId;
@@ -44,9 +46,9 @@ export function handleServerEventMessage(event: ServerToClientMessage, handlers:
       }
 
       handlers.replacePeerNames(peerNames);
-      handlers.replaceMessages(event.messages);
-      handlers.replacePeers(event.peers);
-      handlers.reconcileSnapshotPeers(event.peers);
+      handlers.replaceMessages(messages);
+      handlers.replacePeers(peers);
+      handlers.reconcileSnapshotPeers(peers);
       handlers.setNotice((current) =>
         /^正在进入房间\s+.+/.test(current)
           ? `已进入房间 ${handlers.activeRoom ?? event.roomId}。全局聊天发给整个房间，切到设备会话后就是和该设备的私聊。`
@@ -70,6 +72,10 @@ export function handleServerEventMessage(event: ServerToClientMessage, handlers:
       break;
     }
     case 'chat-event':
+      if (!event.message) {
+        handlers.setNotice('收到异常消息事件，请刷新后重试。');
+        break;
+      }
       if (event.message.file?.fileId) {
         handlers.acknowledgeRelayMessage(event.message.file.fileId);
       }

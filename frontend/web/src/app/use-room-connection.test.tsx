@@ -76,6 +76,7 @@ function HookHarness(props: {
   onRoomReset?: () => void;
   onServerEvent?: (event: unknown) => void;
   onRoomConnected?: (roomId: string) => void;
+  setNotice?: (message: string) => void;
 }) {
   useRoomConnection({
     activeRoom: props.activeRoom,
@@ -93,7 +94,7 @@ function HookHarness(props: {
     onServerEvent: props.onServerEvent ?? vi.fn(),
     onTransferUpdate: vi.fn(),
     prepareIncomingFileTarget: vi.fn(async () => ({ mode: 'memory' as const })),
-    setNotice: vi.fn(),
+    setNotice: props.setNotice ?? vi.fn(),
   });
 
   return null;
@@ -194,6 +195,30 @@ describe('use-room-connection', () => {
     });
 
     expect(onServerEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps socket alive when server event handling fails', async () => {
+    const setNotice = vi.fn();
+    renderHookHarness(
+      <HookHarness
+        session={session}
+        activeRoom="room-a"
+        onServerEvent={() => {
+          throw new Error('boom');
+        }}
+        setNotice={setNotice}
+      />,
+    );
+
+    act(() => {
+      FakeWebSocket.instances[0].open();
+      FakeWebSocket.instances[0].message({
+        type: 'chat-event',
+      });
+    });
+
+    expect(setNotice).toHaveBeenCalledWith('处理信令消息失败，请刷新页面重试。');
+    expect(FakeWebSocket.instances[0].readyState).toBe(FakeWebSocket.OPEN);
   });
 
   it('pauses on offline and reconnects after online', async () => {

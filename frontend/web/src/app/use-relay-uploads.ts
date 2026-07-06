@@ -327,7 +327,8 @@ export function useRelayUploads(options: UseRelayUploadsOptions): RelayUploadCon
   }
 
   function hasMessageForRelayFile(fileId: string): boolean {
-    return messagesRef.current.some((message) => message.file?.fileId === fileId);
+    const messages = Array.isArray(messagesRef.current) ? messagesRef.current : [];
+    return messages.some((message) => message?.file?.fileId === fileId);
   }
 
   function markRelayTransferSynced(fileId: string): void {

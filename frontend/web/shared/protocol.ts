@@ -46,8 +46,8 @@ export interface ChatMessage {
 export interface RoomSnapshotMessage {
   type: 'room-snapshot';
   roomId: string;
-  peers: RoomPeer[];
-  messages: ChatMessage[];
+  peers?: RoomPeer[];
+  messages?: ChatMessage[];
   serverTime: number;
 }
 

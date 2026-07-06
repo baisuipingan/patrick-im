@@ -382,17 +382,23 @@ export function useRoomConnection(options: UseRoomConnectionOptions): RoomConnec
           return;
         }
 
-        const payload = JSON.parse(messageEvent.data as string) as ServerToClientMessage;
+        let payload: ServerToClientMessage;
+        try {
+          payload = JSON.parse(messageEvent.data as string) as ServerToClientMessage;
+        } catch {
+          setNoticeRef.current('收到无法解析的信令消息。');
+          return;
+        }
         lastSignalActivityRef.current = Date.now();
 
         if (payload.type === 'pong') {
           return;
         }
 
-        if (payload.type !== 'signal') {
+        try {
           onServerEventRef.current(payload);
-        } else {
-          onServerEventRef.current(payload);
+        } catch {
+          setNoticeRef.current('处理信令消息失败，请刷新页面重试。');
         }
       };
 

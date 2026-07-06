@@ -79,6 +79,33 @@ describe('server-events', () => {
     expect(handlers.flushRelayAnnounces).toHaveBeenCalledWith('room-a');
   });
 
+  it('accepts empty room snapshots with omitted lists', () => {
+    const handlers = createHandlers();
+    const event = {
+      type: 'room-snapshot',
+      roomId: 'room-a',
+      serverTime: 1,
+    } as ServerToClientMessage;
+
+    handleServerEventMessage(event, handlers);
+
+    expect(handlers.replaceMessages).toHaveBeenCalledWith([]);
+    expect(handlers.replacePeers).toHaveBeenCalledWith([]);
+    expect(handlers.reconcileSnapshotPeers).toHaveBeenCalledWith([]);
+    expect(handlers.flushRelayAnnounces).toHaveBeenCalledWith('room-a');
+  });
+
+  it('ignores malformed chat events without crashing', () => {
+    const handlers = createHandlers();
+    const event = {
+      type: 'chat-event',
+    } as ServerToClientMessage;
+
+    expect(() => handleServerEventMessage(event, handlers)).not.toThrow();
+    expect(handlers.addMessage).not.toHaveBeenCalled();
+    expect(handlers.setNotice).toHaveBeenCalledWith('收到异常消息事件，请刷新后重试。');
+  });
+
   it('handles peer join and leave events', () => {
     const handlers = createHandlers();
 
