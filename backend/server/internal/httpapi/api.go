@@ -277,6 +277,10 @@ func (api *API) createConversationAttachment(c *gin.Context) {
 		protocol.MessageType(strings.TrimSpace(c.PostForm("messageType"))),
 	)
 	if err != nil {
+		if errors.Is(err, chat.ErrValidation) {
+			api.fail(c, http.StatusRequestEntityTooLarge, "file is empty or too large")
+			return
+		}
 		api.handleStoreError(c, err)
 		return
 	}

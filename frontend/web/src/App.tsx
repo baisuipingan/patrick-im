@@ -137,6 +137,21 @@ async function readError(response: Response): Promise<string> {
   }
 }
 
+function readXHRError(xhr: XMLHttpRequest): string {
+  try {
+    const payload = JSON.parse(xhr.responseText) as { error?: string };
+    if (payload.error) {
+      return payload.error;
+    }
+  } catch {
+    // Fall through to a status based message.
+  }
+  if (xhr.status === 413) {
+    return '文件超过服务端上传上限';
+  }
+  return xhr.status > 0 ? `上传失败：${xhr.status}` : '上传失败';
+}
+
 async function apiJSON<T>(input: RequestInfo | URL, init?: RequestInit): Promise<T> {
   const response = await fetch(input, {
     ...init,
@@ -570,10 +585,7 @@ export default function App() {
       }
       for (const item of filesToSend) {
         const messageType = textFile && item.file === textFile ? 'txt_file' : undefined;
-        const sentDirect = await sendDirectAttachment(activeConversation, item.file, messageType);
-        if (!sentDirect) {
-          await uploadAttachment(activeConversation.id, item.file, messageType);
-        }
+        await sendAttachment(activeConversation, item.file, messageType);
       }
       setComposer('');
       clearPendingFiles();
@@ -584,18 +596,51 @@ export default function App() {
     }
   }
 
+  async function sendAttachment(conversation: ConversationView, file: File, messageType?: 'txt_file'): Promise<void> {
+    const transferId = newLocalId('transfer');
+    const startedAt = Date.now();
+    retryableTransfersRef.current[transferId] = { file, conversationId: conversation.id, messageType };
+    const sentDirect = await sendDirectAttachment(conversation, file, messageType, transferId, startedAt);
+    if (!sentDirect) {
+      if (session && file.size > session.maxUploadBytes) {
+        const error = `${file.name || '文件'} 超过服务端上传上限 ${formatBytes(session.maxUploadBytes)}，且 P2P 未完成`;
+        setTransfers((current) => ({
+          ...current,
+          [transferId]: {
+            ...(current[transferId] ?? {
+              id: transferId,
+              fileName: file.name || 'file',
+              conversationId: conversation.id,
+              direction: 'send',
+              startedAt,
+            }),
+            transport: current[transferId]?.transport ?? 'server',
+            totalBytes: file.size,
+            transferredBytes: current[transferId]?.transferredBytes ?? 0,
+            status: 'failed',
+            error,
+            updatedAt: Date.now(),
+            canRetry: true,
+          },
+        }));
+        throw new Error(error);
+      }
+      await uploadAttachment(conversation.id, file, messageType, transferId, startedAt);
+    }
+  }
+
   async function sendDirectAttachment(
     conversation: ConversationView,
     file: File,
     messageType?: 'txt_file',
+    transferId = newLocalId('transfer'),
+    startedAt = Date.now(),
   ): Promise<boolean> {
     const peerId = conversation.peerUserId;
     const mesh = directMeshRef.current;
     if (!peerId || directStates[peerId] !== 'direct' || !mesh || !session) {
       return false;
     }
-    const transferId = newLocalId('direct');
-    const startedAt = Date.now();
     const controller = new AbortController();
     transferAbortControllersRef.current[transferId] = controller;
     pausedTransfersRef.current[transferId] = false;
@@ -640,7 +685,9 @@ export default function App() {
           ...current,
           [transferId]: {
             ...current[transferId],
-            status: 'failed',
+            transport: 'server',
+            transferredBytes: 0,
+            status: 'queued',
             error: '直连不可用，已改用服务端',
             updatedAt: Date.now(),
           },
@@ -681,7 +728,9 @@ export default function App() {
         ...current,
         [transferId]: {
           ...current[transferId],
-          status: aborted ? 'cancelled' : 'failed',
+          transport: aborted ? current[transferId]?.transport : 'server',
+          transferredBytes: aborted ? current[transferId]?.transferredBytes ?? 0 : 0,
+          status: aborted ? 'cancelled' : 'queued',
           error: aborted ? '已取消' : '直连传输失败',
           updatedAt: Date.now(),
         },
@@ -696,14 +745,38 @@ export default function App() {
     }
   }
 
-  function uploadAttachment(conversationId: string, file: File, messageType?: 'txt_file'): Promise<MessageView> {
-    const transferId = newLocalId('transfer');
-    const startedAt = Date.now();
+  function uploadAttachment(
+    conversationId: string,
+    file: File,
+    messageType?: 'txt_file',
+    transferId = newLocalId('transfer'),
+    startedAt = Date.now(),
+  ): Promise<MessageView> {
     retryableTransfersRef.current[transferId] = { file, conversationId, messageType };
+    if (session && file.size > session.maxUploadBytes) {
+      const error = `${file.name || '文件'} 超过服务端上传上限 ${formatBytes(session.maxUploadBytes)}`;
+      setTransfers((current) => ({
+        ...current,
+        [transferId]: {
+          ...(current[transferId] ?? { id: transferId, startedAt }),
+          fileName: file.name || 'file',
+          conversationId,
+          transport: 'server',
+          direction: 'send',
+          totalBytes: file.size,
+          transferredBytes: 0,
+          status: 'failed',
+          error,
+          updatedAt: Date.now(),
+          canRetry: true,
+        },
+      }));
+      return Promise.reject(new Error(error));
+    }
     setTransfers((current) => ({
       ...current,
       [transferId]: {
-        id: transferId,
+        ...(current[transferId] ?? { id: transferId, startedAt }),
         fileName: file.name || 'file',
         conversationId,
         transport: 'server',
@@ -711,8 +784,9 @@ export default function App() {
         totalBytes: file.size,
         transferredBytes: 0,
         status: 'queued',
-        startedAt,
+        startedAt: current[transferId]?.startedAt ?? startedAt,
         updatedAt: startedAt,
+        error: undefined,
         canRetry: true,
       },
     }));
@@ -749,17 +823,18 @@ export default function App() {
       xhr.onload = () => {
         delete uploadXhrsRef.current[transferId];
         if (xhr.status < 200 || xhr.status >= 300) {
+          const error = readXHRError(xhr);
           setTransfers((current) => ({
             ...current,
             [transferId]: {
               ...current[transferId],
               status: 'failed',
-              error: '上传失败',
+              error,
               canRetry: true,
               updatedAt: Date.now(),
             },
           }));
-          reject(new Error('上传失败'));
+          reject(new Error(error));
           return;
         }
         const message = JSON.parse(xhr.responseText) as MessageView;
@@ -957,10 +1032,8 @@ export default function App() {
     const conversation = conversations.find((item) => item.id === retryable.conversationId);
     try {
       if (conversation) {
-        const sentDirect = await sendDirectAttachment(conversation, retryable.file, retryable.messageType);
-        if (sentDirect) {
-          return;
-        }
+        await sendAttachment(conversation, retryable.file, retryable.messageType);
+        return;
       }
       await uploadAttachment(retryable.conversationId, retryable.file, retryable.messageType);
     } catch (error) {

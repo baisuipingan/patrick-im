@@ -327,6 +327,30 @@ func TestV2DirectConversationStaysVisibleAfterRoomRefresh(t *testing.T) {
 	assertRoomHasConversation(t, router, bobCookie, "room-a", direct.ID)
 }
 
+func TestV2AttachmentTooLargeReturns413(t *testing.T) {
+	router := newTestRouter(t)
+	cookie := sessionCookie(t, router)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/rooms", strings.NewReader(`{"roomId":"room-a"}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(cookie)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create room status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	body, contentType := multipartUpload(t, "too-large.txt", strings.Repeat("x", 1024*1024+1), "")
+	req = httptest.NewRequest(http.MethodPost, "/api/conversations/room:room-a/attachments", &body)
+	req.Header.Set("content-type", contentType)
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("upload status = %d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestUploadFileCreatesMessage(t *testing.T) {
 	router := newTestRouter(t)
 	cookie := sessionCookie(t, router)

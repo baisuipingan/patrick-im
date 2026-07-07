@@ -353,26 +353,33 @@ async function sendFileChunks(channel: RTCDataChannel, file: File, options: Dire
         break;
       }
       if (value) {
-        await waitWhilePaused(options);
-        throwIfAborted(options.signal);
-        channel.send(value);
-        sent += value.byteLength;
-        options.onProgress?.(sent, file.size);
-        await waitForBuffer(channel);
+        sent = await sendBytesInChunks(channel, value, sent, file.size, options);
       }
     }
     return;
   }
   const buffer = await file.arrayBuffer();
-  for (let offset = 0; offset < buffer.byteLength; offset += CHUNK_SIZE) {
+  await sendBytesInChunks(channel, new Uint8Array(buffer), sent, file.size, options);
+}
+
+async function sendBytesInChunks(
+  channel: RTCDataChannel,
+  bytes: Uint8Array,
+  sentBytes: number,
+  totalBytes: number,
+  options: DirectSendOptions,
+): Promise<number> {
+  let sent = sentBytes;
+  for (let offset = 0; offset < bytes.byteLength; offset += CHUNK_SIZE) {
     await waitWhilePaused(options);
     throwIfAborted(options.signal);
-    const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
+    const chunk = bytes.slice(offset, offset + CHUNK_SIZE);
     channel.send(chunk);
     sent += chunk.byteLength;
-    options.onProgress?.(sent, file.size);
+    options.onProgress?.(Math.min(sent, totalBytes), totalBytes);
     await waitForBuffer(channel);
   }
+  return sent;
 }
 
 async function waitWhilePaused(options: DirectSendOptions): Promise<void> {
