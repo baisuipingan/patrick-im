@@ -109,6 +109,12 @@ type ClearMessagesResponse struct {
 	Removed  int     `json:"removed"`
 }
 
+type ClearConversationResponse struct {
+	ConversationID string `json:"conversationId"`
+	RoomID         string `json:"roomId"`
+	Removed        int    `json:"removed"`
+}
+
 type UserView struct {
 	ID       string `json:"id"`
 	Nickname string `json:"nickname"`
@@ -219,6 +225,12 @@ type MessageAckPayload struct {
 
 type UnreadUpdatedPayload struct {
 	Conversation ConversationView `json:"conversation"`
+}
+
+type ConversationClearedPayload struct {
+	ConversationID string `json:"conversationId"`
+	ActorID        string `json:"actorId"`
+	Removed        int    `json:"removed"`
 }
 
 type RoomUpdatedPayload struct {

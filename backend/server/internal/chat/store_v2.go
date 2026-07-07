@@ -301,6 +301,61 @@ func (s *Store) MarkConversationRead(ctx context.Context, conversationID, userID
 	return s.conversationView(ctx, conversation, userID)
 }
 
+func (s *Store) ClearConversation(ctx context.Context, conversationID string, actor session.Payload) (protocol.ClearConversationResponse, []string, error) {
+	conversation, err := s.visibleConversation(ctx, conversationID, actor.ClientID)
+	if err != nil {
+		return protocol.ClearConversationResponse{}, nil, err
+	}
+	var messages []repository.MessageV2Record
+	var attachments []repository.AttachmentRecord
+	var legacyRows []repository.MessageRecord
+	now := util.NowMillisInt64()
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("conversation_id = ?", conversation.ID).Find(&messages).Error; err != nil {
+			return err
+		}
+		ids := make([]string, 0, len(messages))
+		for _, message := range messages {
+			ids = append(ids, message.ID)
+		}
+		if len(ids) > 0 {
+			if err := tx.Where("message_id IN ?", ids).Find(&attachments).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("id IN ?", ids).Find(&legacyRows).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("message_id IN ?", ids).Delete(&repository.AttachmentRecord{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("id IN ?", ids).Delete(&repository.MessageV2Record{}).Error; err != nil {
+				return err
+			}
+			if err := tx.Where("id IN ?", ids).Delete(&repository.MessageRecord{}).Error; err != nil {
+				return err
+			}
+		}
+		if err := tx.Where("conversation_id = ?", conversation.ID).Delete(&repository.ReadStateRecord{}).Error; err != nil {
+			return err
+		}
+		return tx.Model(&repository.ConversationRecord{}).Where("id = ?", conversation.ID).Updates(map[string]any{
+			"last_message_id":   nil,
+			"last_message_text": nil,
+			"last_message_at":   int64(0),
+			"updated_at":        now,
+		}).Error
+	})
+	if err != nil {
+		return protocol.ClearConversationResponse{}, nil, err
+	}
+	paths := uniqueStoragePaths(attachments, legacyRows)
+	return protocol.ClearConversationResponse{
+		ConversationID: conversation.ID,
+		RoomID:         conversation.RoomID,
+		Removed:        len(messages),
+	}, paths, nil
+}
+
 func (s *Store) AttachmentInfo(ctx context.Context, attachmentID, viewerID string) (protocol.AttachmentView, error) {
 	var attachment repository.AttachmentRecord
 	if err := s.db.WithContext(ctx).Where("id = ?", attachmentID).First(&attachment).Error; err != nil {
@@ -320,6 +375,24 @@ func (s *Store) AttachmentInfo(ctx context.Context, attachmentID, viewerID strin
 		return protocol.AttachmentView{}, err
 	}
 	return attachmentView(attachment), nil
+}
+
+func uniqueStoragePaths(attachments []repository.AttachmentRecord, legacyRows []repository.MessageRecord) []string {
+	seen := map[string]bool{}
+	paths := make([]string, 0)
+	for _, attachment := range attachments {
+		if attachment.StoragePath != nil && !seen[*attachment.StoragePath] {
+			seen[*attachment.StoragePath] = true
+			paths = append(paths, *attachment.StoragePath)
+		}
+	}
+	for _, row := range legacyRows {
+		if row.StoragePath != nil && !seen[*row.StoragePath] {
+			seen[*row.StoragePath] = true
+			paths = append(paths, *row.StoragePath)
+		}
+	}
+	return paths
 }
 
 func (s *Store) roomSummary(ctx context.Context, room repository.RoomRecord, userID string) (protocol.RoomSummary, error) {

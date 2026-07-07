@@ -61,6 +61,7 @@ func Router(api *API) *gin.Engine {
 	r.POST("/api/rooms/:room_id/conversations/direct", api.createDirectConversation)
 	r.GET("/api/conversations/:conversation_id/messages", api.listConversationMessages)
 	r.POST("/api/conversations/:conversation_id/messages", api.createConversationMessage)
+	r.DELETE("/api/conversations/:conversation_id/messages", api.clearConversationMessages)
 	r.POST("/api/conversations/:conversation_id/attachments", api.createConversationAttachment)
 	r.POST("/api/conversations/:conversation_id/read", api.markConversationRead)
 	r.GET("/api/attachments/:attachment_id", api.attachmentInfo)
@@ -306,6 +307,32 @@ func (api *API) markConversationRead(c *gin.Context) {
 	c.JSON(http.StatusOK, conversation)
 }
 
+func (api *API) clearConversationMessages(c *gin.Context) {
+	payload, ok := api.requireSession(c)
+	if !ok {
+		return
+	}
+	response, files, err := api.store.ClearConversation(c.Request.Context(), c.Param("conversation_id"), payload)
+	if err != nil {
+		api.handleStoreError(c, err)
+		return
+	}
+	api.store.DeleteFiles(files)
+	api.hub.Publish(response.RoomID, recipientsForConversationID(response.ConversationID), protocol.NewEnvelope(
+		"conversation_cleared",
+		"",
+		response.RoomID,
+		response.ConversationID,
+		protocol.ConversationClearedPayload{
+			ConversationID: response.ConversationID,
+			ActorID:        payload.ClientID,
+			Removed:        response.Removed,
+		},
+		util.NowMillisInt64(),
+	))
+	c.JSON(http.StatusOK, response)
+}
+
 func (api *API) attachmentInfo(c *gin.Context) {
 	payload, ok := api.requireSession(c)
 	if !ok {
@@ -497,6 +524,14 @@ func recipientsForMessageView(message protocol.MessageView) []string {
 		return nil
 	}
 	return []string{message.SenderID, *message.TargetID}
+}
+
+func recipientsForConversationID(conversationID string) []string {
+	parts := strings.Split(conversationID, ":")
+	if len(parts) >= 4 && parts[0] == "direct" {
+		return []string{parts[len(parts)-2], parts[len(parts)-1]}
+	}
+	return nil
 }
 
 func (api *API) roomSnapshot(ctx context.Context, roomID, viewerID string) (protocol.Envelope, error) {

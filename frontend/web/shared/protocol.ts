@@ -185,6 +185,12 @@ export interface UnreadUpdatedPayload {
   conversation: ConversationView;
 }
 
+export interface ConversationClearedPayload {
+  conversationId: string;
+  actorId: string;
+  removed: number;
+}
+
 export interface RoomUpdatedPayload {
   room: RoomDetail;
 }

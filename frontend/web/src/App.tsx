@@ -4,6 +4,8 @@ import {
   Copy,
   Download,
   FileText,
+  FolderOpen,
+  HardDrive,
   ImageIcon,
   Loader2,
   LogIn,
@@ -25,6 +27,7 @@ import {
 } from 'lucide-react';
 import type {
   AttachmentView,
+  ConversationClearedPayload,
   ConversationView,
   Envelope,
   MemberUpdatedPayload,
@@ -49,8 +52,16 @@ import {
   isTextWithinHardLimit,
   shouldSendTextAsAttachment,
 } from './features/chat/send-actions';
+import {
+  clearReceiveDirectory,
+  createWritableFile,
+  ensureDirectoryWritable,
+  loadReceiveDirectoryState,
+  pickReceiveDirectory,
+  type StoredDirectoryState,
+} from './lib/file-system';
 import { buildWsUrl, cn, formatBytes, formatClock } from './lib/utils';
-import { DirectMesh, type DirectFileProgress, type DirectState, type IncomingDirectFile } from './webrtc';
+import { DirectMesh, type DirectFileProgress, type DirectState, type IncomingDirectFile, type IncomingDirectFileSink } from './webrtc';
 
 type ConnectionState = 'idle' | 'connecting' | 'online' | 'offline' | 'error';
 type NoticeTone = 'info' | 'success' | 'error';
@@ -103,6 +114,12 @@ type PickerWindow = Window & {
 const NICKNAME_KEY = 'patrick-im:nickname';
 const LAST_ROOM_KEY = 'patrick-im:last-room';
 const RECENT_ROOMS_KEY = 'patrick-im:recent-rooms';
+
+const EMPTY_RECEIVE_DIRECTORY: StoredDirectoryState = {
+  handle: null,
+  status: 'not-configured',
+  name: '',
+};
 
 function readLocalStorage(key: string, fallback = ''): string {
   if (typeof window === 'undefined') {
@@ -192,6 +209,8 @@ export default function App() {
   const [notice, setNotice] = useState<Notice>({ tone: 'info', text: '准备就绪' });
   const [nicknameDraft, setNicknameDraft] = useState(() => readLocalStorage(NICKNAME_KEY));
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [receiveDirectory, setReceiveDirectory] = useState<StoredDirectoryState>(EMPTY_RECEIVE_DIRECTORY);
   const [isDragging, setIsDragging] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -203,6 +222,10 @@ export default function App() {
   const pausedTransfersRef = useRef<Record<string, boolean>>({});
   const transferAbortControllersRef = useRef<Record<string, AbortController>>({});
   const retryableTransfersRef = useRef<Record<string, RetryableTransfer>>({});
+  const receiveDirectoryRef = useRef<StoredDirectoryState>(EMPTY_RECEIVE_DIRECTORY);
+  const conversationsRef = useRef<ConversationView[]>([]);
+  const transfersRef = useRef<Record<string, TransferRow>>({});
+  const sessionRef = useRef<SessionResponse | null>(null);
   const activeConversationIdRef = useRef('');
 
   const activeConversation = useMemo(
@@ -218,6 +241,42 @@ export default function App() {
   useEffect(() => {
     activeConversationIdRef.current = activeConversation?.id ?? '';
   }, [activeConversation?.id]);
+
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
+
+  useEffect(() => {
+    transfersRef.current = transfers;
+  }, [transfers]);
+
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
+
+  useEffect(() => {
+    receiveDirectoryRef.current = receiveDirectory;
+  }, [receiveDirectory]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadReceiveDirectoryState()
+      .then((state) => {
+        if (cancelled) {
+          return;
+        }
+        receiveDirectoryRef.current = state;
+        setReceiveDirectory(state);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setReceiveDirectory({ handle: null, status: 'unsupported', name: '' });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -319,6 +378,8 @@ export default function App() {
       },
       onIncomingFileStart: updateIncomingDirectProgress,
       onIncomingFileProgress: updateIncomingDirectProgress,
+      onIncomingFileError: markIncomingDirectFileFailed,
+      createIncomingFileSink: createIncomingDirectFileSink,
       onIncomingFile: (file) => {
         void acceptIncomingDirectFile(file);
       },
@@ -474,53 +535,163 @@ export default function App() {
         peerId: progress.peerId,
         totalBytes: progress.size,
         transferredBytes: progress.transferredBytes,
-        status: progress.transferredBytes >= progress.size ? 'done' : 'receiving',
+        status: progress.error ? 'failed' : progress.transferredBytes >= progress.size ? 'done' : 'receiving',
+        error: progress.error,
         updatedAt: now,
       },
     }));
   }
 
-  async function acceptIncomingDirectFile(file: IncomingDirectFile) {
-    const conversation = await ensureDirectConversation(file.senderId);
-    const message = directFileMessage({
-      id: file.id,
-      roomId: file.roomId,
-      conversationId: conversation.id,
-      senderId: file.senderId,
-      senderName: file.senderName,
-      targetId: session?.clientId ?? null,
-      fileName: file.fileName,
-      size: file.size,
-      contentType: file.contentType,
-      url: file.url,
-      createdAt: file.createdAt,
-    });
-    objectUrlsRef.current.push(file.url);
-    upsertMessageView(message);
-    setTransfers((current) => ({
-      ...current,
-      [file.id]: {
-        ...(current[file.id] ?? {
-          id: file.id,
-          conversationId: conversation.id,
-          startedAt: file.createdAt,
-          transport: 'p2p',
-          direction: 'receive',
-        }),
-        fileName: file.fileName,
-        peerId: file.senderId,
-        conversationId: conversation.id,
-        totalBytes: file.size,
-        transferredBytes: file.size,
-        status: 'done',
-        updatedAt: Date.now(),
+  function markIncomingDirectFileFailed(progress: DirectFileProgress) {
+    updateIncomingDirectProgress({ ...progress, error: progress.error ?? '接收文件失败' });
+    setNotice({ tone: 'error', text: `${progress.fileName} 接收失败` });
+  }
+
+  async function createIncomingDirectFileSink(file: IncomingDirectFile): Promise<IncomingDirectFileSink | null> {
+    const directory = await ensureDirectoryWritable(receiveDirectoryRef.current);
+    if (!directory) {
+      return null;
+    }
+    const { fileHandle, writer } = await createWritableFile(directory, file.fileName);
+    let closed = false;
+    return {
+      savedToDisk: true,
+      async write(chunk) {
+        await writer.write(chunk);
       },
-    }));
-    setNotice({ tone: 'success', text: `${file.senderName} 发来文件：${file.fileName}` });
+      async close() {
+        closed = true;
+        await writer.close();
+        if (file.contentType.toLowerCase().startsWith('image/')) {
+          const storedFile = await fileHandle.getFile();
+          return { url: URL.createObjectURL(storedFile) };
+        }
+        return {};
+      },
+      async abort() {
+        if (!closed) {
+          await writer.abort().catch(() => undefined);
+        }
+      },
+    };
+  }
+
+  async function acceptIncomingDirectFile(file: IncomingDirectFile) {
+    try {
+      const conversation = await resolveIncomingDirectConversation(file);
+      const message = directFileMessage({
+        id: file.id,
+        roomId: file.roomId,
+        conversationId: conversation.id,
+        senderId: file.senderId,
+        senderName: file.senderName,
+        targetId: sessionRef.current?.clientId ?? file.targetId ?? null,
+        fileName: file.fileName,
+        size: file.size,
+        contentType: file.contentType,
+        url: file.url,
+        createdAt: file.createdAt,
+        savedToDisk: file.savedToDisk,
+        type: file.messageType,
+      });
+      if (file.url) {
+        objectUrlsRef.current.push(file.url);
+      }
+      upsertMessageView(message);
+      setConversations((current) => {
+        const next = upsertConversationAfterMessage(current, conversation, file.id, file.fileName, file.createdAt, activeConversationIdRef.current);
+        conversationsRef.current = next;
+        return next;
+      });
+      setTransfers((current) => ({
+        ...current,
+        [file.id]: {
+          ...(current[file.id] ?? {
+            id: file.id,
+            conversationId: conversation.id,
+            startedAt: file.createdAt,
+            transport: 'p2p',
+            direction: 'receive',
+          }),
+          fileName: file.fileName,
+          peerId: file.senderId,
+          conversationId: conversation.id,
+          totalBytes: file.size,
+          transferredBytes: file.size,
+          status: 'done',
+          error: undefined,
+          updatedAt: Date.now(),
+        },
+      }));
+      setNotice({
+        tone: 'success',
+        text: file.savedToDisk ? `${file.senderName} 发来文件，已保存：${file.fileName}` : `${file.senderName} 发来文件：${file.fileName}`,
+      });
+    } catch (error) {
+      setTransfers((current) => ({
+        ...current,
+        [file.id]: {
+          ...(current[file.id] ?? {
+            id: file.id,
+            conversationId: file.conversationId ?? activeConversationIdRef.current,
+            startedAt: file.createdAt,
+            transport: 'p2p',
+            direction: 'receive',
+          }),
+          fileName: file.fileName,
+          peerId: file.senderId,
+          totalBytes: file.size,
+          transferredBytes: file.size,
+          status: 'failed',
+          error: error instanceof Error ? error.message : '接收文件已完成，但写入聊天记录失败',
+          updatedAt: Date.now(),
+        },
+      }));
+      setNotice({ tone: 'error', text: `${file.fileName} 未写入聊天记录` });
+    }
+  }
+
+  async function resolveIncomingDirectConversation(file: IncomingDirectFile): Promise<ConversationView> {
+    const existingById = file.conversationId ? conversationsRef.current.find((item) => item.id === file.conversationId) : undefined;
+    if (existingById) {
+      return existingById;
+    }
+    const existingByPeer = conversationsRef.current.find((item) => item.peerUserId === file.senderId);
+    if (existingByPeer) {
+      return existingByPeer;
+    }
+    try {
+      const conversation = await ensureDirectConversation(file.senderId);
+      void refreshRoomDetail();
+      return conversation;
+    } catch (error) {
+      const conversationId = file.conversationId || directConversationId(file.roomId, file.senderId, sessionRef.current?.clientId ?? file.targetId);
+      if (!conversationId) {
+        throw error;
+      }
+      const fallback: ConversationView = {
+        id: conversationId,
+        roomId: file.roomId,
+        type: 'direct',
+        title: file.senderName,
+        peerUserId: file.senderId,
+        lastMessageId: file.id,
+        lastMessageText: file.fileName,
+        lastMessageAt: file.createdAt,
+        unreadCount: conversationId === activeConversationIdRef.current ? 0 : 1,
+        updatedAt: file.createdAt,
+      };
+      setConversations((current) => {
+        const next = current.some((item) => item.id === fallback.id) ? current : [fallback, ...current];
+        conversationsRef.current = next;
+        return next;
+      });
+      return fallback;
+    }
   }
 
   async function ensureDirectConversation(peerUserId: string): Promise<ConversationView> {
-    const existing = conversations.find((item) => item.peerUserId === peerUserId);
+    const existing = conversationsRef.current.find((item) => item.peerUserId === peerUserId);
     if (existing) {
       return existing;
     }
@@ -531,9 +702,11 @@ export default function App() {
         body: JSON.stringify({ peerUserId }),
       },
     );
-    setConversations((current) =>
-      current.some((item) => item.id === conversation.id) ? current : [conversation, ...current],
-    );
+    setConversations((current) => {
+      const next = current.some((item) => item.id === conversation.id) ? current : [conversation, ...current];
+      conversationsRef.current = next;
+      return next;
+    });
     return conversation;
   }
 
@@ -665,6 +838,9 @@ export default function App() {
     }));
     try {
       const sent = await mesh.sendFile(peerId, file, {
+        transferId,
+        conversationId: conversation.id,
+        messageType,
         signal: controller.signal,
         isPaused: () => pausedTransfersRef.current[transferId] === true,
         onProgress: (transferredBytes, totalBytes) => {
@@ -868,14 +1044,19 @@ export default function App() {
       };
       xhr.onabort = () => {
         delete uploadXhrsRef.current[transferId];
-        setTransfers((current) => ({
-          ...current,
-          [transferId]: {
-            ...current[transferId],
-            status: 'cancelled',
-            updatedAt: Date.now(),
-          },
-        }));
+        setTransfers((current) => {
+          if (!current[transferId]) {
+            return current;
+          }
+          return {
+            ...current,
+            [transferId]: {
+              ...current[transferId],
+              status: 'cancelled',
+              updatedAt: Date.now(),
+            },
+          };
+        });
         reject(new Error('已取消'));
       };
       xhr.open('POST', `/api/conversations/${encodeURIComponent(conversationId)}/attachments`);
@@ -966,6 +1147,10 @@ export default function App() {
 
   async function saveAttachment(attachment: AttachmentView) {
     try {
+      if (!attachment.url) {
+        setNotice({ tone: 'success', text: '文件已在接收目录' });
+        return;
+      }
       const response = await fetch(attachment.url);
       if (!response.ok) {
         throw new Error('下载失败');
@@ -1038,6 +1223,85 @@ export default function App() {
       await uploadAttachment(retryable.conversationId, retryable.file, retryable.messageType);
     } catch (error) {
       setNotice({ tone: 'error', text: error instanceof Error ? error.message : '重试失败' });
+    }
+  }
+
+  async function clearActiveConversation() {
+    if (!activeConversation) {
+      return;
+    }
+    const confirmed = window.confirm(`清空「${activeConversation.title}」的聊天记录？`);
+    if (!confirmed) {
+      return;
+    }
+    try {
+      const response = await apiJSON<{ conversationId: string; removed: number }>(
+        `/api/conversations/${encodeURIComponent(activeConversation.id)}/messages`,
+        { method: 'DELETE' },
+      );
+      clearConversationLocally(response.conversationId || activeConversation.id);
+      await refreshRoomDetail();
+      await refreshRooms();
+      setNotice({ tone: 'success', text: `已清空 ${response.removed} 条消息` });
+    } catch (error) {
+      setNotice({ tone: 'error', text: error instanceof Error ? error.message : '清空失败' });
+    }
+  }
+
+  function clearConversationLocally(conversationId: string) {
+    for (const [id, row] of Object.entries(transfersRef.current)) {
+      if (row.conversationId !== conversationId) {
+        continue;
+      }
+      uploadXhrsRef.current[id]?.abort();
+      transferAbortControllersRef.current[id]?.abort();
+      delete uploadXhrsRef.current[id];
+      delete transferAbortControllersRef.current[id];
+      delete pausedTransfersRef.current[id];
+      delete retryableTransfersRef.current[id];
+    }
+    setMessagesByConversation((current) => ({ ...current, [conversationId]: [] }));
+    setTransfers((current) => {
+      const next = Object.fromEntries(Object.entries(current).filter(([, row]) => row.conversationId !== conversationId));
+      transfersRef.current = next;
+      return next;
+    });
+    setConversations((current) => {
+      const next = current.map((item) =>
+        item.id === conversationId
+          ? { ...item, lastMessageId: undefined, lastMessageText: undefined, lastMessageAt: 0, unreadCount: 0 }
+          : item,
+      );
+      conversationsRef.current = next;
+      return next;
+    });
+  }
+
+  async function chooseReceiveDirectory() {
+    try {
+      const state = await pickReceiveDirectory();
+      receiveDirectoryRef.current = state;
+      setReceiveDirectory(state);
+      setNotice({
+        tone: state.status === 'ready' ? 'success' : 'info',
+        text: state.status === 'ready' ? `接收目录已设置：${state.name}` : '接收目录需要浏览器授权',
+      });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        return;
+      }
+      setNotice({ tone: 'error', text: '接收目录设置失败' });
+    }
+  }
+
+  async function removeReceiveDirectory() {
+    try {
+      await clearReceiveDirectory();
+      receiveDirectoryRef.current = EMPTY_RECEIVE_DIRECTORY;
+      setReceiveDirectory(EMPTY_RECEIVE_DIRECTORY);
+      setNotice({ tone: 'success', text: '已清除接收目录' });
+    } catch {
+      setNotice({ tone: 'error', text: '清除接收目录失败' });
     }
   }
 
@@ -1133,6 +1397,15 @@ export default function App() {
         void refreshRooms();
         return true;
       }
+      case 'conversation_cleared': {
+        const envelope = payload as Envelope<ConversationClearedPayload>;
+        if (envelope.payload?.conversationId) {
+          clearConversationLocally(envelope.payload.conversationId);
+          void refreshRoomDetail();
+          void refreshRooms();
+        }
+        return true;
+      }
       case 'webrtc_offer':
       case 'webrtc_answer':
       case 'webrtc_ice': {
@@ -1177,6 +1450,7 @@ export default function App() {
         onClose={() => setSidebarOpen(false)}
         onCopyRoomLink={() => void copyRoomLink()}
         onEnterRoom={submitRoom}
+        onOpenSettings={() => setSettingsOpen(true)}
         onRoomInputChange={setRoomInput}
         onSelectConversation={switchConversation}
         recentRooms={recentRoomList}
@@ -1192,6 +1466,7 @@ export default function App() {
           connectionState={connectionState}
           nicknameDraft={nicknameDraft}
           onMenu={() => setSidebarOpen(true)}
+          onClearConversation={() => void clearActiveConversation()}
           onNicknameChange={setNicknameDraft}
           onRefresh={() => void refreshRoomDetail()}
           onSaveNickname={() => void saveNickname()}
@@ -1242,6 +1517,17 @@ export default function App() {
           <span>松开发送文件</span>
         </div>
       ) : null}
+
+      {settingsOpen ? (
+        <SettingsDialog
+          activeRoom={activeRoom}
+          receiveDirectory={receiveDirectory}
+          onChooseReceiveDirectory={() => void chooseReceiveDirectory()}
+          onClearReceiveDirectory={() => void removeReceiveDirectory()}
+          onClose={() => setSettingsOpen(false)}
+          onCopyRoomLink={() => void copyRoomLink()}
+        />
+      ) : null}
     </div>
   );
 }
@@ -1254,6 +1540,7 @@ function Sidebar(props: {
   onClose: () => void;
   onCopyRoomLink: () => void;
   onEnterRoom: (event: FormEvent) => void;
+  onOpenSettings: () => void;
   onRoomInputChange: (value: string) => void;
   onSelectConversation: (conversationId: string) => void;
   recentRooms: string[];
@@ -1318,9 +1605,11 @@ function Sidebar(props: {
       </section>
 
       <section className="sidebar-section compact">
-        <div className="section-title">
-          <Settings size={14} />
-          房间
+        <div className="section-title settings-title">
+          <span>房间</span>
+          <button className="settings-launch" type="button" onClick={props.onOpenSettings} aria-label="打开房间设置">
+            <Settings size={18} />
+          </button>
         </div>
         {props.rooms.map((room) => (
           <div className="room-summary" key={room.id}>
@@ -1333,12 +1622,73 @@ function Sidebar(props: {
   );
 }
 
+function SettingsDialog(props: {
+  activeRoom: string;
+  receiveDirectory: StoredDirectoryState;
+  onChooseReceiveDirectory: () => void;
+  onClearReceiveDirectory: () => void;
+  onClose: () => void;
+  onCopyRoomLink: () => void;
+}) {
+  const directoryReady = props.receiveDirectory.status === 'ready';
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={props.onClose}>
+      <section className="settings-dialog" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <header className="settings-dialog-header">
+          <div>
+            <strong>房间设置</strong>
+            <span>#{props.activeRoom}</span>
+          </div>
+          <button className="icon-button" onClick={props.onClose} aria-label="关闭设置">
+            <X size={17} />
+          </button>
+        </header>
+
+        <div className="settings-row">
+          <div className="settings-row-main">
+            <Share2 size={17} />
+            <span>
+              <strong>房间链接</strong>
+              <small>#{props.activeRoom}</small>
+            </span>
+          </div>
+          <button className="settings-action" onClick={props.onCopyRoomLink}>
+            <Copy size={14} />
+            复制
+          </button>
+        </div>
+
+        <div className="settings-row">
+          <div className="settings-row-main">
+            <HardDrive size={17} />
+            <span>
+              <strong>P2P 接收目录</strong>
+              <small>{receiveDirectoryLabel(props.receiveDirectory)}</small>
+            </span>
+          </div>
+          <div className="settings-actions">
+            <button className="settings-action" onClick={props.onChooseReceiveDirectory}>
+              <FolderOpen size={14} />
+              {directoryReady ? '更换' : '选择'}
+            </button>
+            <button className="settings-action subtle" onClick={props.onClearReceiveDirectory} disabled={!props.receiveDirectory.handle}>
+              <Trash2 size={14} />
+              清除
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function ChatHeader(props: {
   activeConversation?: ConversationView;
   activeRoom: string;
   connectionState: ConnectionState;
   nicknameDraft: string;
   onMenu: () => void;
+  onClearConversation: () => void;
   onNicknameChange: (value: string) => void;
   onRefresh: () => void;
   onSaveNickname: () => void;
@@ -1361,6 +1711,9 @@ function ChatHeader(props: {
       <div className="header-actions">
         <button className="icon-button" onClick={props.onRefresh} aria-label="刷新">
           <RefreshCw size={17} />
+        </button>
+        <button className="icon-button" onClick={props.onClearConversation} aria-label="清空当前会话">
+          <Trash2 size={16} />
         </button>
         <input
           value={props.nicknameDraft}
@@ -1419,7 +1772,9 @@ function MessageTimeline(props: {
 }
 
 function AttachmentMessage({ attachment, onSave }: { attachment: AttachmentView; onSave: () => void }) {
-  if (attachment.previewable) {
+  const savedToDisk = attachment.storageKind === 'p2p_disk';
+  const hasUrl = Boolean(attachment.url);
+  if (attachment.previewable && hasUrl) {
     return (
       <div className="attachment-card image">
         <a className="image-message" href={attachment.url} target="_blank" rel="noreferrer">
@@ -1429,25 +1784,34 @@ function AttachmentMessage({ attachment, onSave }: { attachment: AttachmentView;
             {attachment.fileName}
           </span>
         </a>
-        <button onClick={onSave} aria-label="保存图片">
-          <Download size={14} />
-          保存
+        <button onClick={onSave} disabled={savedToDisk} aria-label={savedToDisk ? '图片已保存' : '保存图片'}>
+          {savedToDisk ? <Check size={14} /> : <Download size={14} />}
+          {savedToDisk ? '已保存' : '保存'}
         </button>
       </div>
     );
   }
+  const content = (
+    <>
+      <FileText size={20} />
+      <span>
+        <strong>{attachment.fileName}</strong>
+        <small>{savedToDisk ? `已保存 · ${formatBytes(attachment.size)}` : formatBytes(attachment.size)}</small>
+      </span>
+    </>
+  );
   return (
     <div className="attachment-card file">
-      <a className="file-message-v2" href={attachment.url} target="_blank" rel="noreferrer">
-        <FileText size={20} />
-        <span>
-          <strong>{attachment.fileName}</strong>
-          <small>{formatBytes(attachment.size)}</small>
-        </span>
-      </a>
-      <button onClick={onSave} aria-label="保存文件">
-        <Download size={14} />
-        保存
+      {hasUrl ? (
+        <a className="file-message-v2" href={attachment.url} target="_blank" rel="noreferrer">
+          {content}
+        </a>
+      ) : (
+        <div className="file-message-v2 saved">{content}</div>
+      )}
+      <button onClick={onSave} disabled={savedToDisk && !hasUrl} aria-label={savedToDisk ? '文件已保存' : '保存文件'}>
+        {savedToDisk ? <Check size={14} /> : <Download size={14} />}
+        {savedToDisk ? '已保存' : '保存'}
       </button>
     </div>
   );
@@ -1669,8 +2033,9 @@ function directFileMessage(input: {
   fileName: string;
   size: number;
   contentType: string;
-  url: string;
+  url?: string;
   createdAt: number;
+  savedToDisk?: boolean;
   type?: 'txt_file';
 }): MessageView {
   const previewable = input.contentType.toLowerCase().startsWith('image/');
@@ -1690,12 +2055,53 @@ function directFileMessage(input: {
       fileName: input.fileName,
       size: input.size,
       contentType: input.contentType,
-      url: input.url,
+      url: input.url ?? '',
       previewable,
-      storageKind: 'p2p',
+      storageKind: input.savedToDisk ? 'p2p_disk' : 'p2p',
       createdAt: input.createdAt,
     },
   };
+}
+
+function upsertConversationAfterMessage(
+  conversations: ConversationView[],
+  conversation: ConversationView,
+  messageId: string,
+  text: string,
+  createdAt: number,
+  activeConversationId: string,
+): ConversationView[] {
+  const nextConversation: ConversationView = {
+    ...conversation,
+    lastMessageId: messageId,
+    lastMessageText: text,
+    lastMessageAt: createdAt,
+    unreadCount: conversation.id === activeConversationId ? 0 : Math.max(1, conversation.unreadCount || 0),
+    updatedAt: createdAt,
+  };
+  const exists = conversations.some((item) => item.id === conversation.id);
+  const next = exists
+    ? conversations.map((item) => (item.id === conversation.id ? { ...item, ...nextConversation } : item))
+    : [nextConversation, ...conversations];
+  return next.sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function directConversationId(roomId: string, left: string, right: string): string {
+  return `direct:${roomId}:${[left, right].map((item) => item.trim()).sort().join(':')}`;
+}
+
+function receiveDirectoryLabel(state: StoredDirectoryState): string {
+  switch (state.status) {
+    case 'ready':
+      return state.name || '已设置';
+    case 'needs-permission':
+      return state.name ? `${state.name} · 需要授权` : '需要授权';
+    case 'unsupported':
+      return '当前浏览器不支持';
+    case 'not-configured':
+    default:
+      return '未设置';
+  }
 }
 
 async function saveBlob(blob: Blob, fileName: string, contentType: string): Promise<void> {

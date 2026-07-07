@@ -5,6 +5,7 @@ export type DirectState = 'connecting' | 'direct' | 'offline';
 export interface IncomingDirectFile {
   id: string;
   roomId: string;
+  conversationId?: string;
   senderId: string;
   senderName: string;
   targetId: string;
@@ -12,7 +13,9 @@ export interface IncomingDirectFile {
   size: number;
   contentType: string;
   createdAt: number;
-  url: string;
+  url?: string;
+  savedToDisk?: boolean;
+  messageType?: 'txt_file';
 }
 
 export interface DirectFileProgress {
@@ -23,12 +26,23 @@ export interface DirectFileProgress {
   size: number;
   transferredBytes: number;
   direction: 'send' | 'receive';
+  error?: string;
 }
 
 export interface DirectSendOptions {
+  transferId?: string;
+  conversationId?: string;
+  messageType?: 'txt_file';
   signal?: AbortSignal;
   isPaused?: () => boolean;
   onProgress?: (transferredBytes: number, totalBytes: number) => void;
+}
+
+export interface IncomingDirectFileSink {
+  savedToDisk: boolean;
+  write: (chunk: ArrayBuffer) => Promise<void>;
+  close: () => Promise<{ url?: string }>;
+  abort: () => Promise<void>;
 }
 
 interface DirectMeshOptions {
@@ -40,6 +54,8 @@ interface DirectMeshOptions {
   onStateChange: (peerId: string, state: DirectState) => void;
   onIncomingFileStart?: (progress: DirectFileProgress) => void;
   onIncomingFileProgress?: (progress: DirectFileProgress) => void;
+  onIncomingFileError?: (progress: DirectFileProgress) => void;
+  createIncomingFileSink?: (meta: DirectFileMeta) => Promise<IncomingDirectFileSink | null>;
   onIncomingFile: (file: IncomingDirectFile) => void;
 }
 
@@ -49,6 +65,7 @@ interface DirectPeer {
   pc: RTCPeerConnection;
   channel: RTCDataChannel | null;
   activeFileId: string | null;
+  activeSendCount: number;
   pendingCandidates: RTCIceCandidateInit[];
   files: Map<string, PendingIncomingFile>;
 }
@@ -57,12 +74,16 @@ interface PendingIncomingFile {
   meta: DirectFileMeta;
   chunks: ArrayBuffer[];
   received: number;
+  sink: IncomingDirectFileSink | null;
+  writeChain: Promise<void>;
+  progress: ProgressReporter;
 }
 
 interface DirectFileMeta {
   type: 'file-meta';
   id: string;
   roomId: string;
+  conversationId?: string;
   senderId: string;
   senderName: string;
   targetId: string;
@@ -70,6 +91,7 @@ interface DirectFileMeta {
   size: number;
   contentType: string;
   createdAt: number;
+  messageType?: 'txt_file';
 }
 
 interface DirectFileDone {
@@ -83,11 +105,19 @@ interface DirectFileCancel {
 }
 
 const CHUNK_SIZE = 64 * 1024;
-const HIGH_WATER_MARK = 1024 * 1024;
-const LOW_WATER_MARK = 256 * 1024;
+const HIGH_WATER_MARK = 8 * 1024 * 1024;
+const LOW_WATER_MARK = 2 * 1024 * 1024;
+const PROGRESS_INTERVAL_MS = 150;
+const PEER_REAP_GRACE_MS = 8000;
+
+interface ProgressReporter {
+  report: (transferredBytes: number, totalBytes: number) => void;
+  flush: (transferredBytes: number, totalBytes: number) => void;
+}
 
 export class DirectMesh {
   private readonly peers = new Map<string, DirectPeer>();
+  private readonly peerCloseTimers = new Map<string, number>();
   private readonly options: DirectMeshOptions;
   private closed = false;
 
@@ -109,11 +139,12 @@ export class DirectMesh {
         continue;
       }
       liveIds.add(peer.clientId);
+      this.clearPeerCloseTimer(peer.clientId);
       this.ensurePeer(peer, this.options.selfId < peer.clientId);
     }
     for (const peerId of [...this.peers.keys()]) {
       if (!liveIds.has(peerId)) {
-        this.closePeer(peerId);
+        this.schedulePeerClose(peerId);
       }
     }
   }
@@ -151,11 +182,12 @@ export class DirectMesh {
     if (!peer || !channel || channel.readyState !== 'open') {
       return false;
     }
-    const id = crypto.randomUUID?.() ?? `direct-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const id = options.transferId ?? crypto.randomUUID?.() ?? `direct-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const meta: DirectFileMeta = {
       type: 'file-meta',
       id,
       roomId: this.options.roomId,
+      conversationId: options.conversationId,
       senderId: this.options.selfId,
       senderName: this.options.selfName,
       targetId: peerId,
@@ -163,18 +195,26 @@ export class DirectMesh {
       size: file.size,
       contentType: file.type || 'application/octet-stream',
       createdAt: Date.now(),
+      messageType: options.messageType,
     };
+    const progress = createProgressReporter(options.onProgress);
+    peer.activeSendCount += 1;
     channel.send(JSON.stringify(meta));
-    options.onProgress?.(0, file.size);
+    progress.flush(0, file.size);
     try {
-      await sendFileChunks(channel, file, options);
+      await sendFileChunks(channel, file, {
+        ...options,
+        onProgress: progress.report,
+      });
       channel.send(JSON.stringify({ type: 'file-done', id } satisfies DirectFileDone));
-      options.onProgress?.(file.size, file.size);
+      progress.flush(file.size, file.size);
     } catch (error) {
       if (channel.readyState === 'open') {
         channel.send(JSON.stringify({ type: 'file-cancel', id } satisfies DirectFileCancel));
       }
       throw error;
+    } finally {
+      peer.activeSendCount = Math.max(0, peer.activeSendCount - 1);
     }
     return true;
   }
@@ -200,6 +240,7 @@ export class DirectMesh {
       pc,
       channel: null,
       activeFileId: null,
+      activeSendCount: 0,
       pendingCandidates: [],
       files: new Map(),
     };
@@ -272,7 +313,24 @@ export class DirectMesh {
       }
       if (payload.type === 'file-meta') {
         peer.activeFileId = payload.id;
-        peer.files.set(payload.id, { meta: payload, chunks: [], received: 0 });
+        const progress = createProgressReporter((transferredBytes, totalBytes) => {
+          this.options.onIncomingFileProgress?.({
+            id: payload.id,
+            roomId: payload.roomId,
+            peerId: peer.id,
+            fileName: payload.fileName,
+            size: totalBytes,
+            transferredBytes,
+            direction: 'receive',
+          });
+        });
+        let sink: IncomingDirectFileSink | null = null;
+        try {
+          sink = (await this.options.createIncomingFileSink?.(payload)) ?? null;
+        } catch {
+          sink = null;
+        }
+        peer.files.set(payload.id, { meta: payload, chunks: [], received: 0, sink, writeChain: Promise.resolve(), progress });
         this.options.onIncomingFileStart?.({
           id: payload.id,
           roomId: payload.roomId,
@@ -285,11 +343,13 @@ export class DirectMesh {
         return;
       }
       if (payload.type === 'file-done') {
-        this.finishIncomingFile(peer, payload.id);
+        await this.finishIncomingFile(peer, payload.id);
         return;
       }
       if (payload.type === 'file-cancel') {
+        const pending = peer.files.get(payload.id);
         peer.files.delete(payload.id);
+        void pending?.sink?.abort();
         if (peer.activeFileId === payload.id) {
           peer.activeFileId = null;
         }
@@ -303,20 +363,16 @@ export class DirectMesh {
       return;
     }
     const chunk = await toArrayBuffer(data);
-    pending.chunks.push(chunk);
+    if (pending.sink) {
+      pending.writeChain = pending.writeChain.then(() => pending.sink?.write(chunk) ?? Promise.resolve());
+    } else {
+      pending.chunks.push(chunk);
+    }
     pending.received += chunk.byteLength;
-    this.options.onIncomingFileProgress?.({
-      id: pending.meta.id,
-      roomId: pending.meta.roomId,
-      peerId: peer.id,
-      fileName: pending.meta.fileName,
-      size: pending.meta.size,
-      transferredBytes: pending.received,
-      direction: 'receive',
-    });
+    pending.progress.report(pending.received, pending.meta.size);
   }
 
-  private finishIncomingFile(peer: DirectPeer, id: string): void {
+  private async finishIncomingFile(peer: DirectPeer, id: string): Promise<void> {
     const pending = peer.files.get(id);
     if (!pending) {
       return;
@@ -325,9 +381,33 @@ export class DirectMesh {
     if (peer.activeFileId === id) {
       peer.activeFileId = null;
     }
-    const blob = new Blob(pending.chunks, { type: pending.meta.contentType });
-    const url = URL.createObjectURL(blob);
-    this.options.onIncomingFile({ ...pending.meta, url });
+    try {
+      await pending.writeChain;
+      if (pending.received !== pending.meta.size) {
+        throw new Error('文件接收不完整');
+      }
+      pending.progress.flush(pending.meta.size, pending.meta.size);
+      if (pending.sink) {
+        const result = await pending.sink.close();
+        this.options.onIncomingFile({ ...pending.meta, url: result.url, savedToDisk: pending.sink.savedToDisk });
+        return;
+      }
+      const blob = new Blob(pending.chunks, { type: pending.meta.contentType });
+      const url = URL.createObjectURL(blob);
+      this.options.onIncomingFile({ ...pending.meta, url });
+    } catch {
+      await pending.sink?.abort();
+      this.options.onIncomingFileError?.({
+        id: pending.meta.id,
+        roomId: pending.meta.roomId,
+        peerId: peer.id,
+        fileName: pending.meta.fileName,
+        size: pending.meta.size,
+        transferredBytes: pending.received,
+        direction: 'receive',
+        error: '接收文件失败',
+      });
+    }
   }
 
   private closePeer(peerId: string): void {
@@ -335,10 +415,41 @@ export class DirectMesh {
     if (!peer) {
       return;
     }
+    this.clearPeerCloseTimer(peerId);
+    for (const pending of peer.files.values()) {
+      void pending.sink?.abort();
+    }
     peer.channel?.close();
     peer.pc.close();
     this.peers.delete(peerId);
     this.options.onStateChange(peerId, 'offline');
+  }
+
+  private schedulePeerClose(peerId: string): void {
+    if (this.peerCloseTimers.has(peerId)) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      this.peerCloseTimers.delete(peerId);
+      const peer = this.peers.get(peerId);
+      if (!peer) {
+        return;
+      }
+      if (peer.activeFileId || peer.activeSendCount > 0) {
+        this.schedulePeerClose(peerId);
+        return;
+      }
+      this.closePeer(peerId);
+    }, PEER_REAP_GRACE_MS);
+    this.peerCloseTimers.set(peerId, timer);
+  }
+
+  private clearPeerCloseTimer(peerId: string): void {
+    const timer = this.peerCloseTimers.get(peerId);
+    if (timer) {
+      window.clearTimeout(timer);
+      this.peerCloseTimers.delete(peerId);
+    }
   }
 }
 
@@ -411,6 +522,32 @@ async function waitForBuffer(channel: RTCDataChannel): Promise<void> {
       resolve();
     };
   });
+}
+
+function createProgressReporter(callback?: (transferredBytes: number, totalBytes: number) => void): ProgressReporter {
+  let lastEmit = 0;
+  let lastBytes = -1;
+  return {
+    report(transferredBytes, totalBytes) {
+      if (!callback) {
+        return;
+      }
+      const now = Date.now();
+      if (transferredBytes >= totalBytes || transferredBytes === 0 || now - lastEmit >= PROGRESS_INTERVAL_MS) {
+        lastEmit = now;
+        lastBytes = transferredBytes;
+        callback(transferredBytes, totalBytes);
+      }
+    },
+    flush(transferredBytes, totalBytes) {
+      if (!callback || lastBytes === transferredBytes) {
+        return;
+      }
+      lastEmit = Date.now();
+      lastBytes = transferredBytes;
+      callback(transferredBytes, totalBytes);
+    },
+  };
 }
 
 async function toArrayBuffer(data: unknown): Promise<ArrayBuffer> {

@@ -225,6 +225,28 @@ a {
   overflow: auto;
 }
 
+.settings-title {
+  justify-content: space-between;
+}
+
+.settings-launch {
+  display: inline-grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.settings-launch:hover {
+  border-color: var(--line-strong);
+  background: var(--surface-muted);
+  color: var(--text);
+}
+
 .section-title,
 .panel-heading {
   display: flex;
@@ -406,7 +428,7 @@ a {
 
 .header-actions {
   display: grid;
-  grid-template-columns: 34px minmax(120px, 180px) 34px;
+  grid-template-columns: 34px 34px minmax(120px, 180px) 34px;
   gap: 7px;
   align-items: center;
 }
@@ -488,6 +510,7 @@ a {
 .message-actions button,
 .attachment-card button,
 .transfer-actions button,
+.settings-action,
 .member-action {
   display: inline-flex;
   align-items: center;
@@ -500,6 +523,12 @@ a {
   color: var(--muted);
   font-size: 12px;
   cursor: pointer;
+}
+
+.attachment-card button:disabled,
+.settings-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
 }
 
 .attachment-card {
@@ -551,6 +580,10 @@ a {
   background: rgba(255, 255, 255, 0.7);
   padding: 9px;
   text-decoration: none;
+}
+
+.file-message-v2.saved {
+  color: var(--text);
 }
 
 .file-message-v2 > svg:first-child {
@@ -837,6 +870,96 @@ a {
   backdrop-filter: blur(5px);
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  background: rgba(23, 32, 46, 0.32);
+  padding: 18px;
+}
+
+.settings-dialog {
+  width: min(520px, 100%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.settings-dialog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+  padding: 14px;
+}
+
+.settings-dialog-header strong,
+.settings-dialog-header span {
+  display: block;
+}
+
+.settings-dialog-header span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.settings-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 14px;
+}
+
+.settings-row + .settings-row {
+  border-top: 1px solid var(--line);
+}
+
+.settings-row-main {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.settings-row-main > span {
+  min-width: 0;
+}
+
+.settings-row-main strong,
+.settings-row-main small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-row-main strong {
+  font-size: 13px;
+}
+
+.settings-row-main small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.settings-action.subtle {
+  background: var(--surface-soft);
+}
+
 .mobile-only {
   display: none;
 }
@@ -881,7 +1004,7 @@ a {
 
   .header-actions {
     grid-column: 1 / -1;
-    grid-template-columns: 34px minmax(0, 1fr) 34px;
+    grid-template-columns: 34px 34px minmax(0, 1fr) 34px;
   }
 
   .message-bubble {
@@ -896,5 +1019,13 @@ a {
     min-width: 44px;
     padding: 0;
     font-size: 0;
+  }
+
+  .settings-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .settings-actions {
+    justify-content: flex-start;
   }
 }

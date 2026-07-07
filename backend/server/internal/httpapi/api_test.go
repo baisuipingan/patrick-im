@@ -259,6 +259,112 @@ func TestV2RoomConversationMessageAndReadFlow(t *testing.T) {
 	}
 }
 
+func TestV2ClearConversationMessages(t *testing.T) {
+	router := newTestRouter(t)
+	cookie := sessionCookie(t, router)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/rooms", strings.NewReader(`{"roomId":"room-a"}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(cookie)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create room status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/conversations/room:room-a/messages", strings.NewReader(`{"text":"hello v2"}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create message status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	var uploadBody bytes.Buffer
+	writer := multipart.NewWriter(&uploadBody)
+	part, err := writer.CreateFormFile("file", "note.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("file body")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/conversations/room:room-a/attachments", &uploadBody)
+	req.Header.Set("content-type", writer.FormDataContentType())
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("upload status = %d body=%s", w.Code, w.Body.String())
+	}
+	var uploaded protocol.MessageView
+	if err := json.Unmarshal(w.Body.Bytes(), &uploaded); err != nil {
+		t.Fatal(err)
+	}
+	if uploaded.Attachment == nil {
+		t.Fatalf("uploaded attachment missing: %#v", uploaded)
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/api/conversations/room:room-a/messages", nil)
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("clear status = %d body=%s", w.Code, w.Body.String())
+	}
+	var cleared protocol.ClearConversationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &cleared); err != nil {
+		t.Fatal(err)
+	}
+	if cleared.ConversationID != "room:room-a" || cleared.Removed != 2 {
+		t.Fatalf("cleared = %#v", cleared)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/conversations/room:room-a/messages", nil)
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list status = %d body=%s", w.Code, w.Body.String())
+	}
+	var listed struct {
+		Messages []protocol.MessageView `json:"messages"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Messages) != 0 {
+		t.Fatalf("listed = %#v", listed.Messages)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/attachments/"+uploaded.Attachment.ID, nil)
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("attachment status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/rooms/room-a", nil)
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("room status = %d body=%s", w.Code, w.Body.String())
+	}
+	var room protocol.RoomDetail
+	if err := json.Unmarshal(w.Body.Bytes(), &room); err != nil {
+		t.Fatal(err)
+	}
+	if len(room.Conversations) != 1 || room.Conversations[0].LastMessageID != nil || room.Conversations[0].LastMessageText != nil || room.Conversations[0].LastMessageAt != 0 {
+		t.Fatalf("room conversations = %#v", room.Conversations)
+	}
+}
+
 func TestV2ConversationsExposeUnreadForOtherUser(t *testing.T) {
 	router := newTestRouter(t)
 	aliceCookie := signedSessionCookie(t, "alice", "Alice")
