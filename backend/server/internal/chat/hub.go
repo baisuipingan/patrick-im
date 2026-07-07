@@ -68,29 +68,6 @@ func (h *Hub) Peers(roomID string) []protocol.Peer {
 	return peersFor(h.rooms[roomID])
 }
 
-func (h *Hub) Peer(roomID, clientID string) (protocol.Peer, bool) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	room := h.rooms[roomID]
-	if room == nil || room[clientID] == nil {
-		return protocol.Peer{}, false
-	}
-	return room[clientID].peer, true
-}
-
-func (h *Hub) RenamePeer(roomID, clientID, nickname string) (protocol.Peer, bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	room := h.rooms[roomID]
-	if room == nil || room[clientID] == nil {
-		return protocol.Peer{}, false
-	}
-	room[clientID].peer.Nickname = nickname
-	peer := room[clientID].peer
-	h.publishLocked(roomID, nil, protocol.ServerToClientMessage{Type: "presence", RoomID: roomID, Peers: peersFor(room)})
-	return peer, true
-}
-
 func (h *Hub) publishLocked(roomID string, recipients []string, event protocol.ServerToClientMessage) {
 	room := h.rooms[roomID]
 	if len(room) == 0 {

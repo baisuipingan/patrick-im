@@ -19,7 +19,7 @@ import (
 	"github.com/baisuipingan/patrick-im/backend/server/internal/util"
 )
 
-const MaxTextBytes = 1024 * 1024
+const MaxTextBytes = 64 * 1024
 
 var (
 	ErrNotFound   = errors.New("not found")

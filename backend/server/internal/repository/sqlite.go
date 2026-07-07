@@ -73,9 +73,6 @@ func migrateLegacyMessageRecords(db *gorm.DB, legacyFileRoot string) error {
 		if err := tx.Exec(`ALTER TABLE message_records RENAME TO message_records_legacy_rewrite`).Error; err != nil {
 			return fmt.Errorf("rename legacy message_records: %w", err)
 		}
-		if err := dropSQLiteIndexes(tx, "message_records_legacy_rewrite"); err != nil {
-			return err
-		}
 		if err := tx.Migrator().CreateTable(&MessageRecord{}); err != nil {
 			return fmt.Errorf("create migrated message_records: %w", err)
 		}
@@ -127,40 +124,6 @@ FROM message_records_legacy_rewrite AS m
 		}
 		return nil
 	})
-}
-
-func dropSQLiteIndexes(db *gorm.DB, tableName string) error {
-	rows, err := db.Raw(`PRAGMA index_list(` + tableName + `)`).Rows()
-	if err != nil {
-		return fmt.Errorf("list legacy indexes: %w", err)
-	}
-	defer rows.Close()
-
-	indexes := make([]string, 0)
-	for rows.Next() {
-		var seq int
-		var name string
-		var unique int
-		var origin string
-		var partial int
-		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
-			return fmt.Errorf("scan legacy index: %w", err)
-		}
-		if name == "" || strings.HasPrefix(name, "sqlite_autoindex") {
-			continue
-		}
-		indexes = append(indexes, name)
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate legacy indexes: %w", err)
-	}
-	for _, name := range indexes {
-		quoted := strings.ReplaceAll(name, `"`, `""`)
-		if err := db.Exec(`DROP INDEX IF EXISTS "` + quoted + `"`).Error; err != nil {
-			return fmt.Errorf("drop legacy index %s: %w", name, err)
-		}
-	}
-	return nil
 }
 
 func hasSQLiteColumn(db *gorm.DB, tableName, columnName string) bool {
