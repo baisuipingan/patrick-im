@@ -354,6 +354,108 @@ func TestRoomWebSocketForwardsSignal(t *testing.T) {
 	}
 }
 
+func TestRelayUploadFlowCreatesDownloadableMessage(t *testing.T) {
+	api := newTestAPI(t)
+	router := Router(api)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	token := signedSessionToken(t, "alice", "Alice")
+	cookie := &http.Cookie{Name: sessionpkg.CookieName, Value: token}
+
+	uploadBody := `{"clientRequestId":"req-1","roomId":"room-a","fileName":"hello.txt","contentType":"text/plain","size":11,"targetId":null}`
+	req := httptest.NewRequest(http.MethodPost, "/api/relay/upload-request", strings.NewReader(uploadBody))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(cookie)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("upload request status = %d body=%s", w.Code, w.Body.String())
+	}
+	var upload protocol.RelayUploadResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &upload); err != nil {
+		t.Fatal(err)
+	}
+	if upload.FileID == "" || upload.UploadToken == "" || len(upload.PartURLs) != 1 {
+		t.Fatalf("upload response = %#v", upload)
+	}
+
+	req = httptest.NewRequest(http.MethodPut, upload.PartURLs[0].URL, strings.NewReader("hello world"))
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("part upload status = %d body=%s", w.Code, w.Body.String())
+	}
+	part := protocol.RelayUploadedPart{PartNumber: 1, ETag: w.Header().Get("etag")}
+	if part.ETag == "" {
+		t.Fatal("missing etag")
+	}
+
+	ackBody, err := json.Marshal(protocol.RelayUploadPartAckRequest{UploadToken: upload.UploadToken, Part: part})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/relay/upload-part", bytes.NewReader(ackBody))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("part ack status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	completeBody, err := json.Marshal(protocol.RelayCompleteUploadRequest{UploadToken: upload.UploadToken, Parts: []protocol.RelayUploadedPart{part}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/relay/complete", bytes.NewReader(completeBody))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("complete status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	alice := dialRoomWebSocket(t, server.URL, "room-a", token)
+	defer alice.Close()
+	readUntilEventType(t, alice, "room-snapshot")
+	if err := alice.WriteJSON(protocol.ClientToServerMessage{
+		Type: "relay-file-announced",
+		File: &protocol.RelayFileAnnouncement{
+			FileID:      upload.FileID,
+			FileName:    "hello.txt",
+			Size:        11,
+			ContentType: "text/plain",
+			ObjectKey:   upload.ObjectKey,
+			TargetID:    nil,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	event := readUntilEventType(t, alice, "chat-event")
+	eventBody, err := json.Marshal(event.Message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var message protocol.LegacyMessage
+	if err := json.Unmarshal(eventBody, &message); err != nil {
+		t.Fatal(err)
+	}
+	if message.Kind != "relay-file" || message.File == nil || message.File.FileID != upload.FileID {
+		t.Fatalf("chat event message = %#v", message)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/files/"+upload.FileID, nil)
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Body.String() != "hello world" {
+		t.Fatalf("download status = %d body=%q", w.Code, w.Body.String())
+	}
+}
+
 func TestCreateMessageRequiresSession(t *testing.T) {
 	router := newTestRouter(t)
 	req := httptest.NewRequest(http.MethodPost, "/api/rooms/room-a/messages", strings.NewReader(`{"text":"hello"}`))
