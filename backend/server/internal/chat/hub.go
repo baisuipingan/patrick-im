@@ -2,6 +2,7 @@ package chat
 
 import (
 	"sync"
+	"time"
 
 	"github.com/baisuipingan/patrick-im/backend/server/internal/protocol"
 )
@@ -15,14 +16,14 @@ type Hub struct {
 
 type subscriber struct {
 	peer protocol.Peer
-	ch   chan protocol.ServerToClientMessage
+	ch   chan any
 }
 
 func NewHub() *Hub {
 	return &Hub{rooms: map[string]map[string]*subscriber{}}
 }
 
-func (h *Hub) Join(roomID string, peer protocol.Peer) (<-chan protocol.ServerToClientMessage, func()) {
+func (h *Hub) Join(roomID string, peer protocol.Peer) (<-chan any, func()) {
 	h.mu.Lock()
 	room := h.rooms[roomID]
 	if room == nil {
@@ -32,10 +33,12 @@ func (h *Hub) Join(roomID string, peer protocol.Peer) (<-chan protocol.ServerToC
 	if current := room[peer.ClientID]; current != nil {
 		close(current.ch)
 	}
-	sub := &subscriber{peer: peer, ch: make(chan protocol.ServerToClientMessage, clientBufferSize)}
+	sub := &subscriber{peer: peer, ch: make(chan any, clientBufferSize)}
 	room[peer.ClientID] = sub
-	presence := protocol.ServerToClientMessage{Type: "presence", RoomID: roomID, Peers: peersFor(room)}
+	peers := peersFor(room)
+	presence := protocol.ServerToClientMessage{Type: "presence", RoomID: roomID, Peers: peers}
 	h.publishLocked(roomID, nil, presence)
+	h.publishLocked(roomID, nil, protocol.NewEnvelope("member_updated", "", roomID, "", protocol.MemberUpdatedPayload{Peers: peers}, time.Now().UnixMilli()))
 	h.mu.Unlock()
 
 	leave := func() {
@@ -51,12 +54,14 @@ func (h *Hub) Join(roomID string, peer protocol.Peer) (<-chan protocol.ServerToC
 			delete(h.rooms, roomID)
 			return
 		}
-		h.publishLocked(roomID, nil, protocol.ServerToClientMessage{Type: "presence", RoomID: roomID, Peers: peersFor(room)})
+		peers := peersFor(room)
+		h.publishLocked(roomID, nil, protocol.ServerToClientMessage{Type: "presence", RoomID: roomID, Peers: peers})
+		h.publishLocked(roomID, nil, protocol.NewEnvelope("member_updated", "", roomID, "", protocol.MemberUpdatedPayload{Peers: peers}, time.Now().UnixMilli()))
 	}
 	return sub.ch, leave
 }
 
-func (h *Hub) Publish(roomID string, recipients []string, event protocol.ServerToClientMessage) {
+func (h *Hub) Publish(roomID string, recipients []string, event any) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	h.publishLocked(roomID, recipients, event)
@@ -68,7 +73,7 @@ func (h *Hub) Peers(roomID string) []protocol.Peer {
 	return peersFor(h.rooms[roomID])
 }
 
-func (h *Hub) publishLocked(roomID string, recipients []string, event protocol.ServerToClientMessage) {
+func (h *Hub) publishLocked(roomID string, recipients []string, event any) {
 	room := h.rooms[roomID]
 	if len(room) == 0 {
 		return

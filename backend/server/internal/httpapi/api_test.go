@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"mime/multipart"
@@ -157,6 +158,175 @@ func TestCreateAndListTextMessage(t *testing.T) {
 	}
 }
 
+func TestV2RoomConversationMessageAndReadFlow(t *testing.T) {
+	router := newTestRouter(t)
+	cookie := sessionCookie(t, router)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/rooms", strings.NewReader(`{"roomId":"room-a"}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(cookie)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create room status = %d body=%s", w.Code, w.Body.String())
+	}
+	var room protocol.RoomDetail
+	if err := json.Unmarshal(w.Body.Bytes(), &room); err != nil {
+		t.Fatal(err)
+	}
+	if room.ID != "room-a" || len(room.Conversations) != 1 || room.Conversations[0].ID != "room:room-a" {
+		t.Fatalf("room = %#v", room)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/conversations/room:room-a/messages", strings.NewReader(`{"text":"hello v2"}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create message status = %d body=%s", w.Code, w.Body.String())
+	}
+	var created protocol.MessageView
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.Type != protocol.MessageTypeText || created.Text == nil || *created.Text != "hello v2" {
+		t.Fatalf("created = %#v", created)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/conversations/room:room-a/messages", nil)
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list messages status = %d body=%s", w.Code, w.Body.String())
+	}
+	var listed struct {
+		Messages []protocol.MessageView `json:"messages"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Messages) != 1 || listed.Messages[0].ID != created.ID {
+		t.Fatalf("listed = %#v", listed.Messages)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/conversations/room:room-a/read", strings.NewReader(`{}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("mark read status = %d body=%s", w.Code, w.Body.String())
+	}
+	var readConversation protocol.ConversationView
+	if err := json.Unmarshal(w.Body.Bytes(), &readConversation); err != nil {
+		t.Fatal(err)
+	}
+	if readConversation.UnreadCount != 0 {
+		t.Fatalf("read conversation = %#v", readConversation)
+	}
+
+	var uploadBody bytes.Buffer
+	writer := multipart.NewWriter(&uploadBody)
+	if err := writer.WriteField("messageType", string(protocol.MessageTypeTxtFile)); err != nil {
+		t.Fatal(err)
+	}
+	part, err := writer.CreateFormFile("file", "message.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("large text")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/conversations/room:room-a/attachments", &uploadBody)
+	req.Header.Set("content-type", writer.FormDataContentType())
+	req.AddCookie(cookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("upload attachment status = %d body=%s", w.Code, w.Body.String())
+	}
+	var uploaded protocol.MessageView
+	if err := json.Unmarshal(w.Body.Bytes(), &uploaded); err != nil {
+		t.Fatal(err)
+	}
+	if uploaded.Type != protocol.MessageTypeTxtFile || uploaded.Attachment == nil || uploaded.Attachment.FileName != "message.txt" {
+		t.Fatalf("uploaded = %#v", uploaded)
+	}
+}
+
+func TestV2ConversationsExposeUnreadForOtherUser(t *testing.T) {
+	router := newTestRouter(t)
+	aliceCookie := signedSessionCookie(t, "alice", "Alice")
+	bobCookie := signedSessionCookie(t, "bob", "Bob")
+
+	postMessage(t, router, aliceCookie, "room-a", `{"text":"hello bob"}`)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/rooms/room-a", nil)
+	req.AddCookie(bobCookie)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("room detail status = %d body=%s", w.Code, w.Body.String())
+	}
+	var room protocol.RoomDetail
+	if err := json.Unmarshal(w.Body.Bytes(), &room); err != nil {
+		t.Fatal(err)
+	}
+	if len(room.Conversations) != 1 || room.Conversations[0].UnreadCount != 1 {
+		t.Fatalf("room conversations = %#v", room.Conversations)
+	}
+}
+
+func TestV2DirectConversationStaysVisibleAfterRoomRefresh(t *testing.T) {
+	router := newTestRouter(t)
+	aliceCookie := signedSessionCookie(t, "alice", "Alice")
+	bobCookie := signedSessionCookie(t, "bob", "Bob")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/rooms", strings.NewReader(`{"roomId":"room-a"}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(aliceCookie)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create room status = %d body=%s", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/rooms", strings.NewReader(`{"roomId":"room-a"}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(bobCookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("bob join room status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/rooms/room-a/conversations/direct", strings.NewReader(`{"peerUserId":"bob"}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(aliceCookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create direct status = %d body=%s", w.Code, w.Body.String())
+	}
+	var direct protocol.ConversationView
+	if err := json.Unmarshal(w.Body.Bytes(), &direct); err != nil {
+		t.Fatal(err)
+	}
+	if direct.ID != "direct:room-a:alice:bob" || direct.PeerUserID == nil || *direct.PeerUserID != "bob" {
+		t.Fatalf("direct = %#v", direct)
+	}
+	if direct.Title != "Bob" {
+		t.Fatalf("direct title = %q", direct.Title)
+	}
+
+	assertRoomHasConversation(t, router, aliceCookie, "room-a", direct.ID)
+	assertRoomHasConversation(t, router, bobCookie, "room-a", direct.ID)
+}
+
 func TestUploadFileCreatesMessage(t *testing.T) {
 	router := newTestRouter(t)
 	cookie := sessionCookie(t, router)
@@ -287,6 +457,39 @@ func TestWebSocketSessionFallbackAcceptsSessionSubprotocol(t *testing.T) {
 	}
 }
 
+func TestWebSocketSessionAcceptsQueryAndAuthorizationToken(t *testing.T) {
+	api := newTestAPI(t)
+	payload := sessionpkg.Payload{
+		ClientID:  "alice",
+		Nickname:  "Alice",
+		IssuedAt:  1,
+		ExpiresAt: 4_102_444_800_000,
+	}
+	token, err := sessionpkg.CreateSignedToken("secret", payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/rooms/room-a/ws?token="+token, nil)
+	got, err := api.requireWebSocketSession(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != payload {
+		t.Fatalf("query payload = %#v", got)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/api/rooms/room-a/ws", nil)
+	req.Header.Set("authorization", "Bearer "+token)
+	got, err = api.requireWebSocketSession(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != payload {
+		t.Fatalf("header payload = %#v", got)
+	}
+}
+
 func TestWebSocketSignalForwardsOnlyToTarget(t *testing.T) {
 	api := newTestAPI(t)
 	aliceEvents, aliceLeave := api.hub.Join("room-a", protocol.Peer{
@@ -305,18 +508,122 @@ func TestWebSocketSignalForwardsOnlyToTarget(t *testing.T) {
 	drainEvents(bobEvents)
 
 	api.handleClientWebSocketMessage(
+		context.Background(),
 		"room-a",
 		sessionpkg.Payload{ClientID: "alice", Nickname: "Alice"},
 		[]byte(`{"type":"signal","targetId":"bob","payload":{"description":{"type":"offer","sdp":"v=0"}}}`),
 	)
 
 	select {
-	case event := <-bobEvents:
+	case raw := <-bobEvents:
+		event, ok := raw.(protocol.ServerToClientMessage)
+		if !ok {
+			t.Fatalf("event type = %T", raw)
+		}
 		if event.Type != "signal" || event.FromID != "alice" || event.Payload == nil || len(event.Payload.Description) == 0 {
 			t.Fatalf("event = %#v", event)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for forwarded signal")
+	}
+
+	select {
+	case event := <-aliceEvents:
+		t.Fatalf("sender received signal: %#v", event)
+	default:
+	}
+}
+
+func TestWebSocketEnvelopeSendMessageAcksAndBroadcasts(t *testing.T) {
+	router := newTestRouter(t)
+	server := httptest.NewServer(router)
+	defer server.Close()
+	alice := dialRoomWebSocket(t, server.URL, "room-a", signedSessionToken(t, "alice", "Alice"))
+	defer alice.Close()
+	readUntilEnvelopeType(t, alice, "room_snapshot")
+
+	request := protocol.NewEnvelope(
+		"send_message",
+		"request-1",
+		"room-a",
+		"room:room-a",
+		protocol.CreateConversationMessageRequest{Text: "hello envelope"},
+		time.Now().UnixMilli(),
+	)
+	if err := alice.WriteJSON(request); err != nil {
+		t.Fatal(err)
+	}
+	created := readUntilEnvelopeType(t, alice, "message_created")
+	if created.ConversationID != "room:room-a" {
+		t.Fatalf("created envelope = %#v", created)
+	}
+	ack := readUntilEnvelopeType(t, alice, "message_ack")
+	if ack.RequestID != "request-1" || ack.Error != nil {
+		t.Fatalf("ack = %#v", ack)
+	}
+	var payload protocol.MessageAckPayload
+	if err := json.Unmarshal(ack.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Message.Text == nil || *payload.Message.Text != "hello envelope" {
+		t.Fatalf("ack payload = %#v", payload)
+	}
+}
+
+func TestWebSocketEnvelopeWebRTCForwardsOnlyToTarget(t *testing.T) {
+	api := newTestAPI(t)
+	aliceEvents, aliceLeave := api.hub.Join("room-a", protocol.Peer{
+		ClientID: "alice",
+		Nickname: "Alice",
+		JoinedAt: 1,
+	})
+	defer aliceLeave()
+	bobEvents, bobLeave := api.hub.Join("room-a", protocol.Peer{
+		ClientID: "bob",
+		Nickname: "Bob",
+		JoinedAt: 2,
+	})
+	defer bobLeave()
+	drainEvents(aliceEvents)
+	drainEvents(bobEvents)
+
+	request := protocol.NewEnvelope(
+		"webrtc_offer",
+		"signal-1",
+		"room-a",
+		"direct:room-a:alice:bob",
+		protocol.WebRTCSignalPayload{
+			TargetID: "bob",
+			Signal: protocol.SignalEnvelope{
+				Description: json.RawMessage(`{"type":"offer","sdp":"v=0"}`),
+			},
+		},
+		time.Now().UnixMilli(),
+	)
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.handleClientWebSocketMessage(context.Background(), "room-a", sessionpkg.Payload{ClientID: "alice", Nickname: "Alice"}, data)
+
+	select {
+	case raw := <-bobEvents:
+		event, ok := raw.(protocol.Envelope)
+		if !ok {
+			t.Fatalf("event type = %T", raw)
+		}
+		if event.Type != "webrtc_offer" || event.RequestID != "signal-1" {
+			t.Fatalf("event = %#v", event)
+		}
+		var payload protocol.WebRTCSignalPayload
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.FromID != "alice" || payload.TargetID != "bob" || len(payload.Signal.Description) == 0 {
+			t.Fatalf("payload = %#v", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for forwarded envelope")
 	}
 
 	select {
@@ -398,7 +705,44 @@ func readUntilEventType(t *testing.T, conn *websocket.Conn, eventType string) pr
 	}
 }
 
-func drainEvents(events <-chan protocol.ServerToClientMessage) {
+func readUntilEnvelopeType(t *testing.T, conn *websocket.Conn, eventType string) protocol.Envelope {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		var event protocol.Envelope
+		if err := conn.ReadJSON(&event); err != nil {
+			t.Fatal(err)
+		}
+		if event.Type == eventType {
+			return event
+		}
+	}
+}
+
+func assertRoomHasConversation(t *testing.T, router http.Handler, cookie *http.Cookie, roomID, conversationID string) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/rooms/"+roomID, nil)
+	req.AddCookie(cookie)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("room detail status = %d body=%s", w.Code, w.Body.String())
+	}
+	var room protocol.RoomDetail
+	if err := json.Unmarshal(w.Body.Bytes(), &room); err != nil {
+		t.Fatal(err)
+	}
+	for _, conversation := range room.Conversations {
+		if conversation.ID == conversationID {
+			return
+		}
+	}
+	t.Fatalf("conversation %q not in room detail: %#v", conversationID, room.Conversations)
+}
+
+func drainEvents(events <-chan any) {
 	for {
 		select {
 		case <-events:

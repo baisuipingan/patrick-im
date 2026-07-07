@@ -97,6 +97,9 @@ func (s *Store) CreateTextMessage(ctx context.Context, roomID string, author ses
 	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
 		return protocol.Message{}, err
 	}
+	if err := s.mirrorMessageRecord(ctx, row); err != nil {
+		return protocol.Message{}, err
+	}
 	return recordToMessage(row), nil
 }
 
@@ -138,6 +141,10 @@ func (s *Store) CreateFileMessage(ctx context.Context, roomID string, author ses
 		CreatedAt:   now,
 	}
 	if err := s.db.WithContext(ctx).Create(&row).Error; err != nil {
+		_ = os.Remove(storagePath)
+		return protocol.Message{}, err
+	}
+	if err := s.mirrorMessageRecord(ctx, row); err != nil {
 		_ = os.Remove(storagePath)
 		return protocol.Message{}, err
 	}
@@ -196,7 +203,13 @@ func (s *Store) ClearThread(ctx context.Context, roomID string, actor session.Pa
 		for _, row := range rows {
 			ids = append(ids, row.ID)
 		}
-		return tx.Where("id IN ?", ids).Delete(&repository.MessageRecord{}).Error
+		if err := tx.Where("id IN ?", ids).Delete(&repository.MessageRecord{}).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("message_id IN ?", ids).Delete(&repository.AttachmentRecord{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id IN ?", ids).Delete(&repository.MessageV2Record{}).Error
 	})
 	if err != nil {
 		return protocol.ClearMessagesResponse{}, nil, err

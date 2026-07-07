@@ -43,6 +43,16 @@ const (
 	MessageKindFile MessageKind = "file"
 )
 
+type MessageType string
+
+const (
+	MessageTypeText    MessageType = "text"
+	MessageTypeImage   MessageType = "image"
+	MessageTypeFile    MessageType = "file"
+	MessageTypeSystem  MessageType = "system"
+	MessageTypeTxtFile MessageType = "txt_file"
+)
+
 type Message struct {
 	ID         string      `json:"id"`
 	RoomID     string      `json:"roomId"`
@@ -65,10 +75,20 @@ type SignalEnvelope struct {
 	Candidate   json.RawMessage `json:"candidate,omitempty"`
 }
 
+type WebRTCSignalPayload struct {
+	TargetID string         `json:"targetId,omitempty"`
+	FromID   string         `json:"fromId,omitempty"`
+	Signal   SignalEnvelope `json:"signal"`
+}
+
 type ClientToServerMessage struct {
-	Type     string          `json:"type"`
-	TargetID string          `json:"targetId,omitempty"`
-	Payload  *SignalEnvelope `json:"payload,omitempty"`
+	Type           string          `json:"type"`
+	RequestID      string          `json:"request_id,omitempty"`
+	RoomID         string          `json:"room_id,omitempty"`
+	ConversationID string          `json:"conversation_id,omitempty"`
+	TargetID       string          `json:"targetId,omitempty"`
+	Payload        *SignalEnvelope `json:"payload,omitempty"`
+	RawPayload     json.RawMessage `json:"-"`
 }
 
 type ServerToClientMessage struct {
@@ -87,4 +107,152 @@ type ServerToClientMessage struct {
 type ClearMessagesResponse struct {
 	TargetID *string `json:"targetId"`
 	Removed  int     `json:"removed"`
+}
+
+type UserView struct {
+	ID       string `json:"id"`
+	Nickname string `json:"nickname"`
+}
+
+type RoomSummary struct {
+	ID              string  `json:"id"`
+	DisplayName     string  `json:"displayName"`
+	LastMessageText *string `json:"lastMessageText,omitempty"`
+	LastMessageAt   int64   `json:"lastMessageAt"`
+	UnreadCount     int64   `json:"unreadCount"`
+	UpdatedAt       int64   `json:"updatedAt"`
+}
+
+type RoomDetail struct {
+	ID            string             `json:"id"`
+	DisplayName   string             `json:"displayName"`
+	Members       []RoomMemberView   `json:"members"`
+	Conversations []ConversationView `json:"conversations"`
+	UpdatedAt     int64              `json:"updatedAt"`
+}
+
+type RoomMemberView struct {
+	UserID     string `json:"userId"`
+	Nickname   string `json:"nickname"`
+	Role       string `json:"role"`
+	JoinedAt   int64  `json:"joinedAt"`
+	LastSeenAt int64  `json:"lastSeenAt"`
+	Online     bool   `json:"online"`
+}
+
+type ConversationView struct {
+	ID              string  `json:"id"`
+	RoomID          string  `json:"roomId"`
+	Type            string  `json:"type"`
+	Title           string  `json:"title"`
+	PeerUserID      *string `json:"peerUserId,omitempty"`
+	LastMessageID   *string `json:"lastMessageId,omitempty"`
+	LastMessageText *string `json:"lastMessageText,omitempty"`
+	LastMessageAt   int64   `json:"lastMessageAt"`
+	UnreadCount     int64   `json:"unreadCount"`
+	UpdatedAt       int64   `json:"updatedAt"`
+}
+
+type AttachmentView struct {
+	ID          string `json:"id"`
+	MessageID   string `json:"messageId"`
+	FileName    string `json:"fileName"`
+	Size        int64  `json:"size"`
+	ContentType string `json:"contentType"`
+	URL         string `json:"url"`
+	Previewable bool   `json:"previewable"`
+	StorageKind string `json:"storageKind"`
+	CreatedAt   int64  `json:"createdAt"`
+}
+
+type MessageView struct {
+	ID              string          `json:"id"`
+	ClientMessageID *string         `json:"clientMessageId,omitempty"`
+	RoomID          string          `json:"roomId"`
+	ConversationID  string          `json:"conversationId"`
+	Type            MessageType     `json:"type"`
+	SenderID        string          `json:"senderId"`
+	SenderName      string          `json:"senderName"`
+	TargetID        *string         `json:"targetId,omitempty"`
+	Text            *string         `json:"text,omitempty"`
+	Attachment      *AttachmentView `json:"attachment,omitempty"`
+	Status          string          `json:"status"`
+	CreatedAt       int64           `json:"createdAt"`
+}
+
+type CreateRoomRequest struct {
+	RoomID string `json:"roomId"`
+}
+
+type CreateDirectConversationRequest struct {
+	PeerUserID string `json:"peerUserId"`
+}
+
+type CreateConversationMessageRequest struct {
+	ClientMessageID *string     `json:"clientMessageId"`
+	Type            MessageType `json:"type"`
+	Text            string      `json:"text"`
+}
+
+type MarkReadRequest struct {
+	LastReadMessageID *string `json:"lastReadMessageId"`
+	LastReadAt        int64   `json:"lastReadAt"`
+}
+
+type RoomSnapshotPayload struct {
+	Room  RoomDetail `json:"room"`
+	Peers []Peer     `json:"peers"`
+}
+
+type MemberUpdatedPayload struct {
+	Peers []Peer `json:"peers"`
+}
+
+type MessageCreatedPayload struct {
+	Message MessageView `json:"message"`
+}
+
+type MessageAckPayload struct {
+	ClientMessageID *string     `json:"clientMessageId,omitempty"`
+	Message         MessageView `json:"message"`
+}
+
+type UnreadUpdatedPayload struct {
+	Conversation ConversationView `json:"conversation"`
+}
+
+type RoomUpdatedPayload struct {
+	Room RoomDetail `json:"room"`
+}
+
+type EnvelopeError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type Envelope struct {
+	Type           string          `json:"type"`
+	RequestID      string          `json:"request_id,omitempty"`
+	RoomID         string          `json:"room_id,omitempty"`
+	ConversationID string          `json:"conversation_id,omitempty"`
+	Payload        json.RawMessage `json:"payload,omitempty"`
+	CreatedAt      int64           `json:"created_at"`
+	Error          *EnvelopeError  `json:"error,omitempty"`
+}
+
+func NewEnvelope(eventType, requestID, roomID, conversationID string, payload any, createdAt int64) Envelope {
+	envelope := Envelope{
+		Type:           eventType,
+		RequestID:      requestID,
+		RoomID:         roomID,
+		ConversationID: conversationID,
+		CreatedAt:      createdAt,
+	}
+	if payload != nil {
+		raw, err := json.Marshal(payload)
+		if err == nil {
+			envelope.Payload = raw
+		}
+	}
+	return envelope
 }
