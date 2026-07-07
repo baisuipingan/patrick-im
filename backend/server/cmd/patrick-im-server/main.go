@@ -23,7 +23,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	db, err := repository.OpenSQLite(cfg.SQLitePath)
+	db, err := repository.OpenSQLite(cfg.SQLitePath, cfg.FileStorePath)
 	if err != nil {
 		logger.Error("open sqlite failed", "error", err)
 		os.Exit(1)
