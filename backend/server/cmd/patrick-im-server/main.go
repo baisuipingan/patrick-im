@@ -9,11 +9,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/baisuipingan/patrick-im/backend/server/internal/chat"
 	"github.com/baisuipingan/patrick-im/backend/server/internal/config"
 	"github.com/baisuipingan/patrick-im/backend/server/internal/httpapi"
-	"github.com/baisuipingan/patrick-im/backend/server/internal/messages"
-	"github.com/baisuipingan/patrick-im/backend/server/internal/realtime"
-	"github.com/baisuipingan/patrick-im/backend/server/internal/relay"
 	"github.com/baisuipingan/patrick-im/backend/server/internal/repository"
 )
 
@@ -37,18 +35,17 @@ func main() {
 	}
 	defer sqlDB.Close()
 
-	relayService, err := relay.NewService(cfg.FileStorePath, cfg.SessionSecret)
+	store, err := chat.NewStore(db, cfg.FileStorePath, cfg.UploadLimitBytes)
 	if err != nil {
-		logger.Error("open relay store failed", "error", err)
+		logger.Error("open chat store failed", "error", err)
 		os.Exit(1)
 	}
 
 	api := httpapi.New(
 		cfg,
 		logger,
-		realtime.NewHub(),
-		messages.NewStore(db, cfg.RecentMessageLimit),
-		relayService,
+		store,
+		chat.NewHub(),
 	)
 	router := httpapi.Router(api)
 	server := &http.Server{

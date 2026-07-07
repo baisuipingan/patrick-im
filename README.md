@@ -1,15 +1,17 @@
 # Patrick IM
 
-Patrick IM 是一个轻量级网页即时通讯项目，面向小团队、朋友之间或临时房间聊天场景。前端使用 React + Vite，后端已经重构为 Go + Gin + GORM，使用 SQLite 保存聊天记录和 relay 文件元数据，文件内容落在本地磁盘。
+Patrick IM 是一个轻量级网页即时通讯项目，面向小团队、朋友之间或临时房间聊天场景。前端使用 React + Vite，后端已经重构为 Go + Gin + GORM，使用 SQLite 保存聊天记录，文件内容落在本地磁盘。
 
-旧 Rust/Axum/MySQL 后端已归档到 `backend/_legacy/rust/server`，当前主构建和部署路径只使用 `backend/server` 下的 Go 后端。
+旧 Rust/Axum/MySQL 后端已移除，当前构建和部署路径只使用 `backend/server` 下的 Go 后端。
 
 ## 功能特性
 
 - 房间制聊天：通过房间 ID 加入同一个实时会话。
-- WebSocket 实时通信：在线成员、文本消息、WebRTC 信令都走后端房间 hub。
-- 直连优先、Relay 兜底：前端优先尝试点对点传输，必要时使用服务器本地文件存储中继。
-- 聊天记录持久化：SQLite 保存可见消息、私聊线程、线程清理和中继文件元数据。
+- REST 写入：文字、文件、清空线程都走 HTTP 接口，失败路径明确。
+- WebSocket 实时订阅：负责在线成员、消息广播、清空通知和 WebRTC 信令转发，不承载持久化写入。
+- WebRTC 直连文件：私聊双方在线且 DataChannel 打通时，文件字节流点对点传输；失败时自动退回服务器上传。
+- 聊天记录持久化：SQLite 保存房间消息、私聊线程和文件消息元数据。
+- 本地文件存储：上传文件直接保存到服务器磁盘，并通过权限检查后下载。
 - 单容器部署：后端二进制、前端构建产物、SQLite 数据和文件存储都在一个服务容器内完成。
 - Makefile 运维入口：开发、测试、构建、Docker 打包、部署、日志查看都集中在 `make` 命令里。
 
@@ -28,7 +30,6 @@ frontend/web/shared             前后端共享协议类型
 backend/server                  Go Gin 后端
 backend/server/web-dist         前端生产构建产物
 backend/server/build            发布二进制输出目录
-backend/_legacy/rust/server     旧 Rust 后端归档，仅作业务核对
 ops/docker-compose.yml          一键安装/生产 compose
 ops/docker-compose.server.yml   本机自测/1Panel 网络 compose
 ops/openresty                   OpenResty/Nginx 示例配置
@@ -90,15 +91,16 @@ Vite 会把 `/api` 和 WebSocket 请求代理到 `http://127.0.0.1:5800`。
 | `PATRICK_IM_LOG` | Go slog 日志级别占位，默认 `info` |
 | `PATRICK_IM_PUBLIC_BASE_URL` | 站点公网地址，用于推断 cookie 安全策略 |
 | `PATRICK_IM_SECURE_COOKIES` | 是否给 session cookie 加 `Secure`；生产 HTTPS 建议 `true` |
+| `PATRICK_IM_STUN_URLS` | WebRTC 使用的 STUN 地址，逗号分隔 |
+| `PATRICK_IM_TURN_URLS` | 可选 TURN 地址，逗号分隔；复杂 NAT 下建议配置 |
+| `PATRICK_IM_TURN_USERNAME` | TURN 用户名 |
+| `PATRICK_IM_TURN_CREDENTIAL` | TURN 密码或凭证 |
 | `PATRICK_IM_SQLITE_PATH` | SQLite 数据库路径 |
 | `PATRICK_IM_FILE_STORE_PATH` | 本地文件存储目录 |
 | `PATRICK_IM_WEB_DIST_PATH` | 前端构建产物目录 |
-| `PATRICK_IM_SESSION_SECRET` | session/upload token 签名密钥，生产必须换成足够长的随机字符串 |
+| `PATRICK_IM_SESSION_SECRET` | session 签名密钥，生产必须换成足够长的随机字符串 |
 | `PATRICK_IM_RECENT_MESSAGE_LIMIT` | 进入房间时加载的最近消息数量 |
-| `PATRICK_IM_STUN_URLS` | 前端 WebRTC 使用的 STUN 地址，逗号分隔 |
-| `PATRICK_IM_TURN_URLS` | TURN 地址，逗号分隔 |
-| `PATRICK_IM_TURN_USERNAME` | TURN 用户名 |
-| `PATRICK_IM_TURN_CREDENTIAL` | TURN 密码 |
+| `PATRICK_IM_UPLOAD_LIMIT_BYTES` | 单文件上传大小上限，默认 `268435456` |
 
 ## 常用命令
 
@@ -177,7 +179,7 @@ docker compose pull
 docker compose up -d --remove-orphans
 ```
 
-SQLite 数据库和 relay 文件默认都在 `/opt/patrick-im/data` 下，迁移和备份时保留这个目录即可。
+SQLite 数据库和上传文件默认都在 `/opt/patrick-im/data` 下，迁移和备份时保留这个目录即可。
 
 ### 手动 Compose 更新
 
@@ -218,6 +220,12 @@ location / {
 ```bash
 curl http://127.0.0.1:5800/api/healthz
 ```
+
+## WebRTC 边界
+
+后端不参与 WebRTC 文件字节流，只在 `/api/rooms/:room/ws` 上转发 `signal` 消息，帮助两个浏览器交换 offer、answer 和 ICE candidate。`/api/session` 会返回 ICE server 配置，前端据此建立 `RTCPeerConnection` 和 DataChannel。
+
+直连文件只在私聊双方同时在线且 WebRTC 打通时使用，文件不会写入 SQLite 或服务器磁盘；需要持久化、跨设备历史或直连失败时，前端会自动使用 `/api/rooms/:room/files` 上传到服务器。
 
 ## 同步 GitHub 和 Gitee
 

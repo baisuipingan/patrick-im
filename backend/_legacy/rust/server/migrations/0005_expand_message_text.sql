@@ -1,2 +1,0 @@
-ALTER TABLE message_records
-  MODIFY COLUMN text LONGTEXT COLLATE utf8mb4_unicode_ci DEFAULT NULL;

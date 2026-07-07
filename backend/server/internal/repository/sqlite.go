@@ -35,13 +35,7 @@ func OpenSQLite(path string) (*gorm.DB, error) {
 			return nil, fmt.Errorf("%s: %w", pragma, err)
 		}
 	}
-	if err := db.AutoMigrate(
-		&MessageRecord{},
-		&RelayFileRecord{},
-		&PendingRelayUpload{},
-		&RelayUploadRequestRecord{},
-		&RelayUploadPart{},
-	); err != nil {
+	if err := db.AutoMigrate(&MessageRecord{}); err != nil {
 		return nil, err
 	}
 	return db, nil

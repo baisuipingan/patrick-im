@@ -18,39 +18,43 @@ import (
 )
 
 const (
-	CookieName = "patrick_im_rs_session"
+	CookieName = "patrick_im_session"
 	ttl        = 14 * 24 * time.Hour
 )
 
 type Payload struct {
 	ClientID  string `json:"clientId"`
 	Nickname  string `json:"nickname"`
-	IssuedAt  uint64 `json:"issuedAt"`
-	ExpiresAt uint64 `json:"expiresAt"`
+	IssuedAt  int64  `json:"issuedAt"`
+	ExpiresAt int64  `json:"expiresAt"`
 }
 
 func GetOrCreate(r *http.Request, w http.ResponseWriter, secure bool, secret string) (Payload, error) {
-	now := util.NowMS()
+	now := util.NowMillisInt64()
 	current, err := Read(r, secret)
 	if err != nil {
 		current = nil
 	}
-	var payload Payload
 	if current == nil {
 		id := uuid.NewString()
-		payload = Payload{
+		current = &Payload{
 			ClientID:  id,
 			Nickname:  "访客-" + strings.ReplaceAll(id, "-", "")[:4],
 			IssuedAt:  now,
-			ExpiresAt: now + uint64(ttl.Milliseconds()),
+			ExpiresAt: now + ttl.Milliseconds(),
 		}
-	} else {
-		payload = *current
-		payload.ExpiresAt = now + uint64(ttl.Milliseconds())
 	}
+	current.ExpiresAt = now + ttl.Milliseconds()
+	if err := Write(w, *current, secure, secret); err != nil {
+		return Payload{}, err
+	}
+	return *current, nil
+}
+
+func Write(w http.ResponseWriter, payload Payload, secure bool, secret string) error {
 	token, err := CreateSignedToken(secret, payload)
 	if err != nil {
-		return Payload{}, err
+		return err
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
@@ -61,7 +65,7 @@ func GetOrCreate(r *http.Request, w http.ResponseWriter, secure bool, secret str
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(ttl.Seconds()),
 	})
-	return payload, nil
+	return nil
 }
 
 func Read(r *http.Request, secret string) (*Payload, error) {
@@ -77,7 +81,7 @@ func ReadToken(token, secret string) (*Payload, error) {
 	if err := ReadSignedToken(secret, token, &payload); err != nil {
 		return nil, err
 	}
-	if payload.ExpiresAt < util.NowMS() {
+	if payload.ExpiresAt < util.NowMillisInt64() {
 		return nil, nil
 	}
 	return &payload, nil

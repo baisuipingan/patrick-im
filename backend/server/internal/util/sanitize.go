@@ -1,8 +1,9 @@
 package util
 
 import (
-	"fmt"
+	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 func SanitizeRoomID(input string) string {
@@ -29,11 +30,10 @@ func SanitizeRoomID(input string) string {
 		compact.WriteRune(out)
 		lastDash = false
 	}
-	result := compact.String()
+	result := strings.Trim(compact.String(), "-")
 	if len([]rune(result)) > 64 {
 		result = string([]rune(result)[:64])
 	}
-	result = strings.Trim(result, "-")
 	if result == "" {
 		return "lobby"
 	}
@@ -41,19 +41,28 @@ func SanitizeRoomID(input string) string {
 }
 
 func SanitizeNickname(input, fallback string) string {
-	normalized := strings.Join(strings.Fields(strings.ReplaceAll(strings.ReplaceAll(strings.TrimSpace(input), "<", ""), ">", "")), " ")
-	runes := []rune(normalized)
-	if len(runes) > 24 {
-		normalized = string(runes[:24])
+	normalized := strings.Join(strings.Fields(strings.TrimSpace(input)), " ")
+	var b strings.Builder
+	for _, ch := range normalized {
+		if !unicode.IsControl(ch) {
+			b.WriteRune(ch)
+		}
 	}
-	if normalized == "" {
+	result := b.String()
+	if len([]rune(result)) > 24 {
+		result = string([]rune(result)[:24])
+	}
+	if strings.TrimSpace(result) == "" {
 		return fallback
 	}
-	return normalized
+	return result
 }
 
 func SanitizeFileName(input string) string {
-	trimmed := strings.TrimSpace(input)
+	trimmed := strings.TrimSpace(filepath.Base(input))
+	if trimmed == "" || trimmed == "." {
+		return "file"
+	}
 	var b strings.Builder
 	for _, ch := range trimmed {
 		switch ch {
@@ -69,23 +78,11 @@ func SanitizeFileName(input string) string {
 		normalized = string(runes[:120])
 	}
 	if normalized == "" {
-		return "unnamed-file"
+		return "file"
 	}
 	return normalized
 }
 
-func BuildObjectKey(roomID, fileID, fileName string) string {
-	return fmt.Sprintf("rooms/%s/%s/%s", roomID, fileID, SanitizeFileName(fileName))
-}
-
-func EncodeContentDispositionName(fileName string) string {
-	var encoded strings.Builder
-	for _, b := range []byte(fileName) {
-		if (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9') || b == '-' || b == '_' || b == '.' || b == '~' {
-			encoded.WriteByte(b)
-			continue
-		}
-		encoded.WriteString(fmt.Sprintf("%%%02X", b))
-	}
-	return encoded.String()
+func IsImageContentType(contentType string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "image/")
 }

@@ -1,9 +1,8 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -11,56 +10,55 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 
+	"github.com/baisuipingan/patrick-im/backend/server/internal/chat"
 	"github.com/baisuipingan/patrick-im/backend/server/internal/config"
-	"github.com/baisuipingan/patrick-im/backend/server/internal/messages"
 	"github.com/baisuipingan/patrick-im/backend/server/internal/protocol"
-	"github.com/baisuipingan/patrick-im/backend/server/internal/realtime"
-	"github.com/baisuipingan/patrick-im/backend/server/internal/relay"
-	"github.com/baisuipingan/patrick-im/backend/server/internal/repository"
 	"github.com/baisuipingan/patrick-im/backend/server/internal/session"
 	"github.com/baisuipingan/patrick-im/backend/server/internal/staticweb"
 	"github.com/baisuipingan/patrick-im/backend/server/internal/util"
 )
 
+const (
+	wsProtocolName          = "patrick-im"
+	wsSessionProtocolPrefix = "patrick-im-session."
+)
+
 type API struct {
-	cfg      config.Config
-	logger   *slog.Logger
-	hub      *realtime.Hub
-	messages *messages.Store
-	relay    *relay.Service
-	static   staticweb.Handler
+	cfg    config.Config
+	logger *slog.Logger
+	store  *chat.Store
+	hub    *chat.Hub
+	static staticweb.Handler
 }
 
-func New(cfg config.Config, logger *slog.Logger, hub *realtime.Hub, messageStore *messages.Store, relayService *relay.Service) *API {
+func New(cfg config.Config, logger *slog.Logger, store *chat.Store, hub *chat.Hub) *API {
 	return &API{
-		cfg:      cfg,
-		logger:   logger,
-		hub:      hub,
-		messages: messageStore,
-		relay:    relayService,
-		static:   staticweb.New(cfg.WebDistPath),
+		cfg:    cfg,
+		logger: logger,
+		store:  store,
+		hub:    hub,
+		static: staticweb.New(cfg.WebDistPath),
 	}
 }
 
 func Router(api *API) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	r.MaxMultipartMemory = 8 << 20
+	r.MaxMultipartMemory = 16 << 20
 	_ = r.SetTrustedProxies([]string{"127.0.0.1", "::1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"})
 	r.Use(requestLogger(api.logger), gin.Recovery())
 
 	r.GET("/api/healthz", api.healthz)
 	r.GET("/api/session", api.sessionInfo)
-	r.POST("/api/files/relay-upload", api.relayUpload)
-	r.POST("/api/files/upload-request", api.uploadRequest)
-	r.POST("/api/files/upload-part/:part_number", api.uploadPart)
-	r.POST("/api/files/complete", api.completeUpload)
-	r.POST("/api/files/abort", api.abortUpload)
-	r.POST("/api/files/discard", api.discardUpload)
-	r.GET("/api/files/:room_id/:file_id/access", api.fileAccess)
+	r.PATCH("/api/session", api.renameSession)
+	r.GET("/api/rooms/:room_id/messages", api.listMessages)
+	r.POST("/api/rooms/:room_id/messages", api.createMessage)
+	r.DELETE("/api/rooms/:room_id/messages", api.clearMessages)
+	r.POST("/api/rooms/:room_id/files", api.createFile)
+	r.GET("/api/files/:file_id", api.downloadFile)
 	r.GET("/api/rooms/:room_id/ws", api.roomWS)
-	r.POST("/api/rooms/:room_id/threads/clear", api.clearThread)
 	r.GET("/", api.static.Serve)
 	r.NoRoute(api.static.Serve)
 	return r
@@ -73,313 +71,138 @@ func (api *API) healthz(c *gin.Context) {
 func (api *API) sessionInfo(c *gin.Context) {
 	payload, err := session.GetOrCreate(c.Request, c.Writer, shouldUseSecureCookie(c.Request, api.cfg.SecureCookies), api.cfg.SessionSecret)
 	if err != nil {
-		api.fail(c, http.StatusInternalServerError, "session error")
+		api.internal(c, err)
 		return
 	}
-	sessionToken, err := session.CreateSignedToken(api.cfg.SessionSecret, payload)
-	if err != nil {
-		api.fail(c, http.StatusInternalServerError, "session error")
-		return
-	}
-	response := protocol.SessionResponse{
-		ClientID:                 payload.ClientID,
-		Nickname:                 payload.Nickname,
-		SessionToken:             sessionToken,
-		IceServers:               api.iceServers(),
-		RelayFileLimitBytes:      relay.FileLimitBytes,
-		DirectFileSoftLimitBytes: ^uint64(0),
-		RecommendedTransferMode:  "auto",
-	}
-	c.JSON(http.StatusOK, response)
+	api.writeSession(c, payload)
 }
 
-func (api *API) uploadRequest(c *gin.Context) {
-	sess, ok := api.requireSession(c)
+func (api *API) renameSession(c *gin.Context) {
+	payload, ok := api.requireSession(c)
 	if !ok {
 		return
 	}
-	var payload protocol.RelayUploadRequest
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		api.fail(c, http.StatusBadRequest, "invalid upload request")
+	var request protocol.RenameSessionRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		api.fail(c, http.StatusBadRequest, "invalid nickname")
 		return
 	}
-	if strings.TrimSpace(payload.FileName) == "" || strings.TrimSpace(payload.RoomID) == "" || payload.Size == 0 {
-		api.fail(c, http.StatusBadRequest, "file metadata is incomplete")
-		return
-	}
-	if payload.Size > relay.FileLimitBytes {
-		api.fail(c, http.StatusRequestEntityTooLarge, fmt.Sprintf("file too large for relay mode (%d bytes max)", relay.FileLimitBytes))
-		return
-	}
-	normalized := normalizeUploadRequest(payload)
-	if existing, err := api.messages.FindRelayUploadRequest(c.Request.Context(), sess.ClientID, normalized.ClientRequestID); err != nil {
-		api.internal(c, err)
-		return
-	} else if existing != nil {
-		if err := validateRelayUploadRequestRecord(*existing, sess.ClientID, normalized); err != nil {
-			api.fail(c, http.StatusConflict, err.Error())
-			return
-		}
-		parts, err := api.messages.ListRelayUploadParts(c.Request.Context(), existing.FileID)
-		if err != nil {
-			api.internal(c, err)
-			return
-		}
-		response, err := api.relay.ResumeUpload(relay.ResumeInput{
-			FileID:      existing.FileID,
-			ObjectKey:   existing.ObjectKey,
-			UploadID:    existing.UploadID,
-			RoomID:      existing.RoomID,
-			FileName:    existing.FileName,
-			ContentType: existing.ContentType,
-			Size:        uint64(existing.Size),
-			TargetID:    existing.TargetID,
-			FromID:      existing.FromID,
-		}, parts)
-		if err != nil {
-			api.internal(c, err)
-			return
-		}
-		c.JSON(http.StatusOK, response)
-		return
-	}
-
-	created, err := api.relay.CreateUpload(sess, payload)
-	if err != nil {
+	payload.Nickname = util.SanitizeNickname(request.Nickname, payload.Nickname)
+	if err := session.Write(c.Writer, payload, shouldUseSecureCookie(c.Request, api.cfg.SecureCookies), api.cfg.SessionSecret); err != nil {
 		api.internal(c, err)
 		return
 	}
-	record := repository.RelayUploadRequestRecord{
-		FromID:      sess.ClientID,
-		RequestID:   normalized.ClientRequestID,
-		FileID:      created.TokenPayload.FileID,
-		RoomID:      created.TokenPayload.RoomID,
-		TargetID:    created.TokenPayload.TargetID,
-		FileName:    created.TokenPayload.FileName,
-		Size:        int64(created.TokenPayload.Size),
-		ContentType: created.TokenPayload.ContentType,
-		ObjectKey:   created.TokenPayload.ObjectKey,
-		UploadID:    created.TokenPayload.UploadID,
-		CreatedAt:   int64(created.TokenPayload.IssuedAt),
-	}
-	existing, inserted, err := api.messages.StoreRelayUploadRequest(c.Request.Context(), record)
-	if err != nil {
-		api.internal(c, err)
-		return
-	}
-	if inserted {
-		c.JSON(http.StatusOK, created.Response)
-		return
-	}
-	_, _ = api.relay.AbortUpload(sess, protocol.RelayAbortUploadRequest{UploadToken: created.Response.UploadToken})
-	if err := validateRelayUploadRequestRecord(*existing, sess.ClientID, normalized); err != nil {
-		api.fail(c, http.StatusConflict, err.Error())
-		return
-	}
-	parts, err := api.messages.ListRelayUploadParts(c.Request.Context(), existing.FileID)
-	if err != nil {
-		api.internal(c, err)
-		return
-	}
-	response, err := api.relay.ResumeUpload(relay.ResumeInput{
-		FileID:      existing.FileID,
-		ObjectKey:   existing.ObjectKey,
-		UploadID:    existing.UploadID,
-		RoomID:      existing.RoomID,
-		FileName:    existing.FileName,
-		ContentType: existing.ContentType,
-		Size:        uint64(existing.Size),
-		TargetID:    existing.TargetID,
-		FromID:      existing.FromID,
-	}, parts)
-	if err != nil {
-		api.internal(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, response)
+	api.writeSession(c, payload)
 }
 
-func (api *API) relayUpload(c *gin.Context) {
-	sess, ok := api.requireSession(c)
+func (api *API) writeSession(c *gin.Context, payload session.Payload) {
+	token, err := session.CreateSignedToken(api.cfg.SessionSecret, payload)
+	if err != nil {
+		api.internal(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, protocol.SessionResponse{
+		ClientID:        payload.ClientID,
+		Nickname:        payload.Nickname,
+		SessionToken:    token,
+		IceServers:      api.iceServers(),
+		MaxUploadBytes:  api.cfg.UploadLimitBytes,
+		HistoryPageSize: api.cfg.RecentMessageLimit,
+	})
+}
+
+func (api *API) iceServers() []protocol.IceServer {
+	servers := make([]protocol.IceServer, 0, 2)
+	if len(api.cfg.STUNURLs) > 0 {
+		servers = append(servers, protocol.IceServer{URLs: api.cfg.STUNURLs})
+	}
+	if len(api.cfg.TURNURLs) > 0 {
+		servers = append(servers, protocol.IceServer{
+			URLs:       api.cfg.TURNURLs,
+			Username:   api.cfg.TURNUsername,
+			Credential: api.cfg.TURNCredential,
+		})
+	}
+	return servers
+}
+
+func (api *API) listMessages(c *gin.Context) {
+	payload, ok := api.requireSession(c)
 	if !ok {
 		return
 	}
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, int64(relay.FileLimitBytes+relay.ChunkSizeBytes))
-	roomID := c.PostForm("roomId")
+	roomID := util.SanitizeRoomID(c.Param("room_id"))
+	limit := parseBoundedInt(c.Query("limit"), api.cfg.RecentMessageLimit, 1, 200)
+	before := parseInt64(c.Query("before"))
+	messages, err := api.store.ListMessages(c.Request.Context(), roomID, payload.ClientID, limit, before)
+	if err != nil {
+		api.internal(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"messages": messages})
+}
+
+func (api *API) createMessage(c *gin.Context) {
+	payload, ok := api.requireSession(c)
+	if !ok {
+		return
+	}
+	roomID := util.SanitizeRoomID(c.Param("room_id"))
+	var request protocol.SendMessageRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		api.fail(c, http.StatusBadRequest, "invalid message")
+		return
+	}
+	message, err := api.store.CreateTextMessage(c.Request.Context(), roomID, payload, request.Text, request.TargetID)
+	if errors.Is(err, chat.ErrValidation) {
+		api.fail(c, http.StatusBadRequest, "message text is empty or too large")
+		return
+	}
+	if err != nil {
+		api.internal(c, err)
+		return
+	}
+	api.publishMessage(roomID, message)
+	c.JSON(http.StatusOK, message)
+}
+
+func (api *API) createFile(c *gin.Context) {
+	payload, ok := api.requireSession(c)
+	if !ok {
+		return
+	}
+	roomID := util.SanitizeRoomID(c.Param("room_id"))
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, api.cfg.UploadLimitBytes+1024*1024)
 	targetID := optionalString(c.PostForm("targetId"))
-	size, err := strconv.ParseUint(strings.TrimSpace(c.PostForm("size")), 10, 64)
-	if err != nil || roomID == "" || size == 0 {
-		api.fail(c, http.StatusBadRequest, "file metadata is incomplete")
-		return
-	}
-	if size > relay.FileLimitBytes {
-		api.fail(c, http.StatusRequestEntityTooLarge, fmt.Sprintf("file too large for relay mode (%d bytes max)", relay.FileLimitBytes))
-		return
-	}
 	header, err := c.FormFile("file")
 	if err != nil {
 		api.fail(c, http.StatusBadRequest, "missing file")
 		return
 	}
-	contentType := header.Header.Get("content-type")
-	if contentType == "" {
-		contentType = "application/octet-stream"
+	message, err := api.store.CreateFileMessage(c.Request.Context(), roomID, payload, header, targetID)
+	if errors.Is(err, chat.ErrValidation) {
+		api.fail(c, http.StatusRequestEntityTooLarge, "file is empty or too large")
+		return
 	}
-	completed, err := api.relay.StoreMultipartFile(c.Request.Context(), sess, roomID, header.Filename, contentType, size, targetID, header)
 	if err != nil {
 		api.internal(c, err)
 		return
 	}
-	if _, err := api.persistCompletedRelayUpload(c, completed); err != nil {
-		return
-	}
-	c.JSON(http.StatusOK, protocol.RelayUploadStoredResponse{FileID: completed.FileID, ObjectKey: completed.ObjectKey})
+	api.publishMessage(roomID, message)
+	c.JSON(http.StatusOK, message)
 }
 
-func (api *API) uploadPart(c *gin.Context) {
-	sess, ok := api.requireSession(c)
+func (api *API) downloadFile(c *gin.Context) {
+	payload, ok := api.requireSession(c)
 	if !ok {
 		return
 	}
-	partNumber, err := strconv.Atoi(c.Param("part_number"))
-	if err != nil {
-		api.fail(c, http.StatusBadRequest, "invalid relay upload part number")
-		return
-	}
-	uploadToken := strings.TrimSpace(c.GetHeader("x-patrick-im-upload-token"))
-	if uploadToken == "" {
-		api.fail(c, http.StatusBadRequest, "missing upload token")
-		return
-	}
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, int64(relay.ChunkSizeBytes)+1)
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		api.fail(c, http.StatusBadRequest, "invalid upload body")
-		return
-	}
-	part, payload, err := api.relay.UploadPart(c.Request.Context(), sess, uploadToken, partNumber, body)
-	if err != nil {
-		api.fail(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	if err := api.messages.StoreRelayUploadPart(c.Request.Context(), payload.FileID, protocol.RelayUploadedPart{
-		PartNumber: part.PartNumber,
-		Etag:       part.Etag,
-	}); err != nil {
-		api.internal(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, part)
-}
-
-func (api *API) completeUpload(c *gin.Context) {
-	sess, ok := api.requireSession(c)
-	if !ok {
-		return
-	}
-	var payload protocol.RelayCompleteUploadRequest
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		api.fail(c, http.StatusBadRequest, "invalid complete upload request")
-		return
-	}
-	tokenPayload, err := api.relay.DescribeUploadToken(sess, payload.UploadToken)
-	if err != nil {
-		api.fail(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	if existing, err := api.messages.FindPendingRelayUpload(c.Request.Context(), tokenPayload.FileID); err != nil {
-		api.internal(c, err)
-		return
-	} else if existing != nil {
-		if err := validatePendingUploadMatchesToken(*existing, tokenPayload); err != nil {
-			api.fail(c, http.StatusConflict, err.Error())
-			return
-		}
-		c.JSON(http.StatusOK, protocol.RelayCompleteUploadResponse{FileID: existing.FileID, ObjectKey: existing.ObjectKey})
-		return
-	}
-	completed, err := api.relay.CompleteUpload(c.Request.Context(), sess, payload)
-	if err != nil {
-		if existing, findErr := api.messages.FindPendingRelayUpload(c.Request.Context(), tokenPayload.FileID); findErr == nil && existing != nil {
-			if validatePendingUploadMatchesToken(*existing, tokenPayload) == nil {
-				c.JSON(http.StatusOK, protocol.RelayCompleteUploadResponse{FileID: existing.FileID, ObjectKey: existing.ObjectKey})
-				return
-			}
-		}
-		api.fail(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	if existing, err := api.persistCompletedRelayUpload(c, completed); err != nil {
-		return
-	} else if existing != nil {
-		c.JSON(http.StatusOK, *existing)
-		return
-	}
-	c.JSON(http.StatusOK, protocol.RelayCompleteUploadResponse{FileID: completed.FileID, ObjectKey: completed.ObjectKey})
-}
-
-func (api *API) abortUpload(c *gin.Context) {
-	sess, ok := api.requireSession(c)
-	if !ok {
-		return
-	}
-	var payload protocol.RelayAbortUploadRequest
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		api.fail(c, http.StatusBadRequest, "invalid abort upload request")
-		return
-	}
-	tokenPayload, err := api.relay.AbortUpload(sess, payload)
-	if err != nil {
-		api.fail(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	_, _ = api.messages.RemoveRelayUploadRequestByFileID(c.Request.Context(), tokenPayload.FileID)
-	c.JSON(http.StatusOK, gin.H{"aborted": true})
-}
-
-func (api *API) discardUpload(c *gin.Context) {
-	sess, ok := api.requireSession(c)
-	if !ok {
-		return
-	}
-	var payload protocol.RelayDiscardUploadRequest
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		api.fail(c, http.StatusBadRequest, "invalid discard upload request")
-		return
-	}
-	tokenPayload, err := api.relay.VerifyUploadToken(sess, payload.UploadToken)
-	if err != nil {
-		api.fail(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	if _, err := api.messages.RemovePendingRelayUpload(c.Request.Context(), tokenPayload.FileID); err != nil {
-		api.internal(c, err)
-		return
-	}
-	if _, err := api.messages.RemoveRelayUploadRequestByFileID(c.Request.Context(), tokenPayload.FileID); err != nil {
-		api.internal(c, err)
-		return
-	}
-	if err := api.relay.DeleteObjectByKey(tokenPayload.ObjectKey); err != nil {
-		api.internal(c, err)
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"discarded": true})
-}
-
-func (api *API) fileAccess(c *gin.Context) {
-	sess, ok := api.requireSession(c)
-	if !ok {
-		return
-	}
-	roomID := util.SanitizeRoomID(c.Param("room_id"))
-	fileID := c.Param("file_id")
-	descriptor, err := api.messages.LookupFileForClient(c.Request.Context(), roomID, fileID, sess.ClientID)
-	if errors.Is(err, messages.ErrFileNotFound) {
+	file, err := api.store.FileForClient(c.Request.Context(), c.Param("file_id"), payload.ClientID)
+	if errors.Is(err, chat.ErrNotFound) {
 		api.fail(c, http.StatusNotFound, "file not found")
 		return
 	}
-	if errors.Is(err, messages.ErrFileForbidden) {
+	if errors.Is(err, chat.ErrForbidden) {
 		api.fail(c, http.StatusForbidden, "file not accessible")
 		return
 	}
@@ -387,88 +210,149 @@ func (api *API) fileAccess(c *gin.Context) {
 		api.internal(c, err)
 		return
 	}
-	object, err := api.relay.GetObject(descriptor.ObjectKey)
-	if err != nil {
-		api.internal(c, err)
-		return
-	}
 	disposition := "attachment"
-	if descriptor.Previewable {
+	if file.Previewable {
 		disposition = "inline"
 	}
-	c.Header("Content-Disposition", fmt.Sprintf("%s; filename*=UTF-8''%s", disposition, util.EncodeContentDispositionName(descriptor.FileName)))
-	c.Header("Content-Type", descriptor.ContentType)
-	c.Header("Content-Length", strconv.FormatUint(object.Size, 10))
-	c.File(object.Path)
+	c.Header("Content-Disposition", disposition+`; filename="`+strings.ReplaceAll(file.FileName, `"`, "")+`"`)
+	c.Header("Content-Type", file.ContentType)
+	c.Header("Content-Length", strconv.FormatInt(file.Size, 10))
+	c.File(file.Path)
 }
 
-func (api *API) clearThread(c *gin.Context) {
-	sess, ok := api.requireSession(c)
+func (api *API) clearMessages(c *gin.Context) {
+	payload, ok := api.requireSession(c)
 	if !ok {
 		return
 	}
 	roomID := util.SanitizeRoomID(c.Param("room_id"))
-	var payload protocol.ClearThreadRequest
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		api.fail(c, http.StatusBadRequest, "invalid clear thread request")
-		return
-	}
-	if !api.hub.IsClientConnected(roomID, sess.ClientID) {
-		api.fail(c, http.StatusForbidden, "client is not connected to this room")
-		return
-	}
-	actorName, ok := api.hub.DisplayNameFor(roomID, sess.ClientID)
-	if !ok {
-		actorName = sess.Nickname
-	}
-	outcome, err := api.messages.ClearThread(c.Request.Context(), roomID, sess.ClientID, actorName, payload.TargetID)
+	targetID := optionalString(c.Query("targetId"))
+	response, files, err := api.store.ClearThread(c.Request.Context(), roomID, payload, targetID)
 	if err != nil {
 		api.internal(c, err)
 		return
 	}
-	if err := api.relay.DeleteOrphanedFiles(outcome.OrphanedFiles); err != nil {
-		api.logger.Warn("delete orphaned relay files failed", "error", err)
-	}
-	if outcome.Event != nil {
-		recipients := recipientsFor(outcome.Event.TargetID, sess.ClientID)
-		api.hub.Broadcast(roomID, nil, recipients, protocol.ServerToClientMessage{
-			Type:              "thread-cleared",
-			TargetID:          outcome.Event.TargetID,
-			ActorID:           outcome.Event.ActorID,
-			ActorName:         outcome.Event.ActorName,
-			RemovedMessages:   outcome.Event.RemovedMessages,
-			RemovedRelayFiles: outcome.Event.RemovedRelayFiles,
-		})
-	}
-	c.JSON(http.StatusOK, outcome.Response)
+	api.store.DeleteFiles(files)
+	api.hub.Publish(roomID, chat.ClearRecipients(payload.ClientID, response.TargetID), protocol.ServerToClientMessage{
+		Type:     "messages-cleared",
+		RoomID:   roomID,
+		ActorID:  payload.ClientID,
+		TargetID: response.TargetID,
+		Removed:  response.Removed,
+	})
+	c.JSON(http.StatusOK, response)
 }
 
-func (api *API) persistCompletedRelayUpload(c *gin.Context, completed relay.CompletedUpload) (*protocol.RelayCompleteUploadResponse, error) {
-	existing, inserted, err := api.messages.StoreCompletedRelayUpload(c.Request.Context(), repository.PendingRelayUpload{
-		FileID:      completed.FileID,
-		RoomID:      completed.RoomID,
-		FromID:      completed.FromID,
-		TargetID:    completed.TargetID,
-		FileName:    completed.FileName,
-		Size:        int64(completed.Size),
-		ContentType: completed.ContentType,
-		ObjectKey:   completed.ObjectKey,
-		CreatedAt:   int64(completed.CreatedAt),
+func (api *API) publishMessage(roomID string, message protocol.Message) {
+	api.hub.Publish(roomID, chat.RecipientsFor(message), protocol.ServerToClientMessage{
+		Type:    "message",
+		RoomID:  roomID,
+		Message: &message,
 	})
+}
+
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  2048,
+	WriteBufferSize: 2048,
+	CheckOrigin: func(_ *http.Request) bool {
+		return true
+	},
+}
+
+func (api *API) roomWS(c *gin.Context) {
+	payload, err := api.requireWebSocketSession(c.Request)
 	if err != nil {
-		_ = api.relay.DeleteObjectByKey(completed.ObjectKey)
-		_, _ = api.messages.RemoveRelayUploadRequestByFileID(c.Request.Context(), completed.FileID)
-		api.internal(c, err)
-		return nil, err
+		api.fail(c, http.StatusUnauthorized, "missing session")
+		return
 	}
-	if !inserted {
-		if err := validatePendingUploadMatchesCompleted(*existing, completed); err != nil {
-			api.fail(c, http.StatusConflict, err.Error())
-			return nil, err
+	roomID := util.SanitizeRoomID(c.Param("room_id"))
+	responseHeader := http.Header{}
+	if websocketSubprotocolRequested(c.Request, wsProtocolName) {
+		responseHeader.Set("Sec-WebSocket-Protocol", wsProtocolName)
+	}
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, responseHeader)
+	if err != nil {
+		api.logger.Warn("websocket upgrade failed", "error", err)
+		return
+	}
+	events, leave := api.hub.Join(roomID, protocol.Peer{
+		ClientID: payload.ClientID,
+		Nickname: payload.Nickname,
+		JoinedAt: util.NowMillisInt64(),
+	})
+	defer leave()
+	defer conn.Close()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			messageType, data, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			if messageType == websocket.TextMessage {
+				api.handleClientWebSocketMessage(roomID, payload, data)
+			}
 		}
-		return &protocol.RelayCompleteUploadResponse{FileID: existing.FileID, ObjectKey: existing.ObjectKey}, nil
+	}()
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return
+			}
+			if err := conn.WriteJSON(event); err != nil {
+				return
+			}
+		case <-ticker.C:
+			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		case <-done:
+			return
+		}
 	}
-	return nil, nil
+}
+
+func (api *API) handleClientWebSocketMessage(roomID string, sender session.Payload, data []byte) {
+	var message protocol.ClientToServerMessage
+	if err := json.Unmarshal(data, &message); err != nil {
+		return
+	}
+	if message.Type != "signal" || strings.TrimSpace(message.TargetID) == "" || message.Payload == nil {
+		return
+	}
+	if message.TargetID == sender.ClientID {
+		return
+	}
+	api.hub.Publish(roomID, []string{message.TargetID}, protocol.ServerToClientMessage{
+		Type:    "signal",
+		RoomID:  roomID,
+		FromID:  sender.ClientID,
+		Payload: message.Payload,
+	})
+}
+
+func (api *API) requireWebSocketSession(r *http.Request) (session.Payload, error) {
+	if payload, err := session.Require(r, api.cfg.SessionSecret); err == nil {
+		return payload, nil
+	}
+	token := websocketSessionToken(r)
+	if token == "" {
+		return session.Payload{}, http.ErrNoCookie
+	}
+	payload, err := session.ReadToken(token, api.cfg.SessionSecret)
+	if err != nil || payload == nil {
+		if err != nil {
+			return session.Payload{}, err
+		}
+		return session.Payload{}, http.ErrNoCookie
+	}
+	return *payload, nil
 }
 
 func (api *API) requireSession(c *gin.Context) (session.Payload, bool) {
@@ -487,17 +371,6 @@ func (api *API) internal(c *gin.Context, err error) {
 
 func (api *API) fail(c *gin.Context, status int, message string) {
 	c.JSON(status, gin.H{"error": message})
-}
-
-func (api *API) iceServers() []protocol.IceServer {
-	servers := make([]protocol.IceServer, 0, 2)
-	if len(api.cfg.STUNURLs) > 0 {
-		servers = append(servers, protocol.IceServer{URLs: api.cfg.STUNURLs})
-	}
-	if len(api.cfg.TURNURLs) > 0 {
-		servers = append(servers, protocol.IceServer{URLs: api.cfg.TURNURLs, Username: api.cfg.TURNUsername, Credential: api.cfg.TURNCredential})
-	}
-	return servers
 }
 
 func requestLogger(logger *slog.Logger) gin.HandlerFunc {
@@ -520,83 +393,36 @@ func shouldUseSecureCookie(r *http.Request, configured bool) bool {
 	return false
 }
 
-type normalizedRelayUploadRequest struct {
-	ClientRequestID string
-	RoomID          string
-	FileName        string
-	ContentType     string
-	Size            uint64
-	TargetID        *string
+func websocketSessionToken(r *http.Request) string {
+	for _, item := range websocketSubprotocols(r) {
+		if strings.HasPrefix(item, wsSessionProtocolPrefix) {
+			return strings.TrimPrefix(item, wsSessionProtocolPrefix)
+		}
+	}
+	return ""
 }
 
-func normalizeUploadRequest(request protocol.RelayUploadRequest) normalizedRelayUploadRequest {
-	clientRequestID := ""
-	if request.ClientRequestID != nil {
-		clientRequestID = strings.TrimSpace(*request.ClientRequestID)
+func websocketSubprotocolRequested(r *http.Request, protocol string) bool {
+	for _, item := range websocketSubprotocols(r) {
+		if item == protocol {
+			return true
+		}
 	}
-	if clientRequestID == "" {
-		clientRequestID = util.SanitizeFileName(request.FileName) + "-" + strconv.FormatUint(util.NowMS(), 10)
-	}
-	contentType := strings.TrimSpace(request.ContentType)
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
-	return normalizedRelayUploadRequest{
-		ClientRequestID: clientRequestID,
-		RoomID:          util.SanitizeRoomID(request.RoomID),
-		FileName:        util.SanitizeFileName(request.FileName),
-		ContentType:     contentType,
-		Size:            request.Size,
-		TargetID:        request.TargetID,
-	}
+	return false
 }
 
-func validateRelayUploadRequestRecord(record repository.RelayUploadRequestRecord, fromID string, normalized normalizedRelayUploadRequest) error {
-	if record.FromID != fromID ||
-		record.RequestID != normalized.ClientRequestID ||
-		record.RoomID != normalized.RoomID ||
-		record.FileName != normalized.FileName ||
-		uint64(record.Size) != normalized.Size ||
-		record.ContentType != normalized.ContentType ||
-		!sameStringPtr(record.TargetID, normalized.TargetID) {
-		return fmt.Errorf("relay upload request id conflicts with different file metadata")
+func websocketSubprotocols(r *http.Request) []string {
+	raw := r.Header.Values("Sec-WebSocket-Protocol")
+	out := make([]string, 0)
+	for _, header := range raw {
+		for _, item := range strings.Split(header, ",") {
+			item = strings.TrimSpace(item)
+			if item != "" {
+				out = append(out, item)
+			}
+		}
 	}
-	return nil
-}
-
-func validatePendingUploadMatchesToken(record repository.PendingRelayUpload, token relay.UploadTokenPayload) error {
-	if record.FileID != token.FileID ||
-		record.RoomID != token.RoomID ||
-		record.FromID != token.FromID ||
-		!sameStringPtr(record.TargetID, token.TargetID) ||
-		record.FileName != token.FileName ||
-		uint64(record.Size) != token.Size ||
-		record.ContentType != token.ContentType ||
-		record.ObjectKey != token.ObjectKey {
-		return fmt.Errorf("completed relay upload conflicts with stored pending upload")
-	}
-	return nil
-}
-
-func validatePendingUploadMatchesCompleted(record repository.PendingRelayUpload, completed relay.CompletedUpload) error {
-	if record.FileID != completed.FileID ||
-		record.RoomID != completed.RoomID ||
-		record.FromID != completed.FromID ||
-		!sameStringPtr(record.TargetID, completed.TargetID) ||
-		record.FileName != completed.FileName ||
-		uint64(record.Size) != completed.Size ||
-		record.ContentType != completed.ContentType ||
-		record.ObjectKey != completed.ObjectKey {
-		return fmt.Errorf("completed relay upload conflicts with stored pending upload")
-	}
-	return nil
-}
-
-func sameStringPtr(left, right *string) bool {
-	if left == nil || *left == "" {
-		return right == nil || *right == ""
-	}
-	return right != nil && *left == *right
+	return out
 }
 
 func optionalString(value string) *string {
@@ -607,9 +433,21 @@ func optionalString(value string) *string {
 	return &value
 }
 
-func recipientsFor(targetID *string, actorID string) []string {
-	if targetID == nil {
-		return nil
+func parseBoundedInt(value string, fallback, min, max int) int {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return fallback
 	}
-	return []string{actorID, *targetID}
+	if parsed < min {
+		return min
+	}
+	if parsed > max {
+		return max
+	}
+	return parsed
+}
+
+func parseInt64(value string) int64 {
+	parsed, _ := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	return parsed
 }

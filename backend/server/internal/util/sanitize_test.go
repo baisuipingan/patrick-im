@@ -16,7 +16,7 @@ func TestSanitizeRoomID(t *testing.T) {
 }
 
 func TestSanitizeFileName(t *testing.T) {
-	if got := SanitizeFileName(` ../bad:name?.png `); got != "..-bad-name-.png" {
+	if got := SanitizeFileName(` ../bad:name?.png `); got != "bad-name-.png" {
 		t.Fatalf("filename = %q", got)
 	}
 }
