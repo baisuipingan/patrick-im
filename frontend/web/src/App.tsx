@@ -61,7 +61,14 @@ import {
   type StoredDirectoryState,
 } from './lib/file-system';
 import { buildWsUrl, cn, formatBytes, formatClock } from './lib/utils';
-import { DirectMesh, type DirectFileProgress, type DirectState, type IncomingDirectFile, type IncomingDirectFileSink } from './webrtc';
+import {
+  DirectMesh,
+  type DirectFileProgress,
+  type DirectPeerSnapshot,
+  type DirectState,
+  type IncomingDirectFile,
+  type IncomingDirectFileSink,
+} from './webrtc';
 
 type ConnectionState = 'idle' | 'connecting' | 'online' | 'offline' | 'error';
 type NoticeTone = 'info' | 'success' | 'error';
@@ -210,6 +217,7 @@ export default function App() {
   const [transfers, setTransfers] = useState<Record<string, TransferRow>>({});
   const [peers, setPeers] = useState<Peer[]>([]);
   const [directStates, setDirectStates] = useState<Record<string, DirectState>>({});
+  const [directSnapshots, setDirectSnapshots] = useState<Record<string, DirectPeerSnapshot>>({});
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
   const [notice, setNotice] = useState<Notice>({ tone: 'info', text: '准备就绪' });
   const [nicknameDraft, setNicknameDraft] = useState(() => readLocalStorage(NICKNAME_KEY));
@@ -395,6 +403,9 @@ export default function App() {
       onStateChange: (peerId, state) => {
         setDirectStates((current) => ({ ...current, [peerId]: state }));
       },
+      onPeerSnapshot: (peerId, snapshot) => {
+        setDirectSnapshots((current) => ({ ...current, [peerId]: snapshot }));
+      },
       onIncomingFileStart: updateIncomingDirectProgress,
       onIncomingFileProgress: updateIncomingDirectProgress,
       onIncomingFileError: markIncomingDirectFileFailed,
@@ -404,6 +415,8 @@ export default function App() {
       },
     });
     directMeshRef.current?.close();
+    setDirectStates({});
+    setDirectSnapshots({});
     directMeshRef.current = mesh;
     mesh.setPeers(peers);
     return () => {
@@ -1670,6 +1683,7 @@ export default function App() {
           room={roomDetail}
           selfId={session?.clientId ?? ''}
           directStates={directStates}
+          directSnapshots={directSnapshots}
           onOpenDirect={(peerId) => void openDirectConversation(peerId)}
         />
         <TransferPanel
@@ -2057,11 +2071,13 @@ function RoomDetails({
   room,
   selfId,
   directStates,
+  directSnapshots,
   onOpenDirect,
 }: {
   room: RoomDetail | null;
   selfId: string;
   directStates: Record<string, DirectState>;
+  directSnapshots: Record<string, DirectPeerSnapshot>;
   onOpenDirect: (peerId: string) => void;
 }) {
   const members = room?.members ?? [];
@@ -2079,6 +2095,7 @@ function RoomDetails({
             member={member}
             selfId={selfId}
             directState={directStates[member.userId]}
+            directSnapshot={directSnapshots[member.userId]}
             onOpenDirect={onOpenDirect}
           />
         ))}
@@ -2091,11 +2108,13 @@ function MemberRow({
   member,
   selfId,
   directState,
+  directSnapshot,
   onOpenDirect,
 }: {
   member: RoomMemberView;
   selfId: string;
   directState?: DirectState;
+  directSnapshot?: DirectPeerSnapshot;
   onOpenDirect: (peerId: string) => void;
 }) {
   const isSelf = member.userId === selfId;
@@ -2107,6 +2126,7 @@ function MemberRow({
         <small>
           {member.online ? '在线' : `最后活跃 ${formatClock(member.lastSeenAt)}`}
           {directState ? ` · ${directStateLabel(directState)}` : ''}
+          {directSnapshot ? ` · ${directSnapshotLabel(directSnapshot)}` : ''}
         </small>
       </span>
       {!isSelf ? (
@@ -2379,6 +2399,17 @@ function directStateLabel(state: DirectState): string {
     default:
       return '未直连';
   }
+}
+
+function directSnapshotLabel(snapshot: DirectPeerSnapshot): string {
+  if (snapshot.state === 'direct') {
+    return snapshot.channelState === 'open' ? 'DC open' : `DC ${snapshot.channelState ?? 'pending'}`;
+  }
+  const parts = [`ICE ${snapshot.iceConnectionState}`, `PC ${snapshot.connectionState}`];
+  if (snapshot.reconnectAttempts > 0) {
+    parts.push(`重试 ${snapshot.reconnectAttempts}`);
+  }
+  return parts.slice(0, 3).join(' / ');
 }
 
 function connectionLabel(state: ConnectionState): string {

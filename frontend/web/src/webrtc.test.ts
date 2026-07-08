@@ -145,7 +145,8 @@ describe('DirectMesh WebRTC negotiation', () => {
 
   it('uses configured ICE servers and sends an offer from the deterministic initiator', async () => {
     const sendSignal = vi.fn<(targetId: string, payload: SignalEnvelope) => void>();
-    const mesh = createMesh({ sendSignal });
+    const onPeerSnapshot = vi.fn();
+    const mesh = createMesh({ sendSignal, onPeerSnapshot });
 
     mesh.setPeers([createPeer()]);
     const pc = peerConnectionInstances[0];
@@ -153,6 +154,11 @@ describe('DirectMesh WebRTC negotiation', () => {
 
     expect(pc.configuration?.iceServers).toEqual([{ urls: ['stun:example.com:3478'] }]);
     expect(sendSignal).toHaveBeenCalledWith('a-remote', { description: { type: 'offer', sdp: 'offer' } });
+    expect(onPeerSnapshot).toHaveBeenCalledWith('a-remote', expect.objectContaining({
+      state: 'connecting',
+      iceConnectionState: 'new',
+      signalingState: 'stable',
+    }));
   });
 
   it('queues remote ICE candidates until the offer arrives, then answers and flushes candidates', async () => {

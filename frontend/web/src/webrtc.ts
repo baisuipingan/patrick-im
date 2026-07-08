@@ -2,6 +2,17 @@ import type { IceServer, Peer, SignalEnvelope } from '@shared/protocol';
 
 export type DirectState = 'connecting' | 'direct' | 'offline';
 
+export interface DirectPeerSnapshot {
+  state: DirectState;
+  connectionState: RTCPeerConnectionState;
+  iceConnectionState: RTCIceConnectionState;
+  signalingState: RTCSignalingState;
+  channelState?: RTCDataChannelState;
+  reconnectAttempts: number;
+  updatedAt: number;
+  note?: string;
+}
+
 export interface IncomingDirectFile {
   id: string;
   roomId: string;
@@ -52,6 +63,7 @@ interface DirectMeshOptions {
   iceServers: IceServer[];
   sendSignal: (targetId: string, payload: SignalEnvelope) => void;
   onStateChange: (peerId: string, state: DirectState) => void;
+  onPeerSnapshot?: (peerId: string, snapshot: DirectPeerSnapshot) => void;
   onIncomingFileStart?: (progress: DirectFileProgress) => void;
   onIncomingFileProgress?: (progress: DirectFileProgress) => void;
   onIncomingFileError?: (progress: DirectFileProgress) => void;
@@ -223,7 +235,7 @@ export class DirectMesh {
         }
       }
     } catch {
-      this.options.onStateChange(fromId, 'offline');
+      this.emitPeerState(peer, 'offline', 'signal_error');
       this.scheduleReconnect(peer);
     } finally {
       peer.isSettingRemoteAnswerPending = false;
@@ -311,7 +323,7 @@ export class DirectMesh {
       reconnectAttempts: 0,
     };
     this.peers.set(peer.clientId, directPeer);
-    this.options.onStateChange(peer.clientId, 'connecting');
+    this.emitPeerState(directPeer, 'connecting', 'peer_created');
 
     pc.onnegotiationneeded = () => {
       void this.negotiate(directPeer);
@@ -325,22 +337,24 @@ export class DirectMesh {
       const state = pc.connectionState;
       if (state === 'connected') {
         directPeer.reconnectAttempts = 0;
-        this.options.onStateChange(peer.clientId, 'direct');
+        this.emitPeerState(directPeer, directPeer.channel?.readyState === 'open' ? 'direct' : 'connecting', 'pc_connected');
       } else if (state === 'failed') {
-        this.options.onStateChange(peer.clientId, 'offline');
+        this.emitPeerState(directPeer, 'offline', 'pc_failed');
         this.scheduleReconnect(directPeer);
       } else if (state === 'closed') {
-        this.options.onStateChange(peer.clientId, 'offline');
+        this.emitPeerState(directPeer, 'offline', 'pc_closed');
       } else if (state === 'disconnected') {
-        this.options.onStateChange(peer.clientId, 'connecting');
+        this.emitPeerState(directPeer, 'connecting', 'pc_disconnected');
       } else {
-        this.options.onStateChange(peer.clientId, 'connecting');
+        this.emitPeerState(directPeer, 'connecting', `pc_${state}`);
       }
     };
     pc.oniceconnectionstatechange = () => {
       if (pc.iceConnectionState === 'failed') {
-        this.options.onStateChange(peer.clientId, 'offline');
+        this.emitPeerState(directPeer, 'offline', 'ice_failed');
         this.scheduleReconnect(directPeer);
+      } else {
+        this.emitPeerState(directPeer, directPeer.channel?.readyState === 'open' ? 'direct' : 'connecting', `ice_${pc.iceConnectionState}`);
       }
     };
     pc.ondatachannel = (event) => {
@@ -355,6 +369,20 @@ export class DirectMesh {
       this.attachChannel(directPeer, pc.createDataChannel('patrick-im-file'));
     }
     return directPeer;
+  }
+
+  private emitPeerState(peer: DirectPeer, state: DirectState, note?: string): void {
+    this.options.onStateChange(peer.id, state);
+    this.options.onPeerSnapshot?.(peer.id, {
+      state,
+      connectionState: peer.pc.connectionState,
+      iceConnectionState: peer.pc.iceConnectionState,
+      signalingState: peer.pc.signalingState,
+      channelState: peer.channel?.readyState,
+      reconnectAttempts: peer.reconnectAttempts,
+      updatedAt: Date.now(),
+      note,
+    });
   }
 
   private isPolitePeer(peerId: string): boolean {
@@ -378,9 +406,12 @@ export class DirectMesh {
     peer.channel = channel;
     channel.binaryType = 'arraybuffer';
     channel.bufferedAmountLowThreshold = LOW_WATER_MARK;
-    channel.onopen = () => this.options.onStateChange(peer.id, 'direct');
-    channel.onclose = () => this.options.onStateChange(peer.id, 'offline');
-    channel.onerror = () => this.scheduleReconnect(peer);
+    channel.onopen = () => this.emitPeerState(peer, 'direct', 'control_open');
+    channel.onclose = () => this.emitPeerState(peer, 'offline', 'control_closed');
+    channel.onerror = () => {
+      this.emitPeerState(peer, 'offline', 'control_error');
+      this.scheduleReconnect(peer);
+    };
     channel.onmessage = (event) => {
       void this.handleControlMessage(peer, event.data);
     };
@@ -397,7 +428,7 @@ export class DirectMesh {
         this.options.sendSignal(peer.id, { description: peer.pc.localDescription });
       }
     } catch {
-      this.options.onStateChange(peer.id, 'offline');
+      this.emitPeerState(peer, 'offline', 'negotiate_error');
       this.scheduleReconnect(peer);
     } finally {
       peer.makingOffer = false;
@@ -710,7 +741,7 @@ export class DirectMesh {
     peer.channel?.close();
     peer.pc.close();
     this.peers.delete(peerId);
-    this.options.onStateChange(peerId, 'offline');
+    this.emitPeerState(peer, 'offline', 'peer_closed');
   }
 
   private schedulePeerClose(peerId: string): void {
