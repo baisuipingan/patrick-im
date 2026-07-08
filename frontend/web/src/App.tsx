@@ -1593,6 +1593,10 @@ export default function App() {
       case 'webrtc_answer':
       case 'webrtc_ice': {
         const envelope = payload as Envelope<WebRTCSignalPayload>;
+        if (envelope.error) {
+          setNotice({ tone: 'error', text: envelope.error.message || '直连信令发送失败' });
+          return true;
+        }
         if (envelope.payload?.fromId && envelope.payload.signal) {
           void directMeshRef.current?.handleSignal(envelope.payload.fromId, envelope.payload.signal);
         }

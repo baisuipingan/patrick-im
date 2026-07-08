@@ -671,14 +671,14 @@ func (api *API) handleClientWebSocketMessage(ctx context.Context, roomID string,
 	if message.TargetID == sender.ClientID {
 		return
 	}
-	dropped := api.hub.PublishReliable(roomID, []string{message.TargetID}, protocol.ServerToClientMessage{
+	delivered, dropped := api.hub.PublishReliable(roomID, []string{message.TargetID}, protocol.ServerToClientMessage{
 		Type:    "signal",
 		RoomID:  roomID,
 		FromID:  sender.ClientID,
 		Payload: message.Payload,
 	}, webrtcSignalTimeout)
-	if dropped > 0 {
-		api.logger.Warn("legacy webrtc signal delivery timed out", "room", roomID, "target", message.TargetID, "dropped", dropped)
+	if delivered == 0 || dropped > 0 {
+		api.logger.Warn("legacy webrtc signal delivery failed", "room", roomID, "target", message.TargetID, "delivered", delivered, "dropped", dropped)
 	}
 }
 
@@ -737,7 +737,7 @@ func (api *API) handleWebRTCEnvelope(roomID string, sender session.Payload, enve
 		return
 	}
 	payload.FromID = sender.ClientID
-	dropped := api.hub.PublishReliable(roomID, []string{payload.TargetID}, protocol.NewEnvelope(
+	delivered, dropped := api.hub.PublishReliable(roomID, []string{payload.TargetID}, protocol.NewEnvelope(
 		envelope.Type,
 		envelope.RequestID,
 		roomID,
@@ -745,8 +745,14 @@ func (api *API) handleWebRTCEnvelope(roomID string, sender session.Payload, enve
 		payload,
 		util.NowMillisInt64(),
 	), webrtcSignalTimeout)
+	if delivered == 0 {
+		api.logger.Warn("webrtc signal target unavailable", "room", roomID, "target", payload.TargetID, "type", envelope.Type, "request_id", envelope.RequestID)
+		api.publishEnvelopeError(roomID, sender.ClientID, envelope.Type, envelope.RequestID, "target_unavailable", "target peer is not connected")
+		return
+	}
 	if dropped > 0 {
-		api.logger.Warn("webrtc signal delivery timed out", "room", roomID, "target", payload.TargetID, "type", envelope.Type, "request_id", envelope.RequestID, "dropped", dropped)
+		api.logger.Warn("webrtc signal delivery timed out", "room", roomID, "target", payload.TargetID, "type", envelope.Type, "request_id", envelope.RequestID, "delivered", delivered, "dropped", dropped)
+		api.publishEnvelopeError(roomID, sender.ClientID, envelope.Type, envelope.RequestID, "signal_delivery_failed", "target peer did not accept signaling message")
 	}
 }
 

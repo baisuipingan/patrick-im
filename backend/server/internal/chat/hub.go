@@ -67,7 +67,7 @@ func (h *Hub) Publish(roomID string, recipients []string, event any) {
 	h.publishLocked(roomID, recipients, event)
 }
 
-func (h *Hub) PublishReliable(roomID string, recipients []string, event any, timeout time.Duration) int {
+func (h *Hub) PublishReliable(roomID string, recipients []string, event any, timeout time.Duration) (int, int) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return h.publishLockedReliable(roomID, recipients, event, timeout)
@@ -101,15 +101,16 @@ func (h *Hub) publishLocked(roomID string, recipients []string, event any) {
 	}
 }
 
-func (h *Hub) publishLockedReliable(roomID string, recipients []string, event any, timeout time.Duration) int {
+func (h *Hub) publishLockedReliable(roomID string, recipients []string, event any, timeout time.Duration) (int, int) {
 	room := h.rooms[roomID]
 	if len(room) == 0 {
-		return 0
+		return 0, 0
 	}
 	allowed := map[string]struct{}{}
 	for _, id := range recipients {
 		allowed[id] = struct{}{}
 	}
+	delivered := 0
 	dropped := 0
 	for clientID, sub := range room {
 		if len(allowed) > 0 {
@@ -120,6 +121,7 @@ func (h *Hub) publishLockedReliable(roomID string, recipients []string, event an
 		if timeout <= 0 {
 			select {
 			case sub.ch <- event:
+				delivered++
 			default:
 				dropped++
 			}
@@ -128,6 +130,7 @@ func (h *Hub) publishLockedReliable(roomID string, recipients []string, event an
 		timer := time.NewTimer(timeout)
 		select {
 		case sub.ch <- event:
+			delivered++
 			if !timer.Stop() {
 				select {
 				case <-timer.C:
@@ -138,7 +141,7 @@ func (h *Hub) publishLockedReliable(roomID string, recipients []string, event an
 			dropped++
 		}
 	}
-	return dropped
+	return delivered, dropped
 }
 
 func peersFor(room map[string]*subscriber) []protocol.Peer {

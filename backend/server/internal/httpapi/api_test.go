@@ -851,6 +851,52 @@ func TestWebSocketEnvelopeWebRTCForwardsOnlyToTarget(t *testing.T) {
 	}
 }
 
+func TestWebSocketEnvelopeWebRTCTargetUnavailableReturnsError(t *testing.T) {
+	api := newTestAPI(t)
+	aliceEvents, aliceLeave := api.hub.Join("room-a", protocol.Peer{
+		ClientID: "alice",
+		Nickname: "Alice",
+		JoinedAt: 1,
+	})
+	defer aliceLeave()
+	drainEvents(aliceEvents)
+
+	request := protocol.NewEnvelope(
+		"webrtc_offer",
+		"signal-missing",
+		"room-a",
+		"direct:room-a:alice:bob",
+		protocol.WebRTCSignalPayload{
+			TargetID: "bob",
+			Signal: protocol.SignalEnvelope{
+				Description: json.RawMessage(`{"type":"offer","sdp":"v=0"}`),
+			},
+		},
+		time.Now().UnixMilli(),
+	)
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api.handleClientWebSocketMessage(context.Background(), "room-a", sessionpkg.Payload{ClientID: "alice", Nickname: "Alice"}, data)
+
+	select {
+	case raw := <-aliceEvents:
+		event, ok := raw.(protocol.Envelope)
+		if !ok {
+			t.Fatalf("event type = %T", raw)
+		}
+		if event.Type != "webrtc_offer" || event.RequestID != "signal-missing" || event.Error == nil {
+			t.Fatalf("event = %#v", event)
+		}
+		if event.Error.Code != "target_unavailable" {
+			t.Fatalf("error = %#v", event.Error)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for error envelope")
+	}
+}
+
 func TestRoomWebSocketForwardsSignal(t *testing.T) {
 	router := newTestRouter(t)
 	server := httptest.NewServer(router)
