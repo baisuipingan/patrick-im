@@ -120,11 +120,13 @@ interface PendingOutgoingFile {
   meta: DirectFileMeta;
   file: File;
   sent: number;
+  phase: 'offered' | 'streaming' | 'awaiting-complete';
   options: DirectSendOptions;
   progress: ProgressReporter;
   resolve: (value: boolean) => void;
   reject: (error: unknown) => void;
   channel?: RTCDataChannel;
+  timeoutId?: number;
   finishedSending?: boolean;
   cancelled?: boolean;
 }
@@ -175,6 +177,8 @@ const PEER_REAP_GRACE_MS = 8000;
 const PEER_RECONNECT_DELAY_MS = 1200;
 const MAX_PEER_RECONNECT_ATTEMPTS = 3;
 const PATH_POLL_INTERVAL_MS = 2000;
+const OUTGOING_ACCEPT_TIMEOUT_MS = 30_000;
+const OUTGOING_COMPLETE_TIMEOUT_MS = 10 * 60_000;
 const FILE_CHANNEL_PREFIX = 'patrick-im-file:';
 
 interface ParsedIceCandidate {
@@ -296,12 +300,21 @@ export class DirectMesh {
         meta,
         file,
         sent: 0,
+        phase: 'offered',
         options,
         progress,
         resolve,
         reject,
       });
-      control.send(JSON.stringify(meta));
+      const pending = peer.outgoingFiles.get(id);
+      if (pending) {
+        this.setOutgoingTimeout(peer, pending, OUTGOING_ACCEPT_TIMEOUT_MS, '接收端未确认接收');
+      }
+      try {
+        control.send(JSON.stringify(meta));
+      } catch (error) {
+        this.cancelOutgoingFile(peer, id, error);
+      }
     });
   }
 
@@ -597,6 +610,8 @@ export class DirectMesh {
     if (!pending || pending.channel || pending.cancelled) {
       return;
     }
+    this.clearOutgoingTimeout(pending);
+    pending.phase = 'streaming';
     const channel = peer.pc.createDataChannel(`${FILE_CHANNEL_PREFIX}${id}`);
     pending.channel = channel;
     channel.binaryType = 'arraybuffer';
@@ -630,6 +645,8 @@ export class DirectMesh {
       });
       channel.send(JSON.stringify({ type: 'file-done', id: pending.meta.id } satisfies DirectFileDone));
       pending.finishedSending = true;
+      pending.phase = 'awaiting-complete';
+      this.setOutgoingTimeout(peer, pending, OUTGOING_COMPLETE_TIMEOUT_MS, '接收端完成确认超时');
       pending.progress.flush(pending.file.size, pending.file.size);
     } catch (error) {
       if (channel.readyState === 'open') {
@@ -646,6 +663,7 @@ export class DirectMesh {
       return;
     }
     pending.channel?.close();
+    this.clearOutgoingTimeout(pending);
     peer.outgoingFiles.delete(id);
     peer.activeSendCount = Math.max(0, peer.activeSendCount - 1);
     pending.resolve(true);
@@ -658,9 +676,25 @@ export class DirectMesh {
     }
     pending.cancelled = true;
     pending.channel?.close();
+    this.clearOutgoingTimeout(pending);
     peer.outgoingFiles.delete(id);
     peer.activeSendCount = Math.max(0, peer.activeSendCount - 1);
     pending.reject(error);
+  }
+
+  private setOutgoingTimeout(peer: DirectPeer, pending: PendingOutgoingFile, timeoutMs: number, message: string): void {
+    this.clearOutgoingTimeout(pending);
+    pending.timeoutId = window.setTimeout(() => {
+      this.cancelOutgoingFile(peer, pending.meta.id, new Error(message));
+    }, timeoutMs);
+  }
+
+  private clearOutgoingTimeout(pending: PendingOutgoingFile): void {
+    if (!pending.timeoutId) {
+      return;
+    }
+    window.clearTimeout(pending.timeoutId);
+    pending.timeoutId = undefined;
   }
 
   private async abortIncomingFile(peer: DirectPeer, id: string): Promise<void> {
@@ -848,6 +882,7 @@ export class DirectMesh {
       void pending.sink?.abort();
     }
     for (const pending of peer.outgoingFiles.values()) {
+      this.clearOutgoingTimeout(pending);
       pending.channel?.close();
       pending.reject(new DOMException('Peer connection closed', 'AbortError'));
     }

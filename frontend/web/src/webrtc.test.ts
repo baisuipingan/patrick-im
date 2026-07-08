@@ -250,6 +250,47 @@ describe('DirectMesh direct file transfer', () => {
     await expect(result).resolves.toBe(true);
   });
 
+  it('rejects outgoing files when the receiver never accepts', async () => {
+    vi.useFakeTimers();
+    try {
+      const mesh = createMesh();
+      mesh.setPeers([createPeer()]);
+      const control = peerConnectionInstances[0].channels[0];
+      control.readyState = 'open';
+
+      const result = mesh.sendFile('a-remote', testFile('timeout.txt', 'hello', 'text/plain'), { transferId: 'timeout-1' });
+      const rejection = expect(result).rejects.toThrow('接收端未确认接收');
+      await vi.advanceTimersByTimeAsync(30_000);
+
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects outgoing files when receiver completion ack never arrives', async () => {
+    vi.useFakeTimers();
+    try {
+      const mesh = createMesh();
+      mesh.setPeers([createPeer()]);
+      const control = peerConnectionInstances[0].channels[0];
+      control.readyState = 'open';
+
+      const result = mesh.sendFile('a-remote', testFile('ack-timeout.txt', 'hello', 'text/plain'), { transferId: 'timeout-2' });
+      control.receive(JSON.stringify({ type: 'file-accept', id: 'timeout-2' }));
+      const fileChannel = peerConnectionInstances[0].channels[1];
+      fileChannel.open();
+      await Promise.resolve();
+      await Promise.resolve();
+      const rejection = expect(result).rejects.toThrow('接收端完成确认超时');
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+      await rejection;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('prepares an incoming file, writes chunks, emits the received file, and sends completion ack', async () => {
     const onIncomingFile = vi.fn();
     const writes: ArrayBuffer[] = [];
