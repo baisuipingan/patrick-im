@@ -2402,14 +2402,25 @@ function directStateLabel(state: DirectState): string {
 }
 
 function directSnapshotLabel(snapshot: DirectPeerSnapshot): string {
+  const path = snapshot.path ? directPathLabel(snapshot.path) : '';
   if (snapshot.state === 'direct') {
-    return snapshot.channelState === 'open' ? 'DC open' : `DC ${snapshot.channelState ?? 'pending'}`;
+    return [snapshot.channelState === 'open' ? 'DC open' : `DC ${snapshot.channelState ?? 'pending'}`, path]
+      .filter(Boolean)
+      .join(' / ');
   }
   const parts = [`ICE ${snapshot.iceConnectionState}`, `PC ${snapshot.connectionState}`];
   if (snapshot.reconnectAttempts > 0) {
     parts.push(`重试 ${snapshot.reconnectAttempts}`);
   }
+  if (path) {
+    parts.push(path);
+  }
   return parts.slice(0, 3).join(' / ');
+}
+
+function directPathLabel(path: NonNullable<DirectPeerSnapshot['path']>): string {
+  const kind = path.kind === 'lan' ? 'LAN' : path.kind === 'turn' ? 'TURN' : path.kind === 'stun' ? 'STUN' : '路径未知';
+  return path.roundTripTimeMs ? `${kind} ${path.roundTripTimeMs}ms` : kind;
 }
 
 function connectionLabel(state: ConnectionState): string {

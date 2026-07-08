@@ -50,6 +50,7 @@ class MockPeerConnection {
   iceConnectionState: RTCIceConnectionState = 'new';
   readonly addedCandidates: RTCIceCandidateInit[] = [];
   readonly channels: MockDataChannel[] = [];
+  stats = new Map<string, Record<string, unknown>>();
 
   constructor(readonly configuration?: RTCConfiguration) {
     peerConnectionInstances.push(this);
@@ -78,6 +79,10 @@ class MockPeerConnection {
 
   async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
     this.addedCandidates.push(candidate);
+  }
+
+  async getStats(): Promise<RTCStatsReport> {
+    return this.stats as unknown as RTCStatsReport;
   }
 
   close(): void {
@@ -158,6 +163,38 @@ describe('DirectMesh WebRTC negotiation', () => {
       state: 'connecting',
       iceConnectionState: 'new',
       signalingState: 'stable',
+    }));
+  });
+
+  it('publishes direct path diagnostics from the selected candidate pair', async () => {
+    const onPeerSnapshot = vi.fn();
+    const mesh = createMesh({ onPeerSnapshot });
+
+    mesh.setPeers([createPeer()]);
+    const pc = peerConnectionInstances[0];
+    const control = pc.channels[0];
+    pc.stats = new Map([
+      ['transport-1', { type: 'transport', selectedCandidatePairId: 'pair-1' }],
+      ['pair-1', {
+        type: 'candidate-pair',
+        localCandidateId: 'local-1',
+        remoteCandidateId: 'remote-1',
+        currentRoundTripTime: 0.012,
+        state: 'succeeded',
+      }],
+      ['local-1', { type: 'local-candidate', candidateType: 'host', address: '192.168.1.8', protocol: 'udp' }],
+      ['remote-1', { type: 'remote-candidate', candidateType: 'host', address: '192.168.1.9', protocol: 'udp' }],
+    ]);
+    pc.connectionState = 'connected';
+    pc.onconnectionstatechange?.();
+    control.open();
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+    expect(onPeerSnapshot).toHaveBeenCalledWith('a-remote', expect.objectContaining({
+      path: expect.objectContaining({
+        kind: 'lan',
+        roundTripTimeMs: 12,
+      }),
     }));
   });
 

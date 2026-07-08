@@ -1,6 +1,17 @@
 import type { IceServer, Peer, SignalEnvelope } from '@shared/protocol';
 
 export type DirectState = 'connecting' | 'direct' | 'offline';
+export type DirectPathKind = 'lan' | 'stun' | 'turn' | 'unknown';
+
+export interface DirectPathInfo {
+  kind: DirectPathKind;
+  localCandidateType?: string;
+  remoteCandidateType?: string;
+  protocol?: string;
+  localAddress?: string;
+  remoteAddress?: string;
+  roundTripTimeMs?: number;
+}
 
 export interface DirectPeerSnapshot {
   state: DirectState;
@@ -9,6 +20,7 @@ export interface DirectPeerSnapshot {
   signalingState: RTCSignalingState;
   channelState?: RTCDataChannelState;
   reconnectAttempts: number;
+  path?: DirectPathInfo;
   updatedAt: number;
   note?: string;
 }
@@ -87,6 +99,11 @@ interface DirectPeer {
   isSettingRemoteAnswerPending: boolean;
   reconnectTimerId?: number;
   reconnectAttempts: number;
+  pathInfo?: DirectPathInfo | null;
+  pathInfoKey?: string;
+  pathPollTimerId?: number;
+  lastLocalCandidate?: ParsedIceCandidate;
+  lastRemoteCandidate?: ParsedIceCandidate;
 }
 
 interface PendingIncomingFile {
@@ -157,7 +174,14 @@ const PROGRESS_INTERVAL_MS = 150;
 const PEER_REAP_GRACE_MS = 8000;
 const PEER_RECONNECT_DELAY_MS = 1200;
 const MAX_PEER_RECONNECT_ATTEMPTS = 3;
+const PATH_POLL_INTERVAL_MS = 2000;
 const FILE_CHANNEL_PREFIX = 'patrick-im-file:';
+
+interface ParsedIceCandidate {
+  candidateType?: string;
+  address?: string;
+  protocol?: string;
+}
 
 interface ProgressReporter {
   report: (transferredBytes: number, totalBytes: number) => void;
@@ -228,6 +252,7 @@ export class DirectMesh {
         if (peer.ignoreOffer) {
           return;
         }
+        peer.lastRemoteCandidate = parseIceCandidate(payload.candidate);
         if (!peer.pc.remoteDescription) {
           peer.pendingCandidates.push(payload.candidate);
         } else {
@@ -330,6 +355,7 @@ export class DirectMesh {
     };
     pc.onicecandidate = (event) => {
       if (event.candidate) {
+        directPeer.lastLocalCandidate = parseIceCandidate(event.candidate);
         this.options.sendSignal(peer.clientId, { candidate: event.candidate.toJSON() });
       }
     };
@@ -337,11 +363,16 @@ export class DirectMesh {
       const state = pc.connectionState;
       if (state === 'connected') {
         directPeer.reconnectAttempts = 0;
+        this.startPathPolling(directPeer);
         this.emitPeerState(directPeer, directPeer.channel?.readyState === 'open' ? 'direct' : 'connecting', 'pc_connected');
       } else if (state === 'failed') {
+        this.stopPathPolling(directPeer);
+        this.publishPathInfo(directPeer, null);
         this.emitPeerState(directPeer, 'offline', 'pc_failed');
         this.scheduleReconnect(directPeer);
       } else if (state === 'closed') {
+        this.stopPathPolling(directPeer);
+        this.publishPathInfo(directPeer, null);
         this.emitPeerState(directPeer, 'offline', 'pc_closed');
       } else if (state === 'disconnected') {
         this.emitPeerState(directPeer, 'connecting', 'pc_disconnected');
@@ -351,6 +382,8 @@ export class DirectMesh {
     };
     pc.oniceconnectionstatechange = () => {
       if (pc.iceConnectionState === 'failed') {
+        this.stopPathPolling(directPeer);
+        this.publishPathInfo(directPeer, null);
         this.emitPeerState(directPeer, 'offline', 'ice_failed');
         this.scheduleReconnect(directPeer);
       } else {
@@ -380,6 +413,7 @@ export class DirectMesh {
       signalingState: peer.pc.signalingState,
       channelState: peer.channel?.readyState,
       reconnectAttempts: peer.reconnectAttempts,
+      path: peer.pathInfo ?? undefined,
       updatedAt: Date.now(),
       note,
     });
@@ -406,9 +440,17 @@ export class DirectMesh {
     peer.channel = channel;
     channel.binaryType = 'arraybuffer';
     channel.bufferedAmountLowThreshold = LOW_WATER_MARK;
-    channel.onopen = () => this.emitPeerState(peer, 'direct', 'control_open');
-    channel.onclose = () => this.emitPeerState(peer, 'offline', 'control_closed');
+    channel.onopen = () => {
+      this.startPathPolling(peer);
+      this.emitPeerState(peer, 'direct', 'control_open');
+    };
+    channel.onclose = () => {
+      this.stopPathPolling(peer);
+      this.publishPathInfo(peer, null);
+      this.emitPeerState(peer, 'offline', 'control_closed');
+    };
     channel.onerror = () => {
+      this.stopPathPolling(peer);
       this.emitPeerState(peer, 'offline', 'control_error');
       this.scheduleReconnect(peer);
     };
@@ -718,12 +760,85 @@ export class DirectMesh {
     }, PEER_RECONNECT_DELAY_MS);
   }
 
+  private startPathPolling(peer: DirectPeer): void {
+    if (peer.pathPollTimerId) {
+      return;
+    }
+    void this.refreshPathInfo(peer);
+    peer.pathPollTimerId = window.setInterval(() => {
+      void this.refreshPathInfo(peer);
+    }, PATH_POLL_INTERVAL_MS);
+  }
+
+  private stopPathPolling(peer: DirectPeer): void {
+    if (!peer.pathPollTimerId) {
+      return;
+    }
+    window.clearInterval(peer.pathPollTimerId);
+    peer.pathPollTimerId = undefined;
+  }
+
+  private publishPathInfo(peer: DirectPeer, path: DirectPathInfo | null): void {
+    const nextKey = buildPathInfoKey(path);
+    if (peer.pathInfoKey === nextKey) {
+      return;
+    }
+    peer.pathInfoKey = nextKey;
+    peer.pathInfo = path;
+    this.emitPeerState(peer, peer.channel?.readyState === 'open' ? 'direct' : 'connecting', path ? 'path_updated' : 'path_cleared');
+  }
+
+  private async refreshPathInfo(peer: DirectPeer): Promise<void> {
+    if (peer.pc.connectionState !== 'connected') {
+      return;
+    }
+    try {
+      const stats = await peer.pc.getStats();
+      const selectedPair = findSelectedCandidatePair(stats);
+      if (!selectedPair) {
+        return;
+      }
+      const localCandidateId = selectedPair.localCandidateId as string | undefined;
+      const remoteCandidateId = selectedPair.remoteCandidateId as string | undefined;
+      const localCandidate = localCandidateId ? (stats.get(localCandidateId) as Record<string, unknown> | undefined) : undefined;
+      const remoteCandidate = remoteCandidateId ? (stats.get(remoteCandidateId) as Record<string, unknown> | undefined) : undefined;
+      const localCandidateType =
+        typeof localCandidate?.candidateType === 'string' ? localCandidate.candidateType : peer.lastLocalCandidate?.candidateType;
+      const remoteCandidateType =
+        typeof remoteCandidate?.candidateType === 'string' ? remoteCandidate.candidateType : peer.lastRemoteCandidate?.candidateType;
+      const localAddress = readCandidateAddress(localCandidate) ?? peer.lastLocalCandidate?.address;
+      const remoteAddress = readCandidateAddress(remoteCandidate) ?? peer.lastRemoteCandidate?.address;
+      const protocol =
+        (typeof localCandidate?.protocol === 'string' ? localCandidate.protocol : undefined) ??
+        (typeof selectedPair.protocol === 'string' ? selectedPair.protocol : undefined) ??
+        peer.lastLocalCandidate?.protocol ??
+        peer.lastRemoteCandidate?.protocol;
+      const roundTripTimeMs =
+        typeof selectedPair.currentRoundTripTime === 'number'
+          ? Math.round(selectedPair.currentRoundTripTime * 1000)
+          : undefined;
+      this.publishPathInfo(peer, {
+        kind: classifyDirectPath(localCandidateType, remoteCandidateType, localAddress, remoteAddress),
+        localCandidateType,
+        remoteCandidateType,
+        protocol,
+        localAddress,
+        remoteAddress,
+        roundTripTimeMs,
+      });
+    } catch {
+      // Stats can fail transiently while ICE is changing; keep the last known path.
+    }
+  }
+
   private closePeer(peerId: string): void {
     const peer = this.peers.get(peerId);
     if (!peer) {
       return;
     }
     this.clearPeerCloseTimer(peerId);
+    this.stopPathPolling(peer);
+    this.publishPathInfo(peer, null);
     if (peer.reconnectTimerId) {
       window.clearTimeout(peer.reconnectTimerId);
       peer.reconnectTimerId = undefined;
@@ -770,6 +885,142 @@ export class DirectMesh {
       this.peerCloseTimers.delete(peerId);
     }
   }
+}
+
+function buildPathInfoKey(path: DirectPathInfo | null): string {
+  if (!path) {
+    return 'none';
+  }
+  return [
+    path.kind,
+    path.localCandidateType ?? '-',
+    path.remoteCandidateType ?? '-',
+    path.protocol ?? '-',
+    path.roundTripTimeMs ?? '-',
+  ].join(':');
+}
+
+function classifyDirectPath(
+  localCandidateType?: string,
+  remoteCandidateType?: string,
+  localAddress?: string,
+  remoteAddress?: string,
+): DirectPathKind {
+  if (localCandidateType === 'relay' || remoteCandidateType === 'relay') {
+    return 'turn';
+  }
+  if (
+    isLocalNetworkCandidate(localCandidateType, localAddress) &&
+    isLocalNetworkCandidate(remoteCandidateType, remoteAddress)
+  ) {
+    return 'lan';
+  }
+  if (isDirectCandidateType(localCandidateType) || isDirectCandidateType(remoteCandidateType)) {
+    return 'stun';
+  }
+  return 'unknown';
+}
+
+function isDirectCandidateType(candidateType?: string): boolean {
+  return candidateType === 'host' || candidateType === 'srflx' || candidateType === 'prflx';
+}
+
+function parseIceCandidate(candidate?: RTCIceCandidateInit | RTCIceCandidate | null): ParsedIceCandidate {
+  if (!candidate) {
+    return {};
+  }
+  const raw = candidate as Record<string, unknown>;
+  const directType = typeof raw.type === 'string' ? raw.type : undefined;
+  const directAddress =
+    typeof raw.address === 'string'
+      ? raw.address
+      : typeof raw.ip === 'string'
+        ? raw.ip
+        : undefined;
+  const directProtocol = typeof raw.protocol === 'string' ? raw.protocol : undefined;
+  const line = typeof candidate.candidate === 'string' ? candidate.candidate.trim() : '';
+  if (!line) {
+    return { candidateType: directType, address: directAddress, protocol: directProtocol };
+  }
+  const parts = line.split(/\s+/);
+  const typeIndex = parts.indexOf('typ');
+  return {
+    candidateType: directType ?? (typeIndex >= 0 && typeIndex + 1 < parts.length ? parts[typeIndex + 1] : undefined),
+    address: directAddress ?? parts[4],
+    protocol: directProtocol ?? parts[2],
+  };
+}
+
+function isLocalNetworkCandidate(candidateType?: string, address?: string): boolean {
+  if (candidateType === 'host' && !address) {
+    return true;
+  }
+  if (candidateType !== 'host' && candidateType !== 'prflx') {
+    return false;
+  }
+  if (!address) {
+    return false;
+  }
+  return address.endsWith('.local') || isPrivateIpAddress(address);
+}
+
+function isPrivateIpAddress(value: string): boolean {
+  const normalized = value.trim().replace(/^\[|\]$/g, '').split('%')[0];
+  const ipv4 = normalized.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const [a, b] = ipv4.slice(1).map((segment) => Number(segment));
+    if ([a, b].some((segment) => Number.isNaN(segment))) {
+      return false;
+    }
+    return a === 10 || a === 127 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254);
+  }
+  const lower = normalized.toLowerCase();
+  return (
+    lower === '::1' ||
+    lower.startsWith('fc') ||
+    lower.startsWith('fd') ||
+    lower.startsWith('fe8') ||
+    lower.startsWith('fe9') ||
+    lower.startsWith('fea') ||
+    lower.startsWith('feb')
+  );
+}
+
+function readCandidateAddress(candidate?: Record<string, unknown>): string | undefined {
+  const direct = typeof candidate?.address === 'string' ? candidate.address : undefined;
+  if (direct) {
+    return direct;
+  }
+  return typeof candidate?.ip === 'string' ? candidate.ip : undefined;
+}
+
+function findSelectedCandidatePair(stats: RTCStatsReport): Record<string, unknown> | null {
+  let pair: Record<string, unknown> | null = null;
+  stats.forEach((report) => {
+    if (pair) {
+      return;
+    }
+    const value = report as unknown as Record<string, unknown>;
+    if (value.type === 'transport' && typeof value.selectedCandidatePairId === 'string') {
+      const selected = stats.get(value.selectedCandidatePairId);
+      if (selected) {
+        pair = selected as unknown as Record<string, unknown>;
+      }
+    }
+  });
+  if (pair) {
+    return pair;
+  }
+  stats.forEach((report) => {
+    if (pair) {
+      return;
+    }
+    const value = report as unknown as Record<string, unknown>;
+    if (value.type === 'candidate-pair' && (value.selected === true || value.nominated === true || value.state === 'succeeded')) {
+      pair = value;
+    }
+  });
+  return pair;
 }
 
 async function sendFileChunks(channel: RTCDataChannel, file: File, options: DirectSendOptions): Promise<void> {
