@@ -845,6 +845,17 @@ a {
   flex-wrap: wrap;
 }
 
+.transfer-note {
+  margin-top: 6px;
+  color: var(--amber);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.transfer-note.error {
+  color: var(--rose);
+}
+
 .transfer-actions {
   justify-content: flex-end;
   margin-top: 7px;

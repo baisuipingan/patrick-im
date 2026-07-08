@@ -114,6 +114,8 @@ type PickerWindow = Window & {
 const NICKNAME_KEY = 'patrick-im:nickname';
 const LAST_ROOM_KEY = 'patrick-im:last-room';
 const RECENT_ROOMS_KEY = 'patrick-im:recent-rooms';
+const DIRECT_CONNECT_WAIT_MS = 10000;
+const TRANSFER_CANCELLED_MESSAGE = '已取消';
 
 const EMPTY_RECEIVE_DIRECTORY: StoredDirectoryState = {
   handle: null,
@@ -223,9 +225,11 @@ export default function App() {
   const pausedTransfersRef = useRef<Record<string, boolean>>({});
   const transferAbortControllersRef = useRef<Record<string, AbortController>>({});
   const retryableTransfersRef = useRef<Record<string, RetryableTransfer>>({});
+  const cancelledTransfersRef = useRef<Record<string, boolean>>({});
   const receiveDirectoryRef = useRef<StoredDirectoryState>(EMPTY_RECEIVE_DIRECTORY);
   const conversationsRef = useRef<ConversationView[]>([]);
   const transfersRef = useRef<Record<string, TransferRow>>({});
+  const directStatesRef = useRef<Record<string, DirectState>>({});
   const sessionRef = useRef<SessionResponse | null>(null);
   const localMessagesRef = useRef<Record<string, MessageView[]>>({});
   const clearedConversationsRef = useRef<Record<string, number>>({});
@@ -252,6 +256,10 @@ export default function App() {
   useEffect(() => {
     transfersRef.current = transfers;
   }, [transfers]);
+
+  useEffect(() => {
+    directStatesRef.current = directStates;
+  }, [directStates]);
 
   useEffect(() => {
     sessionRef.current = session;
@@ -775,6 +783,10 @@ export default function App() {
       await refreshRoomDetail();
       setNotice({ tone: 'success', text: '已发送' });
     } catch (error) {
+      if (isCancelledTransferError(error)) {
+        setNotice({ tone: 'info', text: TRANSFER_CANCELLED_MESSAGE });
+        return;
+      }
       setNotice({ tone: 'error', text: error instanceof Error ? error.message : '发送失败' });
     }
   }
@@ -782,33 +794,41 @@ export default function App() {
   async function sendAttachment(conversation: ConversationView, file: File, messageType?: 'txt_file'): Promise<void> {
     const transferId = newLocalId('transfer');
     const startedAt = Date.now();
+    cancelledTransfersRef.current[transferId] = false;
     retryableTransfersRef.current[transferId] = { file, conversationId: conversation.id, messageType };
-    const sentDirect = await sendDirectAttachment(conversation, file, messageType, transferId, startedAt);
-    if (!sentDirect) {
-      if (session && file.size > session.maxUploadBytes) {
-        const error = `${file.name || '文件'} 超过服务端上传上限 ${formatBytes(session.maxUploadBytes)}，且 P2P 未完成`;
-        setTransfers((current) => ({
-          ...current,
-          [transferId]: {
-            ...(current[transferId] ?? {
-              id: transferId,
-              fileName: file.name || 'file',
-              conversationId: conversation.id,
-              direction: 'send',
-              startedAt,
-            }),
-            transport: current[transferId]?.transport ?? 'server',
-            totalBytes: file.size,
-            transferredBytes: current[transferId]?.transferredBytes ?? 0,
-            status: 'failed',
-            error,
-            updatedAt: Date.now(),
-            canRetry: true,
-          },
-        }));
-        throw new Error(error);
+    try {
+      const sentDirect = await sendDirectAttachment(conversation, file, messageType, transferId, startedAt);
+      if (!sentDirect) {
+        if (isTransferCancelled(transferId)) {
+          throw new Error(TRANSFER_CANCELLED_MESSAGE);
+        }
+        if (session && file.size > session.maxUploadBytes) {
+          const error = `${file.name || '文件'} 超过服务端上传上限 ${formatBytes(session.maxUploadBytes)}，且 P2P 未完成`;
+          setTransfers((current) => ({
+            ...current,
+            [transferId]: {
+              ...(current[transferId] ?? {
+                id: transferId,
+                fileName: file.name || 'file',
+                conversationId: conversation.id,
+                direction: 'send',
+                startedAt,
+              }),
+              transport: current[transferId]?.transport ?? 'server',
+              totalBytes: file.size,
+              transferredBytes: current[transferId]?.transferredBytes ?? 0,
+              status: 'failed',
+              error,
+              updatedAt: Date.now(),
+              canRetry: true,
+            },
+          }));
+          throw new Error(error);
+        }
+        await uploadAttachment(conversation.id, file, messageType, transferId, startedAt);
       }
-      await uploadAttachment(conversation.id, file, messageType, transferId, startedAt);
+    } finally {
+      delete cancelledTransfersRef.current[transferId];
     }
   }
 
@@ -821,8 +841,61 @@ export default function App() {
   ): Promise<boolean> {
     const peerId = conversation.peerUserId;
     const mesh = directMeshRef.current;
-    if (!peerId || directStates[peerId] !== 'direct' || !mesh || !session) {
+    if (!peerId || !mesh || !session) {
       return false;
+    }
+    if (directStatesRef.current[peerId] !== 'direct') {
+      if (directStatesRef.current[peerId] !== 'connecting') {
+        return false;
+      }
+      const waitController = new AbortController();
+      transferAbortControllersRef.current[transferId] = waitController;
+      retryableTransfersRef.current[transferId] = { file, conversationId: conversation.id, messageType };
+      setTransfers((current) => ({
+        ...current,
+        [transferId]: {
+          id: transferId,
+          fileName: file.name || 'file',
+          conversationId: conversation.id,
+          peerId,
+          transport: 'p2p',
+          direction: 'send',
+          totalBytes: file.size,
+          transferredBytes: 0,
+          status: 'queued',
+          startedAt,
+          updatedAt: Date.now(),
+          error: '等待直连建立',
+          canRetry: true,
+        },
+      }));
+      const connected = await waitForDirectPeer(peerId, DIRECT_CONNECT_WAIT_MS, waitController.signal);
+      delete transferAbortControllersRef.current[transferId];
+      if (waitController.signal.aborted || isTransferCancelled(transferId)) {
+        throw new Error(TRANSFER_CANCELLED_MESSAGE);
+      }
+      if (!connected) {
+        setTransfers((current) => ({
+          ...current,
+          [transferId]: {
+            ...(current[transferId] ?? {
+              id: transferId,
+              fileName: file.name || 'file',
+              conversationId: conversation.id,
+              peerId,
+              direction: 'send',
+              totalBytes: file.size,
+              transferredBytes: 0,
+              startedAt,
+            }),
+            transport: 'server',
+            status: 'queued',
+            error: '直连未就绪，已改用服务端',
+            updatedAt: Date.now(),
+          },
+        }));
+        return false;
+      }
     }
     const controller = new AbortController();
     transferAbortControllersRef.current[transferId] = controller;
@@ -922,7 +995,7 @@ export default function App() {
         },
       }));
       if (aborted) {
-        throw new Error('已取消');
+        throw new Error(TRANSFER_CANCELLED_MESSAGE);
       }
       return false;
     } finally {
@@ -972,7 +1045,7 @@ export default function App() {
         status: 'queued',
         startedAt: current[transferId]?.startedAt ?? startedAt,
         updatedAt: startedAt,
-        error: undefined,
+        error: current[transferId]?.error,
         canRetry: true,
       },
     }));
@@ -1173,11 +1246,33 @@ export default function App() {
       await saveBlob(blob, attachment.fileName, attachment.contentType);
       setNotice({ tone: 'success', text: '文件已保存' });
     } catch (error) {
+      if (isAbortError(error)) {
+        setNotice({ tone: 'info', text: '已取消保存' });
+        return;
+      }
       setNotice({ tone: 'error', text: error instanceof Error ? error.message : '保存失败' });
     }
   }
 
+  async function waitForDirectPeer(peerId: string, timeoutMs: number, signal?: AbortSignal): Promise<boolean> {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (signal?.aborted) {
+        return false;
+      }
+      if (directStatesRef.current[peerId] === 'direct') {
+        return true;
+      }
+      if (directStatesRef.current[peerId] === 'offline') {
+        return false;
+      }
+      await delay(150);
+    }
+    return directStatesRef.current[peerId] === 'direct';
+  }
+
   function cancelTransfer(id: string) {
+    cancelledTransfersRef.current[id] = true;
     uploadXhrsRef.current[id]?.abort();
     transferAbortControllersRef.current[id]?.abort();
     setTransfers((current) => {
@@ -1194,6 +1289,10 @@ export default function App() {
         },
       };
     });
+  }
+
+  function isTransferCancelled(id: string): boolean {
+    return cancelledTransfersRef.current[id] === true || transfersRef.current[id]?.status === 'cancelled';
   }
 
   function pauseTransfer(id: string) {
@@ -2034,6 +2133,7 @@ function TransferPanel({
                 </span>
                 <span>{speed > 0 ? `${formatBytes(speed)}/s${eta ? ` · 剩余 ${eta}` : ''}` : row.direction === 'receive' ? '接收中' : '等待传输'}</span>
               </div>
+              {row.error ? <div className={cn('transfer-note', row.status === 'failed' ? 'error' : '')}>{row.error}</div> : null}
               <div className="transfer-actions">
                 {row.status === 'uploading' && row.canPause ? (
                   <button onClick={() => onPause(row.id)}>
@@ -2205,6 +2305,18 @@ async function saveBlob(blob: Blob, fileName: string, contentType: string): Prom
   anchor.rel = 'noreferrer';
   anchor.click();
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError';
+}
+
+function isCancelledTransferError(error: unknown): boolean {
+  return error instanceof Error && error.message === TRANSFER_CANCELLED_MESSAGE;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function extensionFor(fileName: string): string {
