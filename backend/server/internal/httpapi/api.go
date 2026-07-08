@@ -24,6 +24,7 @@ import (
 const (
 	wsProtocolName          = "patrick-im"
 	wsSessionProtocolPrefix = "patrick-im-session."
+	webrtcSignalTimeout     = 2 * time.Second
 )
 
 type API struct {
@@ -670,12 +671,15 @@ func (api *API) handleClientWebSocketMessage(ctx context.Context, roomID string,
 	if message.TargetID == sender.ClientID {
 		return
 	}
-	api.hub.Publish(roomID, []string{message.TargetID}, protocol.ServerToClientMessage{
+	dropped := api.hub.PublishReliable(roomID, []string{message.TargetID}, protocol.ServerToClientMessage{
 		Type:    "signal",
 		RoomID:  roomID,
 		FromID:  sender.ClientID,
 		Payload: message.Payload,
-	})
+	}, webrtcSignalTimeout)
+	if dropped > 0 {
+		api.logger.Warn("legacy webrtc signal delivery timed out", "room", roomID, "target", message.TargetID, "dropped", dropped)
+	}
 }
 
 func (api *API) handleClientEnvelope(ctx context.Context, roomID string, sender session.Payload, data []byte) bool {
@@ -733,14 +737,17 @@ func (api *API) handleWebRTCEnvelope(roomID string, sender session.Payload, enve
 		return
 	}
 	payload.FromID = sender.ClientID
-	api.hub.Publish(roomID, []string{payload.TargetID}, protocol.NewEnvelope(
+	dropped := api.hub.PublishReliable(roomID, []string{payload.TargetID}, protocol.NewEnvelope(
 		envelope.Type,
 		envelope.RequestID,
 		roomID,
 		envelope.ConversationID,
 		payload,
 		util.NowMillisInt64(),
-	))
+	), webrtcSignalTimeout)
+	if dropped > 0 {
+		api.logger.Warn("webrtc signal delivery timed out", "room", roomID, "target", payload.TargetID, "type", envelope.Type, "request_id", envelope.RequestID, "dropped", dropped)
+	}
 }
 
 func (api *API) publishEnvelopeError(roomID, recipientID, eventType, requestID, code, message string) {

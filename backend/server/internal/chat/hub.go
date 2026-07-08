@@ -67,6 +67,12 @@ func (h *Hub) Publish(roomID string, recipients []string, event any) {
 	h.publishLocked(roomID, recipients, event)
 }
 
+func (h *Hub) PublishReliable(roomID string, recipients []string, event any, timeout time.Duration) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.publishLockedReliable(roomID, recipients, event, timeout)
+}
+
 func (h *Hub) Peers(roomID string) []protocol.Peer {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -93,6 +99,46 @@ func (h *Hub) publishLocked(roomID string, recipients []string, event any) {
 		default:
 		}
 	}
+}
+
+func (h *Hub) publishLockedReliable(roomID string, recipients []string, event any, timeout time.Duration) int {
+	room := h.rooms[roomID]
+	if len(room) == 0 {
+		return 0
+	}
+	allowed := map[string]struct{}{}
+	for _, id := range recipients {
+		allowed[id] = struct{}{}
+	}
+	dropped := 0
+	for clientID, sub := range room {
+		if len(allowed) > 0 {
+			if _, ok := allowed[clientID]; !ok {
+				continue
+			}
+		}
+		if timeout <= 0 {
+			select {
+			case sub.ch <- event:
+			default:
+				dropped++
+			}
+			continue
+		}
+		timer := time.NewTimer(timeout)
+		select {
+		case sub.ch <- event:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		case <-timer.C:
+			dropped++
+		}
+	}
+	return dropped
 }
 
 func peersFor(room map[string]*subscriber) []protocol.Peer {
