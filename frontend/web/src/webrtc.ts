@@ -66,8 +66,8 @@ interface DirectPeer {
   polite: boolean;
   pc: RTCPeerConnection;
   channel: RTCDataChannel | null;
-  activeFileId: string | null;
   activeSendCount: number;
+  outgoingFiles: Map<string, PendingOutgoingFile>;
   pendingCandidates: RTCIceCandidateInit[];
   files: Map<string, PendingIncomingFile>;
   makingOffer: boolean;
@@ -84,6 +84,20 @@ interface PendingIncomingFile {
   sink: IncomingDirectFileSink | null;
   writeChain: Promise<void>;
   progress: ProgressReporter;
+  channel?: RTCDataChannel;
+}
+
+interface PendingOutgoingFile {
+  meta: DirectFileMeta;
+  file: File;
+  sent: number;
+  options: DirectSendOptions;
+  progress: ProgressReporter;
+  resolve: (value: boolean) => void;
+  reject: (error: unknown) => void;
+  channel?: RTCDataChannel;
+  finishedSending?: boolean;
+  cancelled?: boolean;
 }
 
 interface DirectFileMeta {
@@ -106,10 +120,23 @@ interface DirectFileDone {
   id: string;
 }
 
+interface DirectFileAccept {
+  type: 'file-accept';
+  id: string;
+}
+
 interface DirectFileCancel {
   type: 'file-cancel';
   id: string;
 }
+
+interface DirectFileFailed {
+  type: 'file-failed';
+  id: string;
+  error?: string;
+}
+
+type DirectControlMessage = DirectFileMeta | DirectFileAccept | DirectFileDone | DirectFileCancel | DirectFileFailed;
 
 const CHUNK_SIZE = 64 * 1024;
 const HIGH_WATER_MARK = 8 * 1024 * 1024;
@@ -118,6 +145,7 @@ const PROGRESS_INTERVAL_MS = 150;
 const PEER_REAP_GRACE_MS = 8000;
 const PEER_RECONNECT_DELAY_MS = 1200;
 const MAX_PEER_RECONNECT_ATTEMPTS = 3;
+const FILE_CHANNEL_PREFIX = 'patrick-im-file:';
 
 interface ProgressReporter {
   report: (transferredBytes: number, totalBytes: number) => void;
@@ -204,8 +232,8 @@ export class DirectMesh {
 
   async sendFile(peerId: string, file: File, options: DirectSendOptions = {}): Promise<boolean> {
     const peer = this.peers.get(peerId);
-    const channel = peer?.channel;
-    if (!peer || !channel || channel.readyState !== 'open') {
+    const control = peer?.channel;
+    if (!peer || !control || control.readyState !== 'open') {
       return false;
     }
     const id = options.transferId ?? crypto.randomUUID?.() ?? `direct-${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -225,24 +253,19 @@ export class DirectMesh {
     };
     const progress = createProgressReporter(options.onProgress);
     peer.activeSendCount += 1;
-    channel.send(JSON.stringify(meta));
     progress.flush(0, file.size);
-    try {
-      await sendFileChunks(channel, file, {
-        ...options,
-        onProgress: progress.report,
+    return new Promise<boolean>((resolve, reject) => {
+      peer.outgoingFiles.set(id, {
+        meta,
+        file,
+        sent: 0,
+        options,
+        progress,
+        resolve,
+        reject,
       });
-      channel.send(JSON.stringify({ type: 'file-done', id } satisfies DirectFileDone));
-      progress.flush(file.size, file.size);
-    } catch (error) {
-      if (channel.readyState === 'open') {
-        channel.send(JSON.stringify({ type: 'file-cancel', id } satisfies DirectFileCancel));
-      }
-      throw error;
-    } finally {
-      peer.activeSendCount = Math.max(0, peer.activeSendCount - 1);
-    }
-    return true;
+      control.send(JSON.stringify(meta));
+    });
   }
 
   close(): void {
@@ -278,8 +301,8 @@ export class DirectMesh {
       polite: this.isPolitePeer(peer.clientId),
       pc,
       channel: null,
-      activeFileId: null,
       activeSendCount: 0,
+      outgoingFiles: new Map(),
       pendingCandidates: [],
       files: new Map(),
       makingOffer: false,
@@ -321,6 +344,10 @@ export class DirectMesh {
       }
     };
     pc.ondatachannel = (event) => {
+      if (event.channel.label.startsWith(FILE_CHANNEL_PREFIX)) {
+        this.attachIncomingFileChannel(directPeer, event.channel);
+        return;
+      }
       this.attachChannel(directPeer, event.channel);
     };
 
@@ -355,7 +382,7 @@ export class DirectMesh {
     channel.onclose = () => this.options.onStateChange(peer.id, 'offline');
     channel.onerror = () => this.scheduleReconnect(peer);
     channel.onmessage = (event) => {
-      void this.handleDataChannelMessage(peer, event.data);
+      void this.handleControlMessage(peer, event.data);
     };
   }
 
@@ -377,63 +404,55 @@ export class DirectMesh {
     }
   }
 
-  private async handleDataChannelMessage(peer: DirectPeer, data: unknown): Promise<void> {
+  private async handleControlMessage(peer: DirectPeer, data: unknown): Promise<void> {
     if (typeof data === 'string') {
-      let payload: DirectFileMeta | DirectFileDone | DirectFileCancel;
+      let payload: DirectControlMessage;
       try {
-        payload = JSON.parse(data) as DirectFileMeta | DirectFileDone | DirectFileCancel;
+        payload = JSON.parse(data) as DirectControlMessage;
       } catch {
         return;
       }
       if (payload.type === 'file-meta') {
-        peer.activeFileId = payload.id;
-        const progress = createProgressReporter((transferredBytes, totalBytes) => {
-          this.options.onIncomingFileProgress?.({
-            id: payload.id,
-            roomId: payload.roomId,
-            peerId: peer.id,
-            fileName: payload.fileName,
-            size: totalBytes,
-            transferredBytes,
-            direction: 'receive',
-          });
-        });
-        let sink: IncomingDirectFileSink | null = null;
-        try {
-          sink = (await this.options.createIncomingFileSink?.(payload)) ?? null;
-        } catch {
-          sink = null;
-        }
-        peer.files.set(payload.id, { meta: payload, chunks: [], received: 0, sink, writeChain: Promise.resolve(), progress });
-        this.options.onIncomingFileStart?.({
-          id: payload.id,
-          roomId: payload.roomId,
-          peerId: peer.id,
-          fileName: payload.fileName,
-          size: payload.size,
-          transferredBytes: 0,
-          direction: 'receive',
-        });
+        await this.prepareIncomingFile(peer, payload);
+        return;
+      }
+      if (payload.type === 'file-accept') {
+        this.openOutgoingFileChannel(peer, payload.id);
         return;
       }
       if (payload.type === 'file-done') {
-        await this.finishIncomingFile(peer, payload.id);
+        this.completeOutgoingFile(peer, payload.id);
         return;
       }
       if (payload.type === 'file-cancel') {
-        const pending = peer.files.get(payload.id);
-        peer.files.delete(payload.id);
-        void pending?.sink?.abort();
-        if (peer.activeFileId === payload.id) {
-          peer.activeFileId = null;
-        }
+        this.cancelOutgoingFile(peer, payload.id, new DOMException('Transfer cancelled by receiver', 'AbortError'));
+        await this.abortIncomingFile(peer, payload.id);
+        return;
+      }
+      if (payload.type === 'file-failed') {
+        this.cancelOutgoingFile(peer, payload.id, new Error(payload.error || '接收端处理失败'));
       }
       return;
     }
+  }
 
-    const activeId = peer.activeFileId;
-    const pending = activeId ? peer.files.get(activeId) : null;
+  private async handleIncomingFileChannelMessage(peer: DirectPeer, id: string, data: unknown): Promise<void> {
+    const pending = peer.files.get(id);
     if (!pending) {
+      return;
+    }
+    if (typeof data === 'string') {
+      let payload: DirectFileDone | DirectFileCancel;
+      try {
+        payload = JSON.parse(data) as DirectFileDone | DirectFileCancel;
+      } catch {
+        return;
+      }
+      if (payload.type === 'file-done') {
+        await this.finishIncomingFile(peer, id);
+      } else if (payload.type === 'file-cancel') {
+        await this.abortIncomingFile(peer, id);
+      }
       return;
     }
     const chunk = await toArrayBuffer(data);
@@ -446,15 +465,168 @@ export class DirectMesh {
     pending.progress.report(pending.received, pending.meta.size);
   }
 
+  private async prepareIncomingFile(peer: DirectPeer, payload: DirectFileMeta): Promise<void> {
+    const progress = createProgressReporter((transferredBytes, totalBytes) => {
+      this.options.onIncomingFileProgress?.({
+        id: payload.id,
+        roomId: payload.roomId,
+        peerId: peer.id,
+        fileName: payload.fileName,
+        size: totalBytes,
+        transferredBytes,
+        direction: 'receive',
+      });
+    });
+    let sink: IncomingDirectFileSink | null = null;
+    try {
+      sink = (await this.options.createIncomingFileSink?.(payload)) ?? null;
+    } catch {
+      sink = null;
+    }
+    peer.files.set(payload.id, { meta: payload, chunks: [], received: 0, sink, writeChain: Promise.resolve(), progress });
+    this.options.onIncomingFileStart?.({
+      id: payload.id,
+      roomId: payload.roomId,
+      peerId: peer.id,
+      fileName: payload.fileName,
+      size: payload.size,
+      transferredBytes: 0,
+      direction: 'receive',
+    });
+    peer.channel?.send(JSON.stringify({ type: 'file-accept', id: payload.id } satisfies DirectFileAccept));
+  }
+
+  private attachIncomingFileChannel(peer: DirectPeer, channel: RTCDataChannel): void {
+    const id = channel.label.startsWith(FILE_CHANNEL_PREFIX) ? channel.label.slice(FILE_CHANNEL_PREFIX.length) : '';
+    const pending = peer.files.get(id);
+    if (!id || !pending) {
+      channel.close();
+      return;
+    }
+    pending.channel = channel;
+    channel.binaryType = 'arraybuffer';
+    channel.onmessage = (event) => {
+      void this.handleIncomingFileChannelMessage(peer, id, event.data);
+    };
+    channel.onerror = () => {
+      void this.failIncomingFile(peer, id, '文件通道异常');
+    };
+    channel.onclose = () => {
+      const current = peer.files.get(id);
+      if (current && current.received < current.meta.size) {
+        void this.failIncomingFile(peer, id, '文件通道已关闭');
+      }
+    };
+  }
+
+  private openOutgoingFileChannel(peer: DirectPeer, id: string): void {
+    const pending = peer.outgoingFiles.get(id);
+    if (!pending || pending.channel || pending.cancelled) {
+      return;
+    }
+    const channel = peer.pc.createDataChannel(`${FILE_CHANNEL_PREFIX}${id}`);
+    pending.channel = channel;
+    channel.binaryType = 'arraybuffer';
+    channel.bufferedAmountLowThreshold = LOW_WATER_MARK;
+    channel.onopen = () => {
+      void this.streamOutgoingFile(peer, pending);
+    };
+    channel.onerror = () => {
+      this.cancelOutgoingFile(peer, id, new Error('文件通道异常'));
+    };
+    channel.onclose = () => {
+      const current = peer.outgoingFiles.get(id);
+      if (current && !current.finishedSending && !current.cancelled) {
+        this.cancelOutgoingFile(peer, id, new Error('文件通道已关闭'));
+      }
+    };
+  }
+
+  private async streamOutgoingFile(peer: DirectPeer, pending: PendingOutgoingFile): Promise<void> {
+    const channel = pending.channel;
+    if (!channel || channel.readyState !== 'open' || pending.cancelled) {
+      return;
+    }
+    try {
+      await sendFileChunks(channel, pending.file, {
+        ...pending.options,
+        onProgress: (transferredBytes, totalBytes) => {
+          pending.sent = transferredBytes;
+          pending.progress.report(transferredBytes, totalBytes);
+        },
+      });
+      channel.send(JSON.stringify({ type: 'file-done', id: pending.meta.id } satisfies DirectFileDone));
+      pending.finishedSending = true;
+      pending.progress.flush(pending.file.size, pending.file.size);
+    } catch (error) {
+      if (channel.readyState === 'open') {
+        channel.send(JSON.stringify({ type: 'file-cancel', id: pending.meta.id } satisfies DirectFileCancel));
+      }
+      peer.channel?.send(JSON.stringify({ type: 'file-cancel', id: pending.meta.id } satisfies DirectFileCancel));
+      this.cancelOutgoingFile(peer, pending.meta.id, error);
+    }
+  }
+
+  private completeOutgoingFile(peer: DirectPeer, id: string): void {
+    const pending = peer.outgoingFiles.get(id);
+    if (!pending) {
+      return;
+    }
+    pending.channel?.close();
+    peer.outgoingFiles.delete(id);
+    peer.activeSendCount = Math.max(0, peer.activeSendCount - 1);
+    pending.resolve(true);
+  }
+
+  private cancelOutgoingFile(peer: DirectPeer, id: string, error: unknown): void {
+    const pending = peer.outgoingFiles.get(id);
+    if (!pending) {
+      return;
+    }
+    pending.cancelled = true;
+    pending.channel?.close();
+    peer.outgoingFiles.delete(id);
+    peer.activeSendCount = Math.max(0, peer.activeSendCount - 1);
+    pending.reject(error);
+  }
+
+  private async abortIncomingFile(peer: DirectPeer, id: string): Promise<void> {
+    const pending = peer.files.get(id);
+    if (!pending) {
+      return;
+    }
+    peer.files.delete(id);
+    pending.channel?.close();
+    await pending.sink?.abort();
+  }
+
+  private async failIncomingFile(peer: DirectPeer, id: string, error: string): Promise<void> {
+    const pending = peer.files.get(id);
+    if (!pending) {
+      return;
+    }
+    peer.files.delete(id);
+    pending.channel?.close();
+    await pending.sink?.abort();
+    peer.channel?.send(JSON.stringify({ type: 'file-failed', id, error } satisfies DirectFileFailed));
+    this.options.onIncomingFileError?.({
+      id: pending.meta.id,
+      roomId: pending.meta.roomId,
+      peerId: peer.id,
+      fileName: pending.meta.fileName,
+      size: pending.meta.size,
+      transferredBytes: pending.received,
+      direction: 'receive',
+      error,
+    });
+  }
+
   private async finishIncomingFile(peer: DirectPeer, id: string): Promise<void> {
     const pending = peer.files.get(id);
     if (!pending) {
       return;
     }
     peer.files.delete(id);
-    if (peer.activeFileId === id) {
-      peer.activeFileId = null;
-    }
     try {
       await pending.writeChain;
       if (pending.received !== pending.meta.size) {
@@ -464,13 +636,19 @@ export class DirectMesh {
       if (pending.sink) {
         const result = await pending.sink.close();
         this.options.onIncomingFile({ ...pending.meta, url: result.url, savedToDisk: pending.sink.savedToDisk });
+        peer.channel?.send(JSON.stringify({ type: 'file-done', id } satisfies DirectFileDone));
+        pending.channel?.close();
         return;
       }
       const blob = new Blob(pending.chunks, { type: pending.meta.contentType });
       const url = URL.createObjectURL(blob);
       this.options.onIncomingFile({ ...pending.meta, url });
+      peer.channel?.send(JSON.stringify({ type: 'file-done', id } satisfies DirectFileDone));
+      pending.channel?.close();
     } catch {
       await pending.sink?.abort();
+      pending.channel?.close();
+      peer.channel?.send(JSON.stringify({ type: 'file-failed', id, error: '接收文件失败' } satisfies DirectFileFailed));
       this.options.onIncomingFileError?.({
         id: pending.meta.id,
         roomId: pending.meta.roomId,
@@ -520,8 +698,15 @@ export class DirectMesh {
       peer.reconnectTimerId = undefined;
     }
     for (const pending of peer.files.values()) {
+      pending.channel?.close();
       void pending.sink?.abort();
     }
+    for (const pending of peer.outgoingFiles.values()) {
+      pending.channel?.close();
+      pending.reject(new DOMException('Peer connection closed', 'AbortError'));
+    }
+    peer.files.clear();
+    peer.outgoingFiles.clear();
     peer.channel?.close();
     peer.pc.close();
     this.peers.delete(peerId);
@@ -538,7 +723,7 @@ export class DirectMesh {
       if (!peer) {
         return;
       }
-      if (peer.activeFileId || peer.activeSendCount > 0) {
+      if (peer.files.size > 0 || peer.outgoingFiles.size > 0 || peer.activeSendCount > 0) {
         this.schedulePeerClose(peerId);
         return;
       }
