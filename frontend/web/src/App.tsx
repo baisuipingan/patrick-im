@@ -1022,6 +1022,7 @@ export default function App() {
       return true;
     } catch (error) {
       const aborted = controller.signal.aborted;
+      const directError = errorMessage(error, '直连传输失败');
       setTransfers((current) => ({
         ...current,
         [transferId]: {
@@ -1029,7 +1030,7 @@ export default function App() {
           transport: aborted ? current[transferId]?.transport : 'server',
           transferredBytes: aborted ? current[transferId]?.transferredBytes ?? 0 : 0,
           status: aborted ? 'cancelled' : 'queued',
-          error: aborted ? '已取消' : '直连传输失败',
+          error: aborted ? '已取消' : directError,
           updatedAt: Date.now(),
         },
       }));
@@ -2364,6 +2365,10 @@ function isAbortError(error: unknown): boolean {
 
 function isCancelledTransferError(error: unknown): boolean {
   return error instanceof Error && error.message === TRANSFER_CANCELLED_MESSAGE;
+}
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
 }
 
 function delay(ms: number): Promise<void> {
