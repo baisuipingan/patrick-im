@@ -100,4 +100,67 @@ INSERT INTO relay_file_records (
 	if rows[1].StoragePath == nil || *rows[1].StoragePath != wantPath {
 		t.Fatalf("storage path = %v, want %s", rows[1].StoragePath, wantPath)
 	}
+
+	var migrated []SchemaMigrationRecord
+	if err := db.Order("version").Find(&migrated).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(migrated) != 3 {
+		t.Fatalf("schema migrations = %#v", migrated)
+	}
+	var v2Messages []MessageV2Record
+	if err := db.Order("created_at").Find(&v2Messages).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(v2Messages) != 2 || v2Messages[0].ConversationID != "room:room-a" || v2Messages[1].Type != "file" {
+		t.Fatalf("v2 messages = %#v", v2Messages)
+	}
+	var attachments []AttachmentRecord
+	if err := db.Find(&attachments).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(attachments) != 1 || attachments[0].ID != "file-1" || attachments[0].StoragePath == nil {
+		t.Fatalf("attachments = %#v", attachments)
+	}
+}
+
+func TestOpenSQLiteCreatesV2SchemaIdempotently(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "patrick-im.sqlite")
+
+	db, err := OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !db.Migrator().HasTable(&SchemaMigrationRecord{}) ||
+		!db.Migrator().HasTable(&UserRecord{}) ||
+		!db.Migrator().HasTable(&ConversationRecord{}) ||
+		!db.Migrator().HasTable(&ReadStateRecord{}) {
+		t.Fatal("missing v2 tables")
+	}
+	var count int64
+	if err := db.Model(&SchemaMigrationRecord{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("migration count = %d", count)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = OpenSQLite(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Model(&SchemaMigrationRecord{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("migration count after reopen = %d", count)
+	}
 }

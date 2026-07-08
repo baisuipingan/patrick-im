@@ -8,6 +8,8 @@ import (
 	"strings"
 )
 
+const DefaultUploadLimitBytes int64 = 100 * 1024 * 1024 * 1024
+
 type Config struct {
 	Bind               string
 	LogLevel           string
@@ -45,7 +47,7 @@ func FromEnv() (Config, error) {
 		SessionSecret:      sessionSecret,
 		SecureCookies:      envBoolOr("PATRICK_IM_SECURE_COOKIES", strings.HasPrefix(publicBaseURL, "https://")),
 		RecentMessageLimit: envIntOr("PATRICK_IM_RECENT_MESSAGE_LIMIT", 80),
-		UploadLimitBytes:   envInt64Or("PATRICK_IM_UPLOAD_LIMIT_BYTES", 256*1024*1024),
+		UploadLimitBytes:   envInt64Or("PATRICK_IM_UPLOAD_LIMIT_BYTES", DefaultUploadLimitBytes),
 	}, nil
 }
 
