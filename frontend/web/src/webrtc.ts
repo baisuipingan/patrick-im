@@ -318,6 +318,22 @@ export class DirectMesh {
     });
   }
 
+  cancelTransfer(id: string): boolean {
+    for (const peer of this.peers.values()) {
+      if (peer.outgoingFiles.has(id)) {
+        this.notifyTransferCancel(peer, id);
+        this.cancelOutgoingFile(peer, id, new DOMException('Transfer cancelled', 'AbortError'));
+        return true;
+      }
+      if (peer.files.has(id)) {
+        this.notifyTransferCancel(peer, id);
+        void this.abortIncomingFile(peer, id);
+        return true;
+      }
+    }
+    return false;
+  }
+
   close(): void {
     this.closed = true;
     for (const peerId of [...this.peers.keys()]) {
@@ -680,6 +696,17 @@ export class DirectMesh {
     peer.outgoingFiles.delete(id);
     peer.activeSendCount = Math.max(0, peer.activeSendCount - 1);
     pending.reject(error);
+  }
+
+  private notifyTransferCancel(peer: DirectPeer, id: string): void {
+    const message = JSON.stringify({ type: 'file-cancel', id } satisfies DirectFileCancel);
+    const outgoing = peer.outgoingFiles.get(id);
+    if (outgoing?.channel?.readyState === 'open') {
+      outgoing.channel.send(message);
+    }
+    if (peer.channel?.readyState === 'open') {
+      peer.channel.send(message);
+    }
   }
 
   private setOutgoingTimeout(peer: DirectPeer, pending: PendingOutgoingFile, timeoutMs: number, message: string): void {

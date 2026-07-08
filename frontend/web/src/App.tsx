@@ -1314,6 +1314,7 @@ export default function App() {
     cancelledTransfersRef.current[id] = true;
     uploadXhrsRef.current[id]?.abort();
     transferAbortControllersRef.current[id]?.abort();
+    directMeshRef.current?.cancelTransfer(id);
     setTransfers((current) => {
       const row = current[id];
       if (!row || row.status === 'done' || row.status === 'failed') {

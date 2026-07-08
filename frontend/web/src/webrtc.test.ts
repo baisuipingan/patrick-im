@@ -291,6 +291,20 @@ describe('DirectMesh direct file transfer', () => {
     }
   });
 
+  it('cancels outgoing files and notifies the receiver', async () => {
+    const mesh = createMesh();
+    mesh.setPeers([createPeer()]);
+    const control = peerConnectionInstances[0].channels[0];
+    control.readyState = 'open';
+
+    const result = mesh.sendFile('a-remote', testFile('cancel.txt', 'hello', 'text/plain'), { transferId: 'cancel-1' });
+    const rejection = expect(result).rejects.toThrow('Transfer cancelled');
+
+    expect(mesh.cancelTransfer('cancel-1')).toBe(true);
+    expect(control.sent.map((item) => JSON.parse(String(item)).type)).toContain('file-cancel');
+    await rejection;
+  });
+
   it('prepares an incoming file, writes chunks, emits the received file, and sends completion ack', async () => {
     const onIncomingFile = vi.fn();
     const writes: ArrayBuffer[] = [];
@@ -341,5 +355,42 @@ describe('DirectMesh direct file transfer', () => {
       savedToDisk: true,
     }));
     expect(control.sent.map((item) => JSON.parse(String(item)).type)).toContain('file-done');
+  });
+
+  it('cancels incoming files, aborts the sink, and notifies the sender', async () => {
+    const abort = vi.fn(async () => undefined);
+    const mesh = createMesh({
+      selfId: 'a-local',
+      createIncomingFileSink: vi.fn(async () => ({
+        savedToDisk: true,
+        write: async () => undefined,
+        close: async () => ({}),
+        abort,
+      })),
+    });
+    await mesh.handleSignal('z-remote', { description: { type: 'offer', sdp: 'offer' } });
+    const pc = peerConnectionInstances[0];
+    const control = new MockDataChannel('control');
+    pc.emitRemoteChannel(control);
+    control.open();
+    control.receive(JSON.stringify({
+      type: 'file-meta',
+      id: 'incoming-cancel',
+      roomId: 'room-1',
+      senderId: 'z-remote',
+      senderName: 'Remote',
+      targetId: 'a-local',
+      fileName: 'incoming.txt',
+      size: 5,
+      contentType: 'text/plain',
+      createdAt: 1,
+    }));
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+    expect(mesh.cancelTransfer('incoming-cancel')).toBe(true);
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+    expect(abort).toHaveBeenCalled();
+    expect(control.sent.map((item) => JSON.parse(String(item)).type)).toContain('file-cancel');
   });
 });
