@@ -103,6 +103,8 @@ interface RetryableTransfer {
   messageType?: 'txt_file';
 }
 
+type PendingWebRTCSignal = Envelope<WebRTCSignalPayload>;
+
 interface SaveFilePicker {
   createWritable: () => Promise<FileSystemWritableFileStream>;
 }
@@ -116,6 +118,7 @@ const LAST_ROOM_KEY = 'patrick-im:last-room';
 const RECENT_ROOMS_KEY = 'patrick-im:recent-rooms';
 const DIRECT_CONNECT_WAIT_MS = 10000;
 const TRANSFER_CANCELLED_MESSAGE = '已取消';
+const MAX_PENDING_WEBRTC_SIGNALS = 200;
 
 const EMPTY_RECEIVE_DIRECTORY: StoredDirectoryState = {
   handle: null,
@@ -222,6 +225,7 @@ export default function App() {
   const uploadXhrsRef = useRef<Record<string, XMLHttpRequest>>({});
   const wsRef = useRef<WebSocket | null>(null);
   const directMeshRef = useRef<DirectMesh | null>(null);
+  const pendingWebRTCSignalsRef = useRef<PendingWebRTCSignal[]>([]);
   const pausedTransfersRef = useRef<Record<string, boolean>>({});
   const transferAbortControllersRef = useRef<Record<string, AbortController>>({});
   const retryableTransfersRef = useRef<Record<string, RetryableTransfer>>({});
@@ -355,7 +359,10 @@ export default function App() {
     const token = encodeURIComponent(session.sessionToken ?? '');
     const ws = new WebSocket(buildWsUrl(`/api/rooms/${encodeURIComponent(activeRoom)}/ws?token=${token}`), ['patrick-im']);
     wsRef.current = ws;
-    ws.onopen = () => setConnectionState('online');
+    ws.onopen = () => {
+      setConnectionState('online');
+      flushPendingWebRTCSignals(ws);
+    };
     ws.onerror = () => setConnectionState('error');
     ws.onclose = () => {
       if (wsRef.current === ws) {
@@ -370,6 +377,7 @@ export default function App() {
       if (wsRef.current === ws) {
         wsRef.current = null;
       }
+      pendingWebRTCSignalsRef.current = pendingWebRTCSignalsRef.current.filter((item) => item.room_id !== activeRoom);
       ws.close();
     };
   }, [activeRoom, session]);
@@ -521,10 +529,6 @@ export default function App() {
   }
 
   function sendWebRTCSignal(targetId: string, signal: SignalEnvelope) {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      return;
-    }
     const envelope: Envelope<WebRTCSignalPayload> = {
       type: webRTCSignalType(signal),
       request_id: newLocalId('webrtc'),
@@ -533,7 +537,29 @@ export default function App() {
       payload: { targetId, signal },
       created_at: Date.now(),
     };
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      pendingWebRTCSignalsRef.current = [...pendingWebRTCSignalsRef.current, envelope].slice(-MAX_PENDING_WEBRTC_SIGNALS);
+      return;
+    }
     ws.send(JSON.stringify(envelope));
+  }
+
+  function flushPendingWebRTCSignals(ws = wsRef.current) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    const pending = pendingWebRTCSignalsRef.current;
+    if (pending.length === 0) {
+      return;
+    }
+    pendingWebRTCSignalsRef.current = [];
+    for (const envelope of pending) {
+      if (envelope.room_id !== activeRoom) {
+        continue;
+      }
+      ws.send(JSON.stringify(envelope));
+    }
   }
 
   function updateIncomingDirectProgress(progress: DirectFileProgress) {
@@ -2347,11 +2373,11 @@ function transferETA(row: TransferRow, speed: number): string {
 function directStateLabel(state: DirectState): string {
   switch (state) {
     case 'direct':
-      return '直连';
+      return '已直连';
     case 'connecting':
-      return '直连中';
+      return '建立中';
     default:
-      return '直连离线';
+      return '未直连';
   }
 }
 
