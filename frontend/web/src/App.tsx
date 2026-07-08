@@ -64,7 +64,6 @@ import { buildWsUrl, cn, formatBytes, formatClock } from './lib/utils';
 import {
   DirectMesh,
   type DirectFileProgress,
-  type DirectPeerSnapshot,
   type DirectState,
   type IncomingDirectFile,
   type IncomingDirectFileSink,
@@ -217,7 +216,6 @@ export default function App() {
   const [transfers, setTransfers] = useState<Record<string, TransferRow>>({});
   const [peers, setPeers] = useState<Peer[]>([]);
   const [directStates, setDirectStates] = useState<Record<string, DirectState>>({});
-  const [directSnapshots, setDirectSnapshots] = useState<Record<string, DirectPeerSnapshot>>({});
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
   const [notice, setNotice] = useState<Notice>({ tone: 'info', text: '准备就绪' });
   const [nicknameDraft, setNicknameDraft] = useState(() => readLocalStorage(NICKNAME_KEY));
@@ -403,9 +401,6 @@ export default function App() {
       onStateChange: (peerId, state) => {
         setDirectStates((current) => ({ ...current, [peerId]: state }));
       },
-      onPeerSnapshot: (peerId, snapshot) => {
-        setDirectSnapshots((current) => ({ ...current, [peerId]: snapshot }));
-      },
       onIncomingFileStart: updateIncomingDirectProgress,
       onIncomingFileProgress: updateIncomingDirectProgress,
       onIncomingFileError: markIncomingDirectFileFailed,
@@ -416,7 +411,6 @@ export default function App() {
     });
     directMeshRef.current?.close();
     setDirectStates({});
-    setDirectSnapshots({});
     directMeshRef.current = mesh;
     mesh.setPeers(peers);
     return () => {
@@ -1689,7 +1683,6 @@ export default function App() {
           room={roomDetail}
           selfId={session?.clientId ?? ''}
           directStates={directStates}
-          directSnapshots={directSnapshots}
           onOpenDirect={(peerId) => void openDirectConversation(peerId)}
         />
         <TransferPanel
@@ -2077,13 +2070,11 @@ function RoomDetails({
   room,
   selfId,
   directStates,
-  directSnapshots,
   onOpenDirect,
 }: {
   room: RoomDetail | null;
   selfId: string;
   directStates: Record<string, DirectState>;
-  directSnapshots: Record<string, DirectPeerSnapshot>;
   onOpenDirect: (peerId: string) => void;
 }) {
   const members = room?.members ?? [];
@@ -2101,7 +2092,6 @@ function RoomDetails({
             member={member}
             selfId={selfId}
             directState={directStates[member.userId]}
-            directSnapshot={directSnapshots[member.userId]}
             onOpenDirect={onOpenDirect}
           />
         ))}
@@ -2114,13 +2104,11 @@ function MemberRow({
   member,
   selfId,
   directState,
-  directSnapshot,
   onOpenDirect,
 }: {
   member: RoomMemberView;
   selfId: string;
   directState?: DirectState;
-  directSnapshot?: DirectPeerSnapshot;
   onOpenDirect: (peerId: string) => void;
 }) {
   const isSelf = member.userId === selfId;
@@ -2132,7 +2120,6 @@ function MemberRow({
         <small>
           {member.online ? '在线' : `最后活跃 ${formatClock(member.lastSeenAt)}`}
           {directState ? ` · ${directStateLabel(directState)}` : ''}
-          {directSnapshot ? ` · ${directSnapshotLabel(directSnapshot)}` : ''}
         </small>
       </span>
       {!isSelf ? (
@@ -2409,28 +2396,6 @@ function directStateLabel(state: DirectState): string {
     default:
       return '未直连';
   }
-}
-
-function directSnapshotLabel(snapshot: DirectPeerSnapshot): string {
-  const path = snapshot.path ? directPathLabel(snapshot.path) : '';
-  if (snapshot.state === 'direct') {
-    return [snapshot.channelState === 'open' ? 'DC open' : `DC ${snapshot.channelState ?? 'pending'}`, path]
-      .filter(Boolean)
-      .join(' / ');
-  }
-  const parts = [`ICE ${snapshot.iceConnectionState}`, `PC ${snapshot.connectionState}`];
-  if (snapshot.reconnectAttempts > 0) {
-    parts.push(`重试 ${snapshot.reconnectAttempts}`);
-  }
-  if (path) {
-    parts.push(path);
-  }
-  return parts.slice(0, 3).join(' / ');
-}
-
-function directPathLabel(path: NonNullable<DirectPeerSnapshot['path']>): string {
-  const kind = path.kind === 'lan' ? 'LAN' : path.kind === 'turn' ? 'TURN' : path.kind === 'stun' ? 'STUN' : '路径未知';
-  return path.roundTripTimeMs ? `${kind} ${path.roundTripTimeMs}ms` : kind;
 }
 
 function connectionLabel(state: ConnectionState): string {

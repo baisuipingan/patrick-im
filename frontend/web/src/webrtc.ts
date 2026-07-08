@@ -99,6 +99,7 @@ interface DirectPeer {
   isSettingRemoteAnswerPending: boolean;
   reconnectTimerId?: number;
   reconnectAttempts: number;
+  controlOpenTimerId?: number;
   pathInfo?: DirectPathInfo | null;
   pathInfoKey?: string;
   pathPollTimerId?: number;
@@ -176,6 +177,7 @@ const PROGRESS_INTERVAL_MS = 150;
 const PEER_REAP_GRACE_MS = 8000;
 const PEER_RECONNECT_DELAY_MS = 1200;
 const MAX_PEER_RECONNECT_ATTEMPTS = 3;
+const CONTROL_CHANNEL_OPEN_TIMEOUT_MS = 3000;
 const PATH_POLL_INTERVAL_MS = 2000;
 const OUTGOING_ACCEPT_TIMEOUT_MS = 30_000;
 const OUTGOING_COMPLETE_TIMEOUT_MS = 10 * 60_000;
@@ -391,8 +393,8 @@ export class DirectMesh {
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
       if (state === 'connected') {
-        directPeer.reconnectAttempts = 0;
         this.startPathPolling(directPeer);
+        this.scheduleControlOpenCheck(directPeer);
         this.emitPeerState(directPeer, directPeer.channel?.readyState === 'open' ? 'direct' : 'connecting', 'pc_connected');
       } else if (state === 'failed') {
         this.stopPathPolling(directPeer);
@@ -416,6 +418,9 @@ export class DirectMesh {
         this.emitPeerState(directPeer, 'offline', 'ice_failed');
         this.scheduleReconnect(directPeer);
       } else {
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+          this.scheduleControlOpenCheck(directPeer);
+        }
         this.emitPeerState(directPeer, directPeer.channel?.readyState === 'open' ? 'direct' : 'connecting', `ice_${pc.iceConnectionState}`);
       }
     };
@@ -470,15 +475,20 @@ export class DirectMesh {
     channel.binaryType = 'arraybuffer';
     channel.bufferedAmountLowThreshold = LOW_WATER_MARK;
     channel.onopen = () => {
+      this.clearControlOpenCheck(peer);
+      peer.reconnectAttempts = 0;
       this.startPathPolling(peer);
       this.emitPeerState(peer, 'direct', 'control_open');
     };
     channel.onclose = () => {
+      this.clearControlOpenCheck(peer);
       this.stopPathPolling(peer);
       this.publishPathInfo(peer, null);
       this.emitPeerState(peer, 'offline', 'control_closed');
+      this.scheduleReconnect(peer);
     };
     channel.onerror = () => {
+      this.clearControlOpenCheck(peer);
       this.stopPathPolling(peer);
       this.emitPeerState(peer, 'offline', 'control_error');
       this.scheduleReconnect(peer);
@@ -814,11 +824,38 @@ export class DirectMesh {
     peer.reconnectTimerId = window.setTimeout(() => {
       peer.reconnectTimerId = undefined;
       const current = this.peers.get(peer.id);
-      if (!current || current !== peer || current.pc.connectionState === 'connected') {
+      if (!current || current !== peer || this.isPeerDirect(current)) {
         return;
       }
       this.recreatePeer(peer);
     }, PEER_RECONNECT_DELAY_MS);
+  }
+
+  private scheduleControlOpenCheck(peer: DirectPeer): void {
+    if (this.closed || peer.controlOpenTimerId || this.isPeerDirect(peer) || peer.reconnectAttempts >= MAX_PEER_RECONNECT_ATTEMPTS) {
+      return;
+    }
+    peer.controlOpenTimerId = window.setTimeout(() => {
+      peer.controlOpenTimerId = undefined;
+      const current = this.peers.get(peer.id);
+      if (!current || current !== peer || this.isPeerDirect(current)) {
+        return;
+      }
+      this.emitPeerState(peer, 'connecting', 'control_open_timeout');
+      this.recreatePeer(peer);
+    }, CONTROL_CHANNEL_OPEN_TIMEOUT_MS);
+  }
+
+  private clearControlOpenCheck(peer: DirectPeer): void {
+    if (!peer.controlOpenTimerId) {
+      return;
+    }
+    window.clearTimeout(peer.controlOpenTimerId);
+    peer.controlOpenTimerId = undefined;
+  }
+
+  private isPeerDirect(peer: DirectPeer): boolean {
+    return peer.pc.connectionState === 'connected' && peer.channel?.readyState === 'open';
   }
 
   private startPathPolling(peer: DirectPeer): void {
@@ -904,6 +941,7 @@ export class DirectMesh {
       window.clearTimeout(peer.reconnectTimerId);
       peer.reconnectTimerId = undefined;
     }
+    this.clearControlOpenCheck(peer);
     for (const pending of peer.files.values()) {
       pending.channel?.close();
       void pending.sink?.abort();

@@ -198,6 +198,51 @@ describe('DirectMesh WebRTC negotiation', () => {
     }));
   });
 
+  it('recreates the peer when the connection succeeds but the control channel never opens', async () => {
+    vi.useFakeTimers();
+    try {
+      const onStateChange = vi.fn();
+      const mesh = createMesh({ onStateChange });
+
+      mesh.setPeers([createPeer()]);
+      const pc = peerConnectionInstances[0];
+      expect(pc.channels[0]?.label).toBe('patrick-im-file');
+
+      pc.connectionState = 'connected';
+      pc.onconnectionstatechange?.();
+      await vi.advanceTimersByTimeAsync(3000);
+
+      expect(peerConnectionInstances).toHaveLength(2);
+      expect(peerConnectionInstances[0].connectionState).toBe('closed');
+      expect(peerConnectionInstances[1].channels[0]?.label).toBe('patrick-im-file');
+      expect(onStateChange).toHaveBeenCalledWith('a-remote', 'connecting');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not recreate the peer after the control channel opens', async () => {
+    vi.useFakeTimers();
+    try {
+      const onStateChange = vi.fn();
+      const mesh = createMesh({ onStateChange });
+
+      mesh.setPeers([createPeer()]);
+      const pc = peerConnectionInstances[0];
+      const control = pc.channels[0];
+
+      pc.connectionState = 'connected';
+      pc.onconnectionstatechange?.();
+      control.open();
+      await vi.advanceTimersByTimeAsync(3000);
+
+      expect(peerConnectionInstances).toHaveLength(1);
+      expect(onStateChange).toHaveBeenCalledWith('a-remote', 'direct');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('queues remote ICE candidates until the offer arrives, then answers and flushes candidates', async () => {
     const sendSignal = vi.fn<(targetId: string, payload: SignalEnvelope) => void>();
     const mesh = createMesh({ selfId: 'a-local', sendSignal });
