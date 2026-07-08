@@ -61,6 +61,7 @@ func Router(api *API) *gin.Engine {
 	r.POST("/api/rooms/:room_id/conversations/direct", api.createDirectConversation)
 	r.GET("/api/conversations/:conversation_id/messages", api.listConversationMessages)
 	r.POST("/api/conversations/:conversation_id/messages", api.createConversationMessage)
+	r.DELETE("/api/conversations/:conversation_id", api.deleteConversation)
 	r.DELETE("/api/conversations/:conversation_id/messages", api.clearConversationMessages)
 	r.POST("/api/conversations/:conversation_id/attachments", api.createConversationAttachment)
 	r.POST("/api/conversations/:conversation_id/read", api.markConversationRead)
@@ -327,6 +328,34 @@ func (api *API) clearConversationMessages(c *gin.Context) {
 			ConversationID: response.ConversationID,
 			ActorID:        payload.ClientID,
 			Removed:        response.Removed,
+			Deleted:        response.Deleted,
+		},
+		util.NowMillisInt64(),
+	))
+	c.JSON(http.StatusOK, response)
+}
+
+func (api *API) deleteConversation(c *gin.Context) {
+	payload, ok := api.requireSession(c)
+	if !ok {
+		return
+	}
+	response, files, err := api.store.DeleteConversation(c.Request.Context(), c.Param("conversation_id"), payload)
+	if err != nil {
+		api.handleStoreError(c, err)
+		return
+	}
+	api.store.DeleteFiles(files)
+	api.hub.Publish(response.RoomID, recipientsForConversationID(response.ConversationID), protocol.NewEnvelope(
+		"conversation_cleared",
+		"",
+		response.RoomID,
+		response.ConversationID,
+		protocol.ConversationClearedPayload{
+			ConversationID: response.ConversationID,
+			ActorID:        payload.ClientID,
+			Removed:        response.Removed,
+			Deleted:        response.Deleted,
 		},
 		util.NowMillisInt64(),
 	))

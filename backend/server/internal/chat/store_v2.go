@@ -306,11 +306,24 @@ func (s *Store) ClearConversation(ctx context.Context, conversationID string, ac
 	if err != nil {
 		return protocol.ClearConversationResponse{}, nil, err
 	}
+	return s.deleteConversationContent(ctx, conversation, false)
+}
+
+func (s *Store) DeleteConversation(ctx context.Context, conversationID string, actor session.Payload) (protocol.ClearConversationResponse, []string, error) {
+	conversation, err := s.visibleConversation(ctx, conversationID, actor.ClientID)
+	if err != nil {
+		return protocol.ClearConversationResponse{}, nil, err
+	}
+	deleteConversation := conversation.Type != conversationTypeRoom
+	return s.deleteConversationContent(ctx, conversation, deleteConversation)
+}
+
+func (s *Store) deleteConversationContent(ctx context.Context, conversation repository.ConversationRecord, deleteConversation bool) (protocol.ClearConversationResponse, []string, error) {
 	var messages []repository.MessageV2Record
 	var attachments []repository.AttachmentRecord
 	var legacyRows []repository.MessageRecord
 	now := util.NowMillisInt64()
-	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("conversation_id = ?", conversation.ID).Find(&messages).Error; err != nil {
 			return err
 		}
@@ -338,6 +351,9 @@ func (s *Store) ClearConversation(ctx context.Context, conversationID string, ac
 		if err := tx.Where("conversation_id = ?", conversation.ID).Delete(&repository.ReadStateRecord{}).Error; err != nil {
 			return err
 		}
+		if deleteConversation {
+			return tx.Where("id = ?", conversation.ID).Delete(&repository.ConversationRecord{}).Error
+		}
 		return tx.Model(&repository.ConversationRecord{}).Where("id = ?", conversation.ID).Updates(map[string]any{
 			"last_message_id":   nil,
 			"last_message_text": nil,
@@ -353,6 +369,7 @@ func (s *Store) ClearConversation(ctx context.Context, conversationID string, ac
 		ConversationID: conversation.ID,
 		RoomID:         conversation.RoomID,
 		Removed:        len(messages),
+		Deleted:        deleteConversation,
 	}, paths, nil
 }
 

@@ -433,6 +433,94 @@ func TestV2DirectConversationStaysVisibleAfterRoomRefresh(t *testing.T) {
 	assertRoomHasConversation(t, router, bobCookie, "room-a", direct.ID)
 }
 
+func TestV2DeleteDirectConversationRemovesMessagesAndAttachment(t *testing.T) {
+	router := newTestRouter(t)
+	aliceCookie := signedSessionCookie(t, "alice", "Alice")
+	bobCookie := signedSessionCookie(t, "bob", "Bob")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/rooms", strings.NewReader(`{"roomId":"room-a"}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(aliceCookie)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("alice join status = %d body=%s", w.Code, w.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/rooms", strings.NewReader(`{"roomId":"room-a"}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(bobCookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("bob join status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/rooms/room-a/conversations/direct", strings.NewReader(`{"peerUserId":"bob"}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(aliceCookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create direct status = %d body=%s", w.Code, w.Body.String())
+	}
+	var direct protocol.ConversationView
+	if err := json.Unmarshal(w.Body.Bytes(), &direct); err != nil {
+		t.Fatal(err)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/api/conversations/"+direct.ID+"/messages", strings.NewReader(`{"text":"secret"}`))
+	req.Header.Set("content-type", "application/json")
+	req.AddCookie(aliceCookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("message status = %d body=%s", w.Code, w.Body.String())
+	}
+
+	body, contentType := multipartUpload(t, "secret.txt", "private file", "")
+	req = httptest.NewRequest(http.MethodPost, "/api/conversations/"+direct.ID+"/attachments", &body)
+	req.Header.Set("content-type", contentType)
+	req.AddCookie(aliceCookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("attachment status = %d body=%s", w.Code, w.Body.String())
+	}
+	var uploaded protocol.MessageView
+	if err := json.Unmarshal(w.Body.Bytes(), &uploaded); err != nil {
+		t.Fatal(err)
+	}
+	if uploaded.Attachment == nil {
+		t.Fatalf("uploaded attachment missing: %#v", uploaded)
+	}
+
+	req = httptest.NewRequest(http.MethodDelete, "/api/conversations/"+direct.ID, nil)
+	req.AddCookie(aliceCookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete status = %d body=%s", w.Code, w.Body.String())
+	}
+	var deleted protocol.ClearConversationResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &deleted); err != nil {
+		t.Fatal(err)
+	}
+	if !deleted.Deleted || deleted.Removed != 2 || deleted.ConversationID != direct.ID {
+		t.Fatalf("deleted = %#v", deleted)
+	}
+
+	assertRoomMissingConversation(t, router, aliceCookie, "room-a", direct.ID)
+	assertRoomMissingConversation(t, router, bobCookie, "room-a", direct.ID)
+
+	req = httptest.NewRequest(http.MethodGet, "/api/attachments/"+uploaded.Attachment.ID, nil)
+	req.AddCookie(aliceCookie)
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("attachment status = %d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestV2AttachmentTooLargeReturns413(t *testing.T) {
 	router := newTestRouter(t)
 	cookie := sessionCookie(t, router)
@@ -853,6 +941,27 @@ func readUntilEnvelopeType(t *testing.T, conn *websocket.Conn, eventType string)
 
 func assertRoomHasConversation(t *testing.T, router http.Handler, cookie *http.Cookie, roomID, conversationID string) {
 	t.Helper()
+	room := fetchRoomDetail(t, router, cookie, roomID)
+	for _, conversation := range room.Conversations {
+		if conversation.ID == conversationID {
+			return
+		}
+	}
+	t.Fatalf("conversation %q not in room detail: %#v", conversationID, room.Conversations)
+}
+
+func assertRoomMissingConversation(t *testing.T, router http.Handler, cookie *http.Cookie, roomID, conversationID string) {
+	t.Helper()
+	room := fetchRoomDetail(t, router, cookie, roomID)
+	for _, conversation := range room.Conversations {
+		if conversation.ID == conversationID {
+			t.Fatalf("conversation %q still in room detail: %#v", conversationID, room.Conversations)
+		}
+	}
+}
+
+func fetchRoomDetail(t *testing.T, router http.Handler, cookie *http.Cookie, roomID string) protocol.RoomDetail {
+	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/api/rooms/"+roomID, nil)
 	req.AddCookie(cookie)
 	w := httptest.NewRecorder()
@@ -864,12 +973,7 @@ func assertRoomHasConversation(t *testing.T, router http.Handler, cookie *http.C
 	if err := json.Unmarshal(w.Body.Bytes(), &room); err != nil {
 		t.Fatal(err)
 	}
-	for _, conversation := range room.Conversations {
-		if conversation.ID == conversationID {
-			return
-		}
-	}
-	t.Fatalf("conversation %q not in room detail: %#v", conversationID, room.Conversations)
+	return room
 }
 
 func drainEvents(events <-chan any) {

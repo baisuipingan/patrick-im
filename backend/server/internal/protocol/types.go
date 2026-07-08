@@ -113,6 +113,7 @@ type ClearConversationResponse struct {
 	ConversationID string `json:"conversationId"`
 	RoomID         string `json:"roomId"`
 	Removed        int    `json:"removed"`
+	Deleted        bool   `json:"deleted"`
 }
 
 type UserView struct {
@@ -231,6 +232,7 @@ type ConversationClearedPayload struct {
 	ConversationID string `json:"conversationId"`
 	ActorID        string `json:"actorId"`
 	Removed        int    `json:"removed"`
+	Deleted        bool   `json:"deleted"`
 }
 
 type RoomUpdatedPayload struct {

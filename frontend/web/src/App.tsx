@@ -211,6 +211,7 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [receiveDirectory, setReceiveDirectory] = useState<StoredDirectoryState>(EMPTY_RECEIVE_DIRECTORY);
+  const [clearingConversationId, setClearingConversationId] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1236,27 +1237,36 @@ export default function App() {
     if (!activeConversation) {
       return;
     }
-    const confirmed = window.confirm(`清空「${activeConversation.title}」的聊天记录？`);
+    const confirmed = window.confirm(`删除「${activeConversation.title}」及其中所有文字和文件？`);
     if (!confirmed) {
       return;
     }
+    const conversationId = activeConversation.id;
+    setClearingConversationId(conversationId);
     try {
-      const response = await apiJSON<{ conversationId: string; removed: number }>(
-        `/api/conversations/${encodeURIComponent(activeConversation.id)}/messages`,
+      const response = await apiJSON<{ conversationId: string; removed: number; deleted: boolean }>(
+        `/api/conversations/${encodeURIComponent(conversationId)}`,
         { method: 'DELETE' },
       );
-      const conversationId = response.conversationId || activeConversation.id;
-      clearConversationLocally(conversationId);
-      await loadMessages(conversationId);
+      deleteConversationLocally(response.conversationId || conversationId, response.deleted);
+      if (!response.deleted) {
+        await loadMessages(response.conversationId || conversationId);
+      }
       await refreshRoomDetail();
       await refreshRooms();
-      setNotice({ tone: 'success', text: `已清空 ${response.removed} 条消息` });
+      setNotice({ tone: 'success', text: response.deleted ? '会话已删除' : `已删除 ${response.removed} 条消息` });
     } catch (error) {
-      setNotice({ tone: 'error', text: error instanceof Error ? error.message : '清空失败' });
+      setNotice({ tone: 'error', text: error instanceof Error ? error.message : '删除失败' });
+    } finally {
+      setClearingConversationId((current) => (current === conversationId ? null : current));
     }
   }
 
   function clearConversationLocally(conversationId: string) {
+    deleteConversationLocally(conversationId, false);
+  }
+
+  function deleteConversationLocally(conversationId: string, deleted: boolean) {
     clearedConversationsRef.current[conversationId] = Date.now();
     for (const [id, row] of Object.entries(transfersRef.current)) {
       if (row.conversationId !== conversationId) {
@@ -1269,21 +1279,34 @@ export default function App() {
       delete pausedTransfersRef.current[id];
       delete retryableTransfersRef.current[id];
     }
-    setMessagesByConversation((current) => ({ ...current, [conversationId]: [] }));
-    setTransfers((current) => {
-      const next = Object.fromEntries(Object.entries(current).filter(([, row]) => row.conversationId !== conversationId));
-      transfersRef.current = next;
+    setMessagesByConversation((current) => {
+      if (!deleted) {
+        return { ...current, [conversationId]: [] };
+      }
+      const next = { ...current };
+      delete next[conversationId];
       return next;
     });
-    setConversations((current) => {
-      const next = current.map((item) =>
-        item.id === conversationId
-          ? { ...item, lastMessageId: undefined, lastMessageText: undefined, lastMessageAt: 0, unreadCount: 0 }
-          : item,
-      );
-      conversationsRef.current = next;
-      return next;
-    });
+    const nextTransfers = Object.fromEntries(
+      Object.entries(transfersRef.current).filter(([, row]) => row.conversationId !== conversationId),
+    );
+    transfersRef.current = nextTransfers;
+    setTransfers(nextTransfers);
+
+    const nextConversations = deleted
+      ? conversationsRef.current.filter((item) => item.id !== conversationId)
+      : conversationsRef.current.map((item) =>
+          item.id === conversationId
+            ? { ...item, lastMessageId: undefined, lastMessageText: undefined, lastMessageAt: 0, unreadCount: 0 }
+            : item,
+        );
+    conversationsRef.current = nextConversations;
+    setConversations(nextConversations);
+    if (deleted && activeConversationIdRef.current === conversationId) {
+      const nextActive = nextConversations[0]?.id ?? '';
+      activeConversationIdRef.current = nextActive;
+      setActiveConversationId(nextActive);
+    }
   }
 
   async function chooseReceiveDirectory() {
@@ -1409,7 +1432,7 @@ export default function App() {
       case 'conversation_cleared': {
         const envelope = payload as Envelope<ConversationClearedPayload>;
         if (envelope.payload?.conversationId) {
-          clearConversationLocally(envelope.payload.conversationId);
+          deleteConversationLocally(envelope.payload.conversationId, envelope.payload.deleted);
           void refreshRoomDetail();
           void refreshRooms();
         }
@@ -1476,6 +1499,7 @@ export default function App() {
           nicknameDraft={nicknameDraft}
           onMenu={() => setSidebarOpen(true)}
           onClearConversation={() => void clearActiveConversation()}
+          isClearingConversation={clearingConversationId === activeConversation?.id}
           onNicknameChange={setNicknameDraft}
           onRefresh={() => void refreshRoomDetail()}
           onSaveNickname={() => void saveNickname()}
@@ -1695,6 +1719,7 @@ function ChatHeader(props: {
   activeConversation?: ConversationView;
   activeRoom: string;
   connectionState: ConnectionState;
+  isClearingConversation: boolean;
   nicknameDraft: string;
   onMenu: () => void;
   onClearConversation: () => void;
@@ -1721,8 +1746,13 @@ function ChatHeader(props: {
         <button className="icon-button" onClick={props.onRefresh} aria-label="刷新">
           <RefreshCw size={17} />
         </button>
-        <button className="icon-button" onClick={props.onClearConversation} aria-label="清空当前会话">
-          <Trash2 size={16} />
+        <button
+          className="icon-button"
+          onClick={props.onClearConversation}
+          disabled={props.isClearingConversation}
+          aria-label="删除当前会话"
+        >
+          {props.isClearingConversation ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}
         </button>
         <input
           value={props.nicknameDraft}

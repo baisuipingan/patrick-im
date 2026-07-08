@@ -189,6 +189,7 @@ export interface ConversationClearedPayload {
   conversationId: string;
   actorId: string;
   removed: number;
+  deleted: boolean;
 }
 
 export interface RoomUpdatedPayload {
