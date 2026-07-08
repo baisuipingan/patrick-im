@@ -62,12 +62,19 @@ interface DirectMeshOptions {
 interface DirectPeer {
   id: string;
   name: string;
+  peer: Peer;
+  polite: boolean;
   pc: RTCPeerConnection;
   channel: RTCDataChannel | null;
   activeFileId: string | null;
   activeSendCount: number;
   pendingCandidates: RTCIceCandidateInit[];
   files: Map<string, PendingIncomingFile>;
+  makingOffer: boolean;
+  ignoreOffer: boolean;
+  isSettingRemoteAnswerPending: boolean;
+  reconnectTimerId?: number;
+  reconnectAttempts: number;
 }
 
 interface PendingIncomingFile {
@@ -109,6 +116,8 @@ const HIGH_WATER_MARK = 8 * 1024 * 1024;
 const LOW_WATER_MARK = 2 * 1024 * 1024;
 const PROGRESS_INTERVAL_MS = 150;
 const PEER_REAP_GRACE_MS = 8000;
+const PEER_RECONNECT_DELAY_MS = 1200;
+const MAX_PEER_RECONNECT_ATTEMPTS = 3;
 
 interface ProgressReporter {
   report: (transferredBytes: number, totalBytes: number) => void;
@@ -140,7 +149,7 @@ export class DirectMesh {
       }
       liveIds.add(peer.clientId);
       this.clearPeerCloseTimer(peer.clientId);
-      this.ensurePeer(peer, this.options.selfId < peer.clientId);
+      this.ensurePeer(peer, this.shouldInitiate(peer.clientId));
     }
     for (const peerId of [...this.peers.keys()]) {
       if (!liveIds.has(peerId)) {
@@ -156,23 +165,40 @@ export class DirectMesh {
     const peer = this.ensurePeer({ clientId: fromId, nickname: fromId, joinedAt: Date.now() }, false);
     try {
       if (payload.description) {
+        const readyForOffer =
+          !peer.makingOffer && (peer.pc.signalingState === 'stable' || peer.isSettingRemoteAnswerPending);
+        const offerCollision = payload.description.type === 'offer' && !readyForOffer;
+        peer.ignoreOffer = !peer.polite && offerCollision;
+        if (peer.ignoreOffer) {
+          return;
+        }
+        peer.ignoreOffer = false;
+        peer.isSettingRemoteAnswerPending = payload.description.type === 'answer';
         await peer.pc.setRemoteDescription(payload.description);
+        peer.isSettingRemoteAnswerPending = false;
         await this.flushPendingCandidates(peer);
         if (payload.description.type === 'offer') {
-          const answer = await peer.pc.createAnswer();
-          await peer.pc.setLocalDescription(answer);
-          this.options.sendSignal(fromId, { description: answer });
+          await peer.pc.setLocalDescription();
+          if (peer.pc.localDescription) {
+            this.options.sendSignal(fromId, { description: peer.pc.localDescription });
+          }
         }
       }
       if (payload.candidate) {
-        if (peer.pc.remoteDescription) {
-          await peer.pc.addIceCandidate(payload.candidate);
-        } else {
+        if (peer.ignoreOffer) {
+          return;
+        }
+        if (!peer.pc.remoteDescription) {
           peer.pendingCandidates.push(payload.candidate);
+        } else {
+          await peer.pc.addIceCandidate(payload.candidate);
         }
       }
     } catch {
       this.options.onStateChange(fromId, 'offline');
+      this.scheduleReconnect(peer);
+    } finally {
+      peer.isSettingRemoteAnswerPending = false;
     }
   }
 
@@ -230,6 +256,17 @@ export class DirectMesh {
     const existing = this.peers.get(peer.clientId);
     if (existing) {
       existing.name = peer.nickname || existing.name;
+      existing.peer = peer;
+      if (existing.pc.connectionState === 'failed' || existing.pc.connectionState === 'closed') {
+        const nextAttempts = existing.reconnectAttempts + 1;
+        if (nextAttempts > MAX_PEER_RECONNECT_ATTEMPTS) {
+          return existing;
+        }
+        this.closePeer(existing.id);
+        const nextPeer = this.ensurePeer(peer, shouldOffer);
+        nextPeer.reconnectAttempts = nextAttempts;
+        return nextPeer;
+      }
       return existing;
     }
 
@@ -237,16 +274,25 @@ export class DirectMesh {
     const directPeer: DirectPeer = {
       id: peer.clientId,
       name: peer.nickname || peer.clientId,
+      peer,
+      polite: this.isPolitePeer(peer.clientId),
       pc,
       channel: null,
       activeFileId: null,
       activeSendCount: 0,
       pendingCandidates: [],
       files: new Map(),
+      makingOffer: false,
+      ignoreOffer: false,
+      isSettingRemoteAnswerPending: false,
+      reconnectAttempts: 0,
     };
     this.peers.set(peer.clientId, directPeer);
     this.options.onStateChange(peer.clientId, 'connecting');
 
+    pc.onnegotiationneeded = () => {
+      void this.negotiate(directPeer);
+    };
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         this.options.sendSignal(peer.clientId, { candidate: event.candidate.toJSON() });
@@ -255,11 +301,23 @@ export class DirectMesh {
     pc.onconnectionstatechange = () => {
       const state = pc.connectionState;
       if (state === 'connected') {
+        directPeer.reconnectAttempts = 0;
         this.options.onStateChange(peer.clientId, 'direct');
-      } else if (state === 'failed' || state === 'closed' || state === 'disconnected') {
+      } else if (state === 'failed') {
         this.options.onStateChange(peer.clientId, 'offline');
+        this.scheduleReconnect(directPeer);
+      } else if (state === 'closed') {
+        this.options.onStateChange(peer.clientId, 'offline');
+      } else if (state === 'disconnected') {
+        this.options.onStateChange(peer.clientId, 'connecting');
       } else {
         this.options.onStateChange(peer.clientId, 'connecting');
+      }
+    };
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'failed') {
+        this.options.onStateChange(peer.clientId, 'offline');
+        this.scheduleReconnect(directPeer);
       }
     };
     pc.ondatachannel = (event) => {
@@ -268,9 +326,16 @@ export class DirectMesh {
 
     if (shouldOffer) {
       this.attachChannel(directPeer, pc.createDataChannel('patrick-im-file'));
-      void this.createOffer(directPeer);
     }
     return directPeer;
+  }
+
+  private isPolitePeer(peerId: string): boolean {
+    return this.options.selfId.localeCompare(peerId) > 0;
+  }
+
+  private shouldInitiate(peerId: string): boolean {
+    return this.options.selfId.localeCompare(peerId) > 0;
   }
 
   private async flushPendingCandidates(peer: DirectPeer): Promise<void> {
@@ -288,18 +353,27 @@ export class DirectMesh {
     channel.bufferedAmountLowThreshold = LOW_WATER_MARK;
     channel.onopen = () => this.options.onStateChange(peer.id, 'direct');
     channel.onclose = () => this.options.onStateChange(peer.id, 'offline');
+    channel.onerror = () => this.scheduleReconnect(peer);
     channel.onmessage = (event) => {
       void this.handleDataChannelMessage(peer, event.data);
     };
   }
 
-  private async createOffer(peer: DirectPeer): Promise<void> {
+  private async negotiate(peer: DirectPeer): Promise<void> {
+    if (this.closed || peer.pc.signalingState === 'closed') {
+      return;
+    }
     try {
-      const offer = await peer.pc.createOffer();
-      await peer.pc.setLocalDescription(offer);
-      this.options.sendSignal(peer.id, { description: offer });
+      peer.makingOffer = true;
+      await peer.pc.setLocalDescription();
+      if (peer.pc.localDescription) {
+        this.options.sendSignal(peer.id, { description: peer.pc.localDescription });
+      }
     } catch {
       this.options.onStateChange(peer.id, 'offline');
+      this.scheduleReconnect(peer);
+    } finally {
+      peer.makingOffer = false;
     }
   }
 
@@ -410,12 +484,41 @@ export class DirectMesh {
     }
   }
 
+  private recreatePeer(peer: DirectPeer): void {
+    const nextAttempts = peer.reconnectAttempts + 1;
+    const peerInfo = peer.peer;
+    this.closePeer(peer.id);
+    if (this.closed || nextAttempts > MAX_PEER_RECONNECT_ATTEMPTS) {
+      return;
+    }
+    const nextPeer = this.ensurePeer(peerInfo, this.shouldInitiate(peerInfo.clientId));
+    nextPeer.reconnectAttempts = nextAttempts;
+  }
+
+  private scheduleReconnect(peer: DirectPeer): void {
+    if (this.closed || peer.reconnectTimerId || peer.reconnectAttempts >= MAX_PEER_RECONNECT_ATTEMPTS) {
+      return;
+    }
+    peer.reconnectTimerId = window.setTimeout(() => {
+      peer.reconnectTimerId = undefined;
+      const current = this.peers.get(peer.id);
+      if (!current || current !== peer || current.pc.connectionState === 'connected') {
+        return;
+      }
+      this.recreatePeer(peer);
+    }, PEER_RECONNECT_DELAY_MS);
+  }
+
   private closePeer(peerId: string): void {
     const peer = this.peers.get(peerId);
     if (!peer) {
       return;
     }
     this.clearPeerCloseTimer(peerId);
+    if (peer.reconnectTimerId) {
+      window.clearTimeout(peer.reconnectTimerId);
+      peer.reconnectTimerId = undefined;
+    }
     for (const pending of peer.files.values()) {
       void pending.sink?.abort();
     }

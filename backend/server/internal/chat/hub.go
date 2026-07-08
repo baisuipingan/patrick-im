@@ -7,7 +7,7 @@ import (
 	"github.com/baisuipingan/patrick-im/backend/server/internal/protocol"
 )
 
-const clientBufferSize = 32
+const clientBufferSize = 512
 
 type Hub struct {
 	mu    sync.RWMutex
