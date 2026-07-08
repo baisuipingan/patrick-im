@@ -18,6 +18,7 @@ interface FileSystemFileHandle extends FileSystemHandle {
 interface FileSystemDirectoryHandle extends FileSystemHandle {
   readonly kind: 'directory';
   getFileHandle(name: string, options?: { create?: boolean }): Promise<FileSystemFileHandle>;
+  removeEntry(name: string, options?: { recursive?: boolean }): Promise<void>;
 }
 
 interface Window {

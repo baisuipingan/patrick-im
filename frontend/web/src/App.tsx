@@ -227,6 +227,7 @@ export default function App() {
   const conversationsRef = useRef<ConversationView[]>([]);
   const transfersRef = useRef<Record<string, TransferRow>>({});
   const sessionRef = useRef<SessionResponse | null>(null);
+  const localMessagesRef = useRef<Record<string, MessageView[]>>({});
   const clearedConversationsRef = useRef<Record<string, number>>({});
   const activeConversationIdRef = useRef('');
 
@@ -472,9 +473,10 @@ export default function App() {
     if (clearedAt > requestedAt) {
       return;
     }
+    const messages = mergeMessages(payload.messages ?? [], localMessagesRef.current[conversationId] ?? []);
     setMessagesByConversation((current) => ({
       ...current,
-      [conversationId]: payload.messages ?? [],
+      [conversationId]: messages,
     }));
   }
 
@@ -567,8 +569,8 @@ export default function App() {
         await writer.write(chunk);
       },
       async close() {
-        closed = true;
         await writer.close();
+        closed = true;
         if (file.contentType.toLowerCase().startsWith('image/')) {
           const storedFile = await fileHandle.getFile();
           return { url: URL.createObjectURL(storedFile) };
@@ -578,6 +580,7 @@ export default function App() {
       async abort() {
         if (!closed) {
           await writer.abort().catch(() => undefined);
+          await directory.removeEntry(fileHandle.name).catch(() => undefined);
         }
       },
     };
@@ -1072,11 +1075,15 @@ export default function App() {
   }
 
   function upsertMessageView(message: MessageView) {
+    if (isLocalOnlyMessage(message)) {
+      localMessagesRef.current = {
+        ...localMessagesRef.current,
+        [message.conversationId]: upsertMessageList(localMessagesRef.current[message.conversationId] ?? [], message),
+      };
+    }
     setMessagesByConversation((current) => {
       const list = current[message.conversationId] ?? [];
-      const exists = list.some((item) => item.id === message.id);
-      const next = exists ? list.map((item) => (item.id === message.id ? message : item)) : [...list, message];
-      next.sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
+      const next = upsertMessageList(list, message);
       return { ...current, [message.conversationId]: next };
     });
   }
@@ -1280,9 +1287,14 @@ export default function App() {
       delete retryableTransfersRef.current[id];
     }
     setMessagesByConversation((current) => {
+      const nextLocalMessages = { ...localMessagesRef.current };
       if (!deleted) {
+        nextLocalMessages[conversationId] = [];
+        localMessagesRef.current = nextLocalMessages;
         return { ...current, [conversationId]: [] };
       }
+      delete nextLocalMessages[conversationId];
+      localMessagesRef.current = nextLocalMessages;
       const next = { ...current };
       delete next[conversationId];
       return next;
@@ -2123,6 +2135,32 @@ function upsertConversationAfterMessage(
     ? conversations.map((item) => (item.id === conversation.id ? { ...item, ...nextConversation } : item))
     : [nextConversation, ...conversations];
   return next.sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function isLocalOnlyMessage(message: MessageView): boolean {
+  const storageKind = message.attachment?.storageKind ?? '';
+  return storageKind === 'p2p' || storageKind === 'p2p_disk';
+}
+
+function mergeMessages(serverMessages: MessageView[], localMessages: MessageView[]): MessageView[] {
+  const merged = new Map<string, MessageView>();
+  for (const message of serverMessages) {
+    merged.set(message.id, message);
+  }
+  for (const message of localMessages) {
+    merged.set(message.id, message);
+  }
+  return sortMessages([...merged.values()]);
+}
+
+function upsertMessageList(messages: MessageView[], message: MessageView): MessageView[] {
+  const exists = messages.some((item) => item.id === message.id);
+  const next = exists ? messages.map((item) => (item.id === message.id ? message : item)) : [...messages, message];
+  return sortMessages(next);
+}
+
+function sortMessages(messages: MessageView[]): MessageView[] {
+  return [...messages].sort((left, right) => left.createdAt - right.createdAt || left.id.localeCompare(right.id));
 }
 
 function directConversationId(roomId: string, left: string, right: string): string {
