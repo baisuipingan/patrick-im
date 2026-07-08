@@ -226,6 +226,7 @@ export default function App() {
   const conversationsRef = useRef<ConversationView[]>([]);
   const transfersRef = useRef<Record<string, TransferRow>>({});
   const sessionRef = useRef<SessionResponse | null>(null);
+  const clearedConversationsRef = useRef<Record<string, number>>({});
   const activeConversationIdRef = useRef('');
 
   const activeConversation = useMemo(
@@ -462,9 +463,14 @@ export default function App() {
   }
 
   async function loadMessages(conversationId: string) {
+    const requestedAt = Date.now();
     const payload = await apiJSON<{ messages: MessageView[] }>(
       `/api/conversations/${encodeURIComponent(conversationId)}/messages`,
     );
+    const clearedAt = clearedConversationsRef.current[conversationId] ?? 0;
+    if (clearedAt > requestedAt) {
+      return;
+    }
     setMessagesByConversation((current) => ({
       ...current,
       [conversationId]: payload.messages ?? [],
@@ -1239,7 +1245,9 @@ export default function App() {
         `/api/conversations/${encodeURIComponent(activeConversation.id)}/messages`,
         { method: 'DELETE' },
       );
-      clearConversationLocally(response.conversationId || activeConversation.id);
+      const conversationId = response.conversationId || activeConversation.id;
+      clearConversationLocally(conversationId);
+      await loadMessages(conversationId);
       await refreshRoomDetail();
       await refreshRooms();
       setNotice({ tone: 'success', text: `已清空 ${response.removed} 条消息` });
@@ -1249,6 +1257,7 @@ export default function App() {
   }
 
   function clearConversationLocally(conversationId: string) {
+    clearedConversationsRef.current[conversationId] = Date.now();
     for (const [id, row] of Object.entries(transfersRef.current)) {
       if (row.conversationId !== conversationId) {
         continue;

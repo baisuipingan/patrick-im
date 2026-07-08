@@ -20,6 +20,7 @@ import (
 )
 
 const MaxTextBytes = 64 * 1024
+const defaultUploadLimitBytes int64 = 100 * 1024 * 1024 * 1024
 
 var (
 	ErrNotFound   = errors.New("not found")
@@ -44,7 +45,7 @@ type FileObject struct {
 
 func NewStore(db *gorm.DB, fileRoot string, uploadLimit int64) (*Store, error) {
 	if uploadLimit <= 0 {
-		uploadLimit = 256 * 1024 * 1024
+		uploadLimit = defaultUploadLimitBytes
 	}
 	if err := os.MkdirAll(fileRoot, 0o755); err != nil {
 		return nil, err
