@@ -49,7 +49,6 @@ import type {
 import { normalizeRoomId, roomFromHash } from './app-model';
 import {
   createTextAttachmentFile,
-  isTextWithinHardLimit,
   shouldSendTextAsAttachment,
 } from './features/chat/send-actions';
 import {
@@ -824,10 +823,6 @@ export default function App() {
     const text = composer.trim();
     const files = [...pendingFiles];
     if (!text && files.length === 0) {
-      return;
-    }
-    if (text && !isTextWithinHardLimit(text)) {
-      setNotice({ tone: 'error', text: '文本超过 1 MiB，请拆分后再发送' });
       return;
     }
 

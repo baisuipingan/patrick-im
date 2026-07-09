@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
   byteLength,
   createTextAttachmentFile,
-  isTextWithinHardLimit,
   shouldSendTextAsAttachment,
 } from './send-actions';
 
@@ -17,9 +16,8 @@ describe('send actions', () => {
     expect(shouldSendTextAsAttachment('a'.repeat(200 * 1024 + 1))).toBe(true);
   });
 
-  it('keeps the hard text limit at 1 MiB', () => {
-    expect(isTextWithinHardLimit('a'.repeat(1024 * 1024))).toBe(true);
-    expect(isTextWithinHardLimit('a'.repeat(1024 * 1024 + 1))).toBe(false);
+  it('keeps converting very large text into a txt attachment', () => {
+    expect(shouldSendTextAsAttachment('a'.repeat(1024 * 1024 + 1))).toBe(true);
   });
 
   it('creates stable txt attachment names', () => {

@@ -1,5 +1,4 @@
 export const TEXT_ATTACHMENT_THRESHOLD_BYTES = 200 * 1024;
-export const MAX_TEXT_MESSAGE_BYTES = 1024 * 1024;
 
 const encoder = new TextEncoder();
 
@@ -9,10 +8,6 @@ export function byteLength(value: string): number {
 
 export function shouldSendTextAsAttachment(value: string): boolean {
   return byteLength(value) > TEXT_ATTACHMENT_THRESHOLD_BYTES;
-}
-
-export function isTextWithinHardLimit(value: string): boolean {
-  return byteLength(value) <= MAX_TEXT_MESSAGE_BYTES;
 }
 
 export function createTextAttachmentFile(value: string, now = new Date()): File {
