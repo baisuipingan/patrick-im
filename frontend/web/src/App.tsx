@@ -418,6 +418,7 @@ export default function App() {
       },
       onIncomingFileStart: updateIncomingDirectProgress,
       onIncomingFileProgress: updateIncomingDirectProgress,
+      onIncomingFileCancel: markIncomingDirectFileCancelled,
       onIncomingFileError: markIncomingDirectFileFailed,
       createIncomingFileSink: createIncomingDirectFileSink,
       onIncomingFile: (file) => {
@@ -600,11 +601,16 @@ export default function App() {
         peerId: progress.peerId,
         totalBytes: progress.size,
         transferredBytes: progress.transferredBytes,
-        status: progress.error ? 'failed' : progress.transferredBytes >= progress.size ? 'done' : 'receiving',
+        status: progress.cancelled ? 'cancelled' : progress.error ? 'failed' : progress.transferredBytes >= progress.size ? 'done' : 'receiving',
         error: progress.error,
         updatedAt: now,
       },
     }));
+  }
+
+  function markIncomingDirectFileCancelled(progress: DirectFileProgress) {
+    updateIncomingDirectProgress({ ...progress, cancelled: true, error: progress.error ?? '已取消' });
+    setNotice({ tone: 'info', text: `${progress.fileName} 已取消接收` });
   }
 
   function markIncomingDirectFileFailed(progress: DirectFileProgress) {

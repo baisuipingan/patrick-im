@@ -404,8 +404,10 @@ describe('DirectMesh direct file transfer', () => {
 
   it('cancels incoming files, aborts the sink, and notifies the sender', async () => {
     const abort = vi.fn(async () => undefined);
+    const onIncomingFileCancel = vi.fn();
     const mesh = createMesh({
       selfId: 'a-local',
+      onIncomingFileCancel,
       createIncomingFileSink: vi.fn(async () => ({
         savedToDisk: true,
         write: async () => undefined,
@@ -436,6 +438,96 @@ describe('DirectMesh direct file transfer', () => {
     await new Promise((resolve) => window.setTimeout(resolve, 0));
 
     expect(abort).toHaveBeenCalled();
+    expect(onIncomingFileCancel).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'incoming-cancel',
+      cancelled: true,
+      error: '已取消',
+    }));
     expect(control.sent.map((item) => JSON.parse(String(item)).type)).toContain('file-cancel');
+  });
+
+  it('marks incoming files cancelled when the sender sends a cancel control message', async () => {
+    const abort = vi.fn(async () => undefined);
+    const onIncomingFileCancel = vi.fn();
+    const mesh = createMesh({
+      selfId: 'a-local',
+      onIncomingFileCancel,
+      createIncomingFileSink: vi.fn(async () => ({
+        savedToDisk: true,
+        write: async () => undefined,
+        close: async () => ({}),
+        abort,
+      })),
+    });
+    await mesh.handleSignal('z-remote', { description: { type: 'offer', sdp: 'offer' } });
+    const pc = peerConnectionInstances[0];
+    const control = new MockDataChannel('control');
+    pc.emitRemoteChannel(control);
+    control.open();
+    control.receive(JSON.stringify({
+      type: 'file-meta',
+      id: 'remote-cancel',
+      roomId: 'room-1',
+      senderId: 'z-remote',
+      senderName: 'Remote',
+      targetId: 'a-local',
+      fileName: 'incoming.txt',
+      size: 5,
+      contentType: 'text/plain',
+      createdAt: 1,
+    }));
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+    control.receive(JSON.stringify({ type: 'file-cancel', id: 'remote-cancel' }));
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+    expect(abort).toHaveBeenCalled();
+    expect(onIncomingFileCancel).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'remote-cancel',
+      transferredBytes: 0,
+      cancelled: true,
+    }));
+  });
+
+  it('fails pending incoming files when the peer disconnects before the file channel opens', async () => {
+    const abort = vi.fn(async () => undefined);
+    const onIncomingFileError = vi.fn();
+    const mesh = createMesh({
+      selfId: 'a-local',
+      onIncomingFileError,
+      createIncomingFileSink: vi.fn(async () => ({
+        savedToDisk: true,
+        write: async () => undefined,
+        close: async () => ({}),
+        abort,
+      })),
+    });
+    await mesh.handleSignal('z-remote', { description: { type: 'offer', sdp: 'offer' } });
+    const pc = peerConnectionInstances[0];
+    const control = new MockDataChannel('control');
+    pc.emitRemoteChannel(control);
+    control.open();
+    control.receive(JSON.stringify({
+      type: 'file-meta',
+      id: 'disconnect-pending',
+      roomId: 'room-1',
+      senderId: 'z-remote',
+      senderName: 'Remote',
+      targetId: 'a-local',
+      fileName: 'incoming.txt',
+      size: 5,
+      contentType: 'text/plain',
+      createdAt: 1,
+    }));
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+    control.close();
+    await new Promise((resolve) => window.setTimeout(resolve, 0));
+
+    expect(abort).toHaveBeenCalled();
+    expect(onIncomingFileError).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'disconnect-pending',
+      error: '直连已断开，传输中断',
+    }));
   });
 });

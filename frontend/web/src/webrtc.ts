@@ -50,6 +50,7 @@ export interface DirectFileProgress {
   transferredBytes: number;
   direction: 'send' | 'receive';
   error?: string;
+  cancelled?: boolean;
 }
 
 export interface DirectSendOptions {
@@ -78,6 +79,7 @@ interface DirectMeshOptions {
   onPeerSnapshot?: (peerId: string, snapshot: DirectPeerSnapshot) => void;
   onIncomingFileStart?: (progress: DirectFileProgress) => void;
   onIncomingFileProgress?: (progress: DirectFileProgress) => void;
+  onIncomingFileCancel?: (progress: DirectFileProgress) => void;
   onIncomingFileError?: (progress: DirectFileProgress) => void;
   createIncomingFileSink?: (meta: DirectFileMeta) => Promise<IncomingDirectFileSink | null>;
   onIncomingFile: (file: IncomingDirectFile) => void;
@@ -329,7 +331,7 @@ export class DirectMesh {
       }
       if (peer.files.has(id)) {
         this.notifyTransferCancel(peer, id);
-        void this.abortIncomingFile(peer, id);
+        void this.cancelIncomingFile(peer, id);
         return true;
       }
     }
@@ -481,6 +483,7 @@ export class DirectMesh {
       this.emitPeerState(peer, 'direct', 'control_open');
     };
     channel.onclose = () => {
+      void this.failIncomingFilesForPeer(peer, '直连已断开，传输中断');
       this.clearControlOpenCheck(peer);
       this.stopPathPolling(peer);
       this.publishPathInfo(peer, null);
@@ -488,6 +491,7 @@ export class DirectMesh {
       this.scheduleReconnect(peer);
     };
     channel.onerror = () => {
+      void this.failIncomingFilesForPeer(peer, '直连通道异常');
       this.clearControlOpenCheck(peer);
       this.stopPathPolling(peer);
       this.emitPeerState(peer, 'offline', 'control_error');
@@ -538,7 +542,7 @@ export class DirectMesh {
       }
       if (payload.type === 'file-cancel') {
         this.cancelOutgoingFile(peer, payload.id, new DOMException('Transfer cancelled by receiver', 'AbortError'));
-        await this.abortIncomingFile(peer, payload.id);
+        await this.cancelIncomingFile(peer, payload.id);
         return;
       }
       if (payload.type === 'file-failed') {
@@ -563,7 +567,7 @@ export class DirectMesh {
       if (payload.type === 'file-done') {
         await this.finishIncomingFile(peer, id);
       } else if (payload.type === 'file-cancel') {
-        await this.abortIncomingFile(peer, id);
+        await this.cancelIncomingFile(peer, id);
       }
       return;
     }
@@ -734,14 +738,26 @@ export class DirectMesh {
     pending.timeoutId = undefined;
   }
 
-  private async abortIncomingFile(peer: DirectPeer, id: string): Promise<void> {
+  private async cancelIncomingFile(peer: DirectPeer, id: string): Promise<void> {
     const pending = peer.files.get(id);
     if (!pending) {
       return;
     }
     peer.files.delete(id);
     pending.channel?.close();
+    await pending.writeChain.catch(() => undefined);
     await pending.sink?.abort();
+    this.options.onIncomingFileCancel?.({
+      id: pending.meta.id,
+      roomId: pending.meta.roomId,
+      peerId: peer.id,
+      fileName: pending.meta.fileName,
+      size: pending.meta.size,
+      transferredBytes: pending.received,
+      direction: 'receive',
+      error: '已取消',
+      cancelled: true,
+    });
   }
 
   private async failIncomingFile(peer: DirectPeer, id: string, error: string): Promise<void> {
@@ -751,6 +767,7 @@ export class DirectMesh {
     }
     peer.files.delete(id);
     pending.channel?.close();
+    await pending.writeChain.catch(() => undefined);
     await pending.sink?.abort();
     peer.channel?.send(JSON.stringify({ type: 'file-failed', id, error } satisfies DirectFileFailed));
     this.options.onIncomingFileError?.({
@@ -763,6 +780,11 @@ export class DirectMesh {
       direction: 'receive',
       error,
     });
+  }
+
+  private async failIncomingFilesForPeer(peer: DirectPeer, error: string): Promise<void> {
+    const pendingIds = [...peer.files.keys()];
+    await Promise.all(pendingIds.map((id) => this.failIncomingFile(peer, id, error)));
   }
 
   private async finishIncomingFile(peer: DirectPeer, id: string): Promise<void> {
@@ -935,6 +957,10 @@ export class DirectMesh {
       return;
     }
     this.clearPeerCloseTimer(peerId);
+    for (const pending of peer.outgoingFiles.values()) {
+      this.notifyTransferCancel(peer, pending.meta.id);
+    }
+    void this.failIncomingFilesForPeer(peer, '直连已断开，传输中断');
     this.stopPathPolling(peer);
     this.publishPathInfo(peer, null);
     if (peer.reconnectTimerId) {
