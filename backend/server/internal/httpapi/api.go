@@ -223,7 +223,7 @@ func (api *API) createDirectConversation(c *gin.Context) {
 		return
 	}
 	api.publishUnreadUpdated(conversation, payload.ClientID)
-	api.publishRoomUpdated(c.Request.Context(), conversation.RoomID, payload.ClientID)
+	api.publishRoomUpdated(c.Request.Context(), conversation.RoomID, recipientsForConversationID(conversation.ID))
 	c.JSON(http.StatusOK, conversation)
 }
 
@@ -257,7 +257,7 @@ func (api *API) createConversationMessage(c *gin.Context) {
 		api.handleStoreError(c, err)
 		return
 	}
-	api.publishMessageCreated(message)
+	api.publishMessageCreated(c.Request.Context(), message)
 	c.JSON(http.StatusOK, message)
 }
 
@@ -287,7 +287,7 @@ func (api *API) createConversationAttachment(c *gin.Context) {
 		api.handleStoreError(c, err)
 		return
 	}
-	api.publishMessageCreated(message)
+	api.publishMessageCreated(c.Request.Context(), message)
 	c.JSON(http.StatusOK, message)
 }
 
@@ -333,6 +333,7 @@ func (api *API) clearConversationMessages(c *gin.Context) {
 		},
 		util.NowMillisInt64(),
 	))
+	api.publishRoomUpdated(c.Request.Context(), response.RoomID, recipientsForConversationID(response.ConversationID))
 	c.JSON(http.StatusOK, response)
 }
 
@@ -360,6 +361,7 @@ func (api *API) deleteConversation(c *gin.Context) {
 		},
 		util.NowMillisInt64(),
 	))
+	api.publishRoomUpdated(c.Request.Context(), response.RoomID, recipientsForConversationID(response.ConversationID))
 	c.JSON(http.StatusOK, response)
 }
 
@@ -501,8 +503,9 @@ func (api *API) publishMessage(roomID string, message protocol.Message) {
 	})
 }
 
-func (api *API) publishMessageCreated(message protocol.MessageView) {
-	api.hub.Publish(message.RoomID, recipientsForMessageView(message), protocol.NewEnvelope(
+func (api *API) publishMessageCreated(ctx context.Context, message protocol.MessageView) {
+	recipients := recipientsForMessageView(message)
+	api.hub.Publish(message.RoomID, recipients, protocol.NewEnvelope(
 		"message_created",
 		"",
 		message.RoomID,
@@ -510,6 +513,7 @@ func (api *API) publishMessageCreated(message protocol.MessageView) {
 		protocol.MessageCreatedPayload{Message: message},
 		util.NowMillisInt64(),
 	))
+	api.publishRoomUpdated(ctx, message.RoomID, recipients)
 }
 
 func (api *API) publishMessageAck(requestID string, message protocol.MessageView) {
@@ -534,19 +538,30 @@ func (api *API) publishUnreadUpdated(conversation protocol.ConversationView, use
 	))
 }
 
-func (api *API) publishRoomUpdated(ctx context.Context, roomID, viewerID string) {
-	room, err := api.store.RoomDetail(ctx, roomID, viewerID, onlineMap(api.hub.Peers(roomID)))
-	if err != nil {
-		return
+func (api *API) publishRoomUpdated(ctx context.Context, roomID string, recipients []string) {
+	peers := api.hub.Peers(roomID)
+	online := onlineMap(peers)
+	viewerIDs := recipients
+	if len(viewerIDs) == 0 {
+		viewerIDs = make([]string, 0, len(peers))
+		for _, peer := range peers {
+			viewerIDs = append(viewerIDs, peer.ClientID)
+		}
 	}
-	api.hub.Publish(roomID, nil, protocol.NewEnvelope(
-		"room_updated",
-		"",
-		roomID,
-		"",
-		protocol.RoomUpdatedPayload{Room: room},
-		util.NowMillisInt64(),
-	))
+	for _, viewerID := range uniqueNonEmpty(viewerIDs) {
+		room, err := api.store.RoomDetail(ctx, roomID, viewerID, online)
+		if err != nil {
+			continue
+		}
+		api.hub.Publish(roomID, []string{viewerID}, protocol.NewEnvelope(
+			"room_updated",
+			"",
+			roomID,
+			"",
+			protocol.RoomUpdatedPayload{Room: room},
+			util.NowMillisInt64(),
+		))
+	}
 }
 
 func recipientsForMessageView(message protocol.MessageView) []string {
@@ -562,6 +577,23 @@ func recipientsForConversationID(conversationID string) []string {
 		return []string{parts[len(parts)-2], parts[len(parts)-1]}
 	}
 	return nil
+}
+
+func uniqueNonEmpty(values []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func (api *API) roomSnapshot(ctx context.Context, roomID, viewerID string) (protocol.Envelope, error) {
@@ -720,7 +752,7 @@ func (api *API) handleSendMessageEnvelope(ctx context.Context, roomID string, se
 		api.publishEnvelopeError(roomID, sender.ClientID, "message_ack", envelope.RequestID, "send_failed", "message was not accepted")
 		return
 	}
-	api.publishMessageCreated(message)
+	api.publishMessageCreated(ctx, message)
 	api.publishMessageAck(envelope.RequestID, message)
 }
 

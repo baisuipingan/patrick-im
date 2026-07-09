@@ -111,6 +111,16 @@ interface RetryableTransfer {
 
 type PendingWebRTCSignal = Envelope<WebRTCSignalPayload>;
 
+class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 interface SaveFilePicker {
   createWritable: () => Promise<FileSystemWritableFileStream>;
 }
@@ -189,9 +199,13 @@ async function apiJSON<T>(input: RequestInfo | URL, init?: RequestInit): Promise
     },
   });
   if (!response.ok) {
-    throw new Error(await readError(response));
+    throw new ApiError(response.status, await readError(response));
   }
   return (await response.json()) as T;
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 404;
 }
 
 function newLocalId(prefix: string): string {
@@ -223,6 +237,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [receiveDirectory, setReceiveDirectory] = useState<StoredDirectoryState>(EMPTY_RECEIVE_DIRECTORY);
   const [clearingConversationId, setClearingConversationId] = useState<string | null>(null);
+  const [isSending, setIsSending] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -754,11 +769,35 @@ export default function App() {
       },
     );
     setConversations((current) => {
-      const next = current.some((item) => item.id === conversation.id) ? current : [conversation, ...current];
+      const next = upsertConversationView(current, conversation, activeConversationIdRef.current);
       conversationsRef.current = next;
       return next;
     });
     return conversation;
+  }
+
+  async function ensureSendableConversation(conversation: ConversationView): Promise<ConversationView> {
+    if (conversation.type !== 'direct' || !conversation.peerUserId) {
+      return conversation;
+    }
+    const fresh = await apiJSON<ConversationView>(
+      `/api/rooms/${encodeURIComponent(activeRoom)}/conversations/direct`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ peerUserId: conversation.peerUserId }),
+      },
+    );
+    setConversations((current) => {
+      const withoutStale = current.filter((item) => item.id !== conversation.id || item.id === fresh.id);
+      const next = upsertConversationView(withoutStale, fresh, activeConversationIdRef.current);
+      conversationsRef.current = next;
+      return next;
+    });
+    if (fresh.id !== conversation.id) {
+      activeConversationIdRef.current = fresh.id;
+      setActiveConversationId(fresh.id);
+    }
+    return fresh;
   }
 
   async function openDirectConversation(peerUserId: string) {
@@ -773,7 +812,7 @@ export default function App() {
   }
 
   async function sendMessage() {
-    if (!activeConversation || !session) {
+    if (!activeConversation || !session || isSending) {
       return;
     }
     const text = composer.trim();
@@ -792,10 +831,13 @@ export default function App() {
       ? [{ id: newLocalId('text-file'), file: textFile }, ...files]
       : files;
 
+    setIsSending(true);
+    setNotice({ tone: 'info', text: '发送中...' });
     try {
+      const conversation = await ensureSendableConversation(activeConversation);
       if (textToSend) {
         const message = await apiJSON<MessageView>(
-          `/api/conversations/${encodeURIComponent(activeConversation.id)}/messages`,
+          `/api/conversations/${encodeURIComponent(conversation.id)}/messages`,
           {
             method: 'POST',
             body: JSON.stringify({
@@ -809,18 +851,26 @@ export default function App() {
       }
       for (const item of filesToSend) {
         const messageType = textFile && item.file === textFile ? 'txt_file' : undefined;
-        await sendAttachment(activeConversation, item.file, messageType);
+        await sendAttachment(conversation, item.file, messageType);
       }
       setComposer('');
       clearPendingFiles();
       await refreshRoomDetail();
       setNotice({ tone: 'success', text: '已发送' });
     } catch (error) {
+      if (isNotFoundError(error) && activeConversation.type === 'direct' && activeConversation.peerUserId) {
+        deleteConversationLocally(activeConversation.id, true);
+        await refreshRoomDetail().catch(() => undefined);
+        setNotice({ tone: 'error', text: '会话已失效，请重新打开私聊后发送' });
+        return;
+      }
       if (isCancelledTransferError(error)) {
         setNotice({ tone: 'info', text: TRANSFER_CANCELLED_MESSAGE });
         return;
       }
       setNotice({ tone: 'error', text: error instanceof Error ? error.message : '发送失败' });
+    } finally {
+      setIsSending(false);
     }
   }
 
@@ -1667,6 +1717,7 @@ export default function App() {
           composer={composer}
           composerRef={composerRef}
           fileInputRef={fileInputRef}
+          isSending={isSending}
           pendingFiles={pendingFiles}
           onAttachFiles={appendPendingFiles}
           onComposerChange={setComposer}
@@ -2010,6 +2061,7 @@ function Composer(props: {
   composer: string;
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
+  isSending: boolean;
   pendingFiles: PendingAttachment[];
   onAttachFiles: (files: File[]) => void;
   onComposerChange: (value: string) => void;
@@ -2017,6 +2069,7 @@ function Composer(props: {
   onRemovePendingFile: (id: string) => void;
   onSend: () => void;
 }) {
+  const canSend = props.composer.trim().length > 0 || props.pendingFiles.length > 0;
   return (
     <footer className="composer-v2">
       <input
@@ -2052,14 +2105,17 @@ function Composer(props: {
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault();
+              if (props.isSending) {
+                return;
+              }
               props.onSend();
             }
           }}
           placeholder="输入消息，粘贴图片或拖拽文件..."
         />
-        <button className="send-button" onClick={props.onSend}>
-          <Send size={18} />
-          发送
+        <button className="send-button" onClick={props.onSend} disabled={props.isSending || !canSend}>
+          {props.isSending ? <Loader2 className="spin" size={18} /> : <Send size={18} />}
+          {props.isSending ? '发送中' : '发送'}
         </button>
       </div>
     </footer>
@@ -2272,6 +2328,22 @@ function upsertConversationAfterMessage(
   const exists = conversations.some((item) => item.id === conversation.id);
   const next = exists
     ? conversations.map((item) => (item.id === conversation.id ? { ...item, ...nextConversation } : item))
+    : [nextConversation, ...conversations];
+  return next.sort((left, right) => right.updatedAt - left.updatedAt);
+}
+
+function upsertConversationView(
+  conversations: ConversationView[],
+  conversation: ConversationView,
+  activeConversationId: string,
+): ConversationView[] {
+  const nextConversation: ConversationView = {
+    ...conversation,
+    unreadCount: conversation.id === activeConversationId ? 0 : conversation.unreadCount,
+  };
+  const exists = conversations.some((item) => item.id === conversation.id);
+  const next = exists
+    ? conversations.map((item) => (item.id === conversation.id ? nextConversation : item))
     : [nextConversation, ...conversations];
   return next.sort((left, right) => right.updatedAt - left.updatedAt);
 }
