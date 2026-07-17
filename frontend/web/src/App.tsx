@@ -51,6 +51,7 @@ import {
   createTextAttachmentFile,
   shouldSendTextAsAttachment,
 } from './features/chat/send-actions';
+import { copyImageToClipboard } from './lib/clipboard';
 import {
   clearReceiveDirectory,
   createWritableFile,
@@ -1303,11 +1304,14 @@ export default function App() {
     try {
       if (message.text) {
         await navigator.clipboard.writeText(message.text);
-      } else if (message.attachment?.previewable && typeof ClipboardItem !== 'undefined') {
-        const response = await fetch(message.attachment.url);
-        const blob = await response.blob();
-        await navigator.clipboard.write([new ClipboardItem({ [blob.type || 'image/png']: blob })]);
-      } else if (message.attachment) {
+      } else if (
+        message.attachment?.previewable &&
+        message.attachment.url &&
+        typeof ClipboardItem !== 'undefined' &&
+        typeof navigator.clipboard?.write === 'function'
+      ) {
+        await copyImageToClipboard(message.attachment.url);
+      } else if (message.attachment?.url) {
         await navigator.clipboard.writeText(`${window.location.origin}${message.attachment.url}`);
       }
       setCopiedMessageId(message.id);
